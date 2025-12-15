@@ -1,0 +1,28 @@
+CURL Commands:
+
+# Set your variables
+SET JIRA_URL=https://testjira.testcompany.org
+SET USERNAME=your-username
+SET PASSWORD=your-password
+SET COOKIE_FILE=jira-cookies.txt
+
+# Clean up
+del %COOKIE_FILE%
+
+# STEP 1: Login
+curl.exe -v -k -L -c %COOKIE_FILE% -d "username=%USERNAME%&password=%PASSWORD%" -H "Content-Type: application/x-www-form-urlencoded" -H "Referer: %JIRA_URL%/login.jsp" -o step1-login.html %JIRA_URL%/login.jsp
+
+# STEP 2: Navigate to filter page
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step2-filter-page.html %JIRA_URL%/secure/ManageFilters.jspa
+
+# STEP 3: Submit search form
+curl.exe -v -k -L -b %COOKIE_FILE% -c %COOKIE_FILE% -d "filterView=search&Search=Search&searchName=&searchOwnerUserName=&searchShareType=any" -H "Content-Type: application/x-www-form-urlencoded" -H "Referer: %JIRA_URL%/secure/ManageFilters.jspa" -w "\n\nFINAL_URL: %{url_effective}\n" -o step3-search-results.html %JIRA_URL%/secure/ManageFilters.jspa
+
+# STEP 4: Pagination page 1
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step4-page1.html "%JIRA_URL%/secure/ManageFilters.jspa?filterView=search&pagingOffset=0"
+
+# STEP 5: Pagination page 2
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step5-page2.html "%JIRA_URL%/secure/ManageFilters.jspa?filterView=search&pagingOffset=20"
+
+# Check cookie file
+type %COOKIE_FILE%
