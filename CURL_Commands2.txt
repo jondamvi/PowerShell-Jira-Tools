@@ -1,0 +1,19 @@
+
+CURL Commands:
+# STEP 1: Login (same as before)
+curl.exe -v -k -L -c %COOKIE_FILE% -d "username=%USERNAME%&password=%PASSWORD%" -H "Content-Type: application/x-www-form-urlencoded" -o step1-login.html %JIRA_URL%/login.jsp
+
+# STEP 2: Get the filter page to capture atl_token
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step2-filter-page.html %JIRA_URL%/secure/ManageFilters.jspa
+
+# Extract atl_token from step2-filter-page.html manually or with grep
+# Look for: <input name="atl_token" type="hidden" value="XXXXX">
+
+# STEP 3: Submit search using GET (not POST!)
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step3-search-results.html "%JIRA_URL%/secure/ManageFilters.jspa?search=search&searchName=&searchOwnerUserName=&searchShareType=any&returnUrl=ManageFilters.jspa"
+
+# STEP 4: Pagination page 1
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step4-page1.html "%JIRA_URL%/secure/ManageFilters.jspa?search=search&searchName=&searchOwnerUserName=&searchShareType=any&pagingOffset=0"
+
+# STEP 5: Pagination page 2  
+curl.exe -v -k -b %COOKIE_FILE% -c %COOKIE_FILE% -o step5-page2.html "%JIRA_URL%/secure/ManageFilters.jspa?search=search&searchName=&searchOwnerUserName=&searchShareType=any&pagingOffset=20"
