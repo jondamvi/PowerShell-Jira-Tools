@@ -1,4 +1,4 @@
-# JIRA Shared Filters Scraper using curl
+﻿# JIRA Shared Filters Scraper using curl
 # Scrapes shared filters from JIRA web interface and exports to JSON
 # ============================================================
 # CONFIGURATION
@@ -358,7 +358,7 @@ while ($hasMorePages) {
             $allFilters += $filter
         }
     }
-    Write-Status "  Page $pageNumber: Found $filtersOnPage shared filters" -Color Green
+    Write-Status "  Page ${pageNumber}: Found $filtersOnPage shared filters" -Color Green
     # Check if there are more pages
     if ($filtersOnPage -eq 0 -or $html -notmatch 'pagingOffset=' + ($pageOffset + 20)) {
         $hasMorePages = $false
