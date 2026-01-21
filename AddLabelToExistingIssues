@@ -1,0 +1,55 @@
+$baseUrl = "https://your-domain.atlassian.net"
+$email = "your-email@company.com"
+$apiToken = "your-api-token"
+$targetUser = "target-user-account-id"
+$labelToAdd = "commented-by-john"
+
+$auth = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${email}:${apiToken}"))
+$headers = @{
+    "Authorization" = "Basic $auth"
+    "Content-Type"  = "application/json"
+}
+
+# Get all issues in project (paginate as needed)
+$jql = "project = YOUR_PROJECT"
+$startAt = 0
+$maxResults = 100
+
+do {
+    $searchUrl = "$baseUrl/rest/api/3/search?jql=$([uri]::EscapeDataString($jql))&startAt=$startAt&maxResults=$maxResults"
+    $response = Invoke-RestMethod -Uri $searchUrl -Headers $headers -Method Get
+    
+    foreach ($issue in $response.issues) {
+        $issueKey = $issue.key
+        
+        # Get comments for this issue
+        $commentsUrl = "$baseUrl/rest/api/3/issue/$issueKey/comment"
+        $comments = Invoke-RestMethod -Uri $commentsUrl -Headers $headers -Method Get
+        
+        $hasTargetComment = $comments.comments | Where-Object { $_.author.accountId -eq $targetUser }
+        
+        if ($hasTargetComment) {
+            # Add label to issue
+            $updateUrl = "$baseUrl/rest/api/3/issue/$issueKey"
+            $body = @{
+                update = @{
+                    labels = @(
+                        @{ add = $labelToAdd }
+                    )
+                }
+            } | ConvertTo-Json -Depth 5
+            
+            try {
+                Invoke-RestMethod -Uri $updateUrl -Headers $headers -Method Put -Body $body
+                Write-Host "Tagged: $issueKey" -ForegroundColor Green
+            }
+            catch {
+                Write-Host "Failed: $issueKey - $_" -ForegroundColor Red
+            }
+        }
+    }
+    
+    $startAt += $maxResults
+} while ($startAt -lt $response.total)
+
+Write-Host "Done! Processed $($response.total) issues."
