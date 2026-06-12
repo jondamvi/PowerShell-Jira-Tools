@@ -137,6 +137,31 @@ function Convert-AttrValue {
     }
 }
 
+# Resolve typeValue GUIDs (e.g. Confluence attribute -> Application Link) to names.
+# Lazily fetches the applinks list once; falls back gracefully if unavailable.
+$script:AppLinkMap = $null
+function Resolve-TypeValueGuid {
+    param([string]$Guid)
+    if ([string]::IsNullOrWhiteSpace($Guid)) { return '' }
+    if ($null -eq $script:AppLinkMap) {
+        $script:AppLinkMap = @{}
+        try {
+            $resp = Invoke-RestMethod -Uri "$BaseUrl/rest/applinks/1.0/applicationlink" `
+                        -Headers ($headers + @{ Accept = 'application/json' }) -Method Get -UseBasicParsing
+            foreach ($l in (ConvertTo-FlatArray (Get-Prop $resp 'applicationLinks'))) {
+                $lid = [string](Get-Prop $l 'id' '')
+                if ($lid) { $script:AppLinkMap[$lid] = [string](Get-Prop $l 'name' '') }
+            }
+            Write-Host ("Application links resolved: {0}" -f $script:AppLinkMap.Count) -ForegroundColor DarkCyan
+        }
+        catch {
+            Write-Warning ("Could not fetch application links for GUID resolution: {0}" -f $_.Exception.Message)
+        }
+    }
+    if ($script:AppLinkMap.ContainsKey($Guid)) { return $script:AppLinkMap[$Guid] }
+    return ''
+}
+
 # --- Type maps ---------------------------------------------------------------
 # Insight DC attribute 'type' enum
 $typeNames = @{
@@ -220,21 +245,37 @@ foreach ($schema in $schemas) {
             $typeName = 'Default/' + $(if ($defaultTypeNames.ContainsKey($dtId)) { $defaultTypeNames[$dtId] } else { "Unknown($dtId)" })
         }
 
-        # objectType *should* be in the per-schema attributes payload, but some
-        # Insight versions omit it there. Fall back to the single-attribute
-        # endpoint, which always includes it.
-        $ot = Get-Prop $attr 'objectType'
-        if ($null -eq $ot) {
-            try {
-                $attrFull = Invoke-InsightApi ("/rest/insight/1.0/objecttypeattribute/{0}" -f (Get-Prop $attr 'id'))
-                $ot = Get-Prop $attrFull 'objectType'
-            }
-            catch {
-                Write-Warning ("  Could not resolve objectType for attribute '{0}' (id {1}): {2}" -f (Get-Prop $attr 'name' '?'), (Get-Prop $attr 'id' '?'), $_.Exception.Message)
-            }
+        # The schema-level attributes payload is trimmed on some Insight versions
+        # (no objectType, no typeValue). Fetch the authoritative full JSON for
+        # every flagged attribute - cheap, since only flagged ones are fetched.
+        $attrFull = $attr
+        try {
+            $fetched = Invoke-InsightApi ("/rest/insight/1.0/objecttypeattribute/{0}" -f (Get-Prop $attr 'id'))
+            if ($null -ne $fetched) { $attrFull = $fetched }
         }
+        catch {
+            Write-Warning ("  Full attribute lookup failed for '{0}' (id {1}): {2} - using schema-level payload." -f (Get-Prop $attr 'name' '?'), (Get-Prop $attr 'id' '?'), $_.Exception.Message)
+        }
+
+        $ot     = Get-Prop $attrFull 'objectType'
+        if ($null -eq $ot) { $ot = Get-Prop $attr 'objectType' }
         $otId   = Get-Prop $ot 'id'
         $otName = Get-Prop $ot 'name' '?'
+
+        # typeValue GUID (e.g. Confluence app link) + best-effort name resolution
+        $typeValueGuid = [string](Get-Prop $attrFull 'typeValue' '')
+        $typeValueName = ''
+        if ($typeValueGuid) {
+            $typeValueName = Resolve-TypeValueGuid $typeValueGuid
+            if (-not $typeValueName) {
+                # Fallback: confluenceTypeValue may carry a name inline (not always present)
+                $ctv = Get-Prop $attrFull 'confluenceTypeValue'
+                if ($null -ne $ctv) {
+                    $typeValueName = [string](Get-Prop $ctv 'name' (Get-Prop $ctv 'label' ''))
+                }
+            }
+        }
+
         if ($null -eq $otId) {
             # Keep it in the report rather than dropping it silently
             $results.Add([PSCustomObject]@{
@@ -247,6 +288,8 @@ foreach ($schema in $schemas) {
                 AttributeName   = Get-Prop $attr 'name' '?'
                 AttributeType   = $typeName
                 TypeId          = $typeId
+                TypeValueGuid   = $typeValueGuid
+                TypeValueName   = $typeValueName
                 ObjectsWithData = -1
                 MigrationImpact = 'UNKNOWN - objectType unresolved, verify manually'
                 IqlUsed         = ''
@@ -343,6 +386,8 @@ foreach ($schema in $schemas) {
             AttributeName   = $attr.name
             AttributeType   = $typeName
             TypeId          = $typeId
+            TypeValueGuid   = $typeValueGuid
+            TypeValueName   = $typeValueName
             ObjectsWithData = $objectsWithData
             MigrationImpact = if ($objectsWithData -gt 0) { 'YES - data present' } else { 'Definition only' }
             IqlUsed         = $iql
@@ -350,8 +395,9 @@ foreach ($schema in $schemas) {
         }
         $results.Add($row)
 
+        $tvDisplay = if ($typeValueName) { " | TypeValue='$typeValueName'" } elseif ($typeValueGuid) { " | TypeValue=$typeValueGuid" } else { '' }
         $color = if ($objectsWithData -gt 0) { 'Red' } else { 'Gray' }
-        Write-Host ("    [{0}] ObjectType='{1}' | Attribute='{2}' (id {3}) -> {4} object(s) with data" -f $typeName, $otName, $attr.name, $attr.id, $objectsWithData) -ForegroundColor $color
+        Write-Host ("    [{0}] ObjectType='{1}' | Attribute='{2}' (id {3}){4} -> {5} object(s) with data" -f $typeName, $otName, $attr.name, $attr.id, $tvDisplay, $objectsWithData) -ForegroundColor $color
     }
 }
 
@@ -362,7 +408,7 @@ if ($results.Count -eq 0) {
 }
 else {
     $results | Sort-Object -Property ObjectsWithData -Descending |
-        Format-Table SchemaName, ObjectTypeName, AttributeName, AttributeId, AttributeType, ObjectsWithData, MigrationImpact -AutoSize
+        Format-Table SchemaName, ObjectTypeName, AttributeName, AttributeId, AttributeType, TypeValueName, ObjectsWithData, MigrationImpact -AutoSize
 
     $results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host ("Full report written to: {0}" -f (Resolve-Path $OutputCsv)) -ForegroundColor Cyan
