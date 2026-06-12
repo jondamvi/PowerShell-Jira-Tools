@@ -1,5 +1,5 @@
 ﻿param(
-    [Parameter(Mandatory)][string]$BaseUrl,   # https://yoursite.atlassian.net
+    [Parameter(Mandatory)][string]$BaseUrl,
     [Parameter(Mandatory)][string]$Email,
     [Parameter(Mandatory)][string]$Token
 )
@@ -8,22 +8,27 @@ $h = @{
     "Content-Type" = "application/json"
 }
 function Get-J($url) {
-    try { Invoke-RestMethod -Uri $url -Headers $h -ErrorAction Stop }
+    try { Invoke-RestMethod -Uri $url -Headers $h -TimeoutSec 10 -ErrorAction Stop }
     catch {
-        $resp = $_.Exception.Response
-        if ($resp -and $resp.StatusCode.value__ -in 401,403) { "DENIED" } else { $null }
+        $code = $_.Exception.Response.StatusCode.value__
+        if ($code -in 401,403) { return "DENIED" }
+        return $null
     }
 }
+
+Write-Host "Fetching project list..." -ForegroundColor Cyan
 $projs = @(); $start = 0
 do {
     $r = Get-J "$BaseUrl/rest/api/3/project/search?maxResults=50&startAt=$start&expand=lead"
     if ($r -eq "DENIED") { Write-Warning "Cannot list projects: access denied"; exit }
     if (!$r) { break }
-    if ($r.values) { $projs += $r.values }
+    $projs += $r.values
+    Write-Host "  Got $($projs.Count) projects so far..."
     $start += 50
 } while (-not $r.isLast)
+Write-Host "Total projects: $($projs.Count)" -ForegroundColor Cyan
 
-$uCache = @{}; $psCache = @{}; $gCache = @{}
+$uCache = @{}; $psCache = @{}
 function Get-US($id) {
     if (!$uCache.ContainsKey($id)) {
         $u = Get-J "$BaseUrl/rest/api/3/user?accountId=$id"
@@ -31,52 +36,27 @@ function Get-US($id) {
     }
     $uCache[$id]
 }
-function Get-GS($id) {
-    if (!$gCache.ContainsKey($id)) {
-        $g = Get-J "$BaseUrl/rest/api/3/group?groupId=$id"
-        $gCache[$id] = if ($g) {"OK"} else {"MISSING"}
-    }
-    $gCache[$id]
-}
 
-$out = foreach ($p in $projs) {
+$i = 0
+foreach ($p in $projs) {
+    $i++
+    Write-Host "[$i/$($projs.Count)] $($p.key) - $($p.name)" -NoNewline
     $iss = @()
+
     if (!$p.lead) { $iss += "No project lead" }
     else {
         $us = Get-US $p.lead.accountId
-        if ($us -ne "OK") { $iss += "Project lead: $($us.ToLower())" }
+        if ($us -ne "OK") { $iss += "Lead: $us" }
     }
+
     $ps = Get-J "$BaseUrl/rest/api/3/project/$($p.key)/permissionscheme"
-    if     ($ps -eq "DENIED") { $iss += "PERMISSION DENIED: scheme" }
-    elseif (!$ps)              { $iss += "No permission scheme assigned" }
+    if     ($ps -eq "DENIED") { $iss += "DENIED: scheme" }
+    elseif (!$ps)              { $iss += "No permission scheme" }
     else {
         if (!$psCache.ContainsKey($ps.id)) {
             $psCache[$ps.id] = Get-J "$BaseUrl/rest/api/3/permissionscheme/$($ps.id)?expand=permissions"
         }
         $sd = $psCache[$ps.id]
         if ($sd -and $sd -ne "DENIED") {
-            if (!($sd.permissions | Where-Object { $_.permission -eq "BROWSE_PROJECTS" })) {
-                $iss += "Scheme: BROWSE_PROJECTS not granted"
-            }
-            foreach ($perm in $sd.permissions) {
-                if ($perm.holder.type -eq "user") {
-                    $us = Get-US $perm.holder.parameter
-                    if ($us -in "MISSING","INACTIVE") { $iss += "Scheme: $($us.ToLower()) user in $($perm.permission)" }
-                } elseif ($perm.holder.type -eq "group") {
-                    if ((Get-GS $perm.holder.parameter) -eq "MISSING") {
-                        $iss += "Scheme: group '$($perm.holder.value)' missing"
-                    }
-                }
-            }
-        }
-    }
-    $comps = Get-J "$BaseUrl/rest/api/3/project/$($p.key)/components"
-    if ($comps -and $comps -ne "DENIED") {
-        foreach ($comp in ($comps | Where-Object { $_.lead })) {
-            $us = Get-US $comp.lead.accountId
-            if ($us -in "MISSING","INACTIVE") { $iss += "Component '$($comp.name)': lead $($us.ToLower())" }
-        }
-    }
-    if ($iss.Count) { [PSCustomObject]@{ Name=$p.name; Key=$p.key; Id=$p.id; Issues=($iss -join " | ") } }
-}
-if ($out) { $out | Format-Table -AutoSize -Wrap } else { Write-Host "No configuration issues found." }
+            if (!($sd.permissions | Where-Object { $_.permission -eq "BROWSE_PROJECTS" })) { $iss += "BROWSE_PROJECTS missing" }
+            foreach ($perm in
