@@ -220,12 +220,38 @@ foreach ($schema in $schemas) {
             $typeName = 'Default/' + $(if ($defaultTypeNames.ContainsKey($dtId)) { $defaultTypeNames[$dtId] } else { "Unknown($dtId)" })
         }
 
-        # objectType is included in the per-schema attributes payload
-        $ot     = Get-Prop $attr 'objectType'
+        # objectType *should* be in the per-schema attributes payload, but some
+        # Insight versions omit it there. Fall back to the single-attribute
+        # endpoint, which always includes it.
+        $ot = Get-Prop $attr 'objectType'
+        if ($null -eq $ot) {
+            try {
+                $attrFull = Invoke-InsightApi ("/rest/insight/1.0/objecttypeattribute/{0}" -f (Get-Prop $attr 'id'))
+                $ot = Get-Prop $attrFull 'objectType'
+            }
+            catch {
+                Write-Warning ("  Could not resolve objectType for attribute '{0}' (id {1}): {2}" -f (Get-Prop $attr 'name' '?'), (Get-Prop $attr 'id' '?'), $_.Exception.Message)
+            }
+        }
         $otId   = Get-Prop $ot 'id'
         $otName = Get-Prop $ot 'name' '?'
         if ($null -eq $otId) {
-            Write-Warning ("  Attribute '{0}' (id {1}) has no objectType in payload - skipping IQL count." -f (Get-Prop $attr 'name' '?'), (Get-Prop $attr 'id' '?'))
+            # Keep it in the report rather than dropping it silently
+            $results.Add([PSCustomObject]@{
+                SchemaId        = $schema.id
+                SchemaName      = $schema.name
+                SchemaKey       = $schema.objectSchemaKey
+                ObjectTypeId    = ''
+                ObjectTypeName  = 'UNRESOLVED'
+                AttributeId     = Get-Prop $attr 'id' ''
+                AttributeName   = Get-Prop $attr 'name' '?'
+                AttributeType   = $typeName
+                TypeId          = $typeId
+                ObjectsWithData = -1
+                MigrationImpact = 'UNKNOWN - objectType unresolved, verify manually'
+                IqlUsed         = ''
+                Error           = 'objectType missing in schema payload and fallback lookup failed'
+            })
             continue
         }
 
