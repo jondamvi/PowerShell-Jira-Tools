@@ -1,54 +1,4 @@
-﻿param(
-    [Parameter(Mandatory)][string]$BaseUrl,
-    [Parameter(Mandatory)][string]$Email,
-    [Parameter(Mandatory)][string]$Token
-)
-$h = @{
-    Authorization  = "Basic " + [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes("${Email}:${Token}"))
-    "Content-Type" = "application/json"
-}
-function Get-J($url) {
-    try { Invoke-RestMethod -Uri $url -Headers $h -TimeoutSec 10 -ErrorAction Stop }
-    catch {
-        $code = $_.Exception.Response.StatusCode.value__
-        if ($code -in 401,403) { return "DENIED" }
-        return $null
-    }
-}
-
-Write-Host "Fetching project list..." -ForegroundColor Cyan
-$projs = @(); $start = 0
-do {
-    $r = Get-J "$BaseUrl/rest/api/3/project/search?maxResults=50&startAt=$start&expand=lead"
-    if ($r -eq "DENIED") { Write-Warning "Cannot list projects: access denied"; exit }
-    if (!$r) { break }
-    $projs += $r.values
-    Write-Host "  Got $($projs.Count) projects so far..."
-    $start += 50
-} while (-not $r.isLast)
-Write-Host "Total projects: $($projs.Count)" -ForegroundColor Cyan
-
-$uCache = @{}; $psCache = @{}
-function Get-US($id) {
-    if (!$uCache.ContainsKey($id)) {
-        $u = Get-J "$BaseUrl/rest/api/3/user?accountId=$id"
-        $uCache[$id] = if ($u -eq "DENIED") {"DENIED"} elseif (!$u) {"MISSING"} elseif (!$u.active) {"INACTIVE"} else {"OK"}
-    }
-    $uCache[$id]
-}
-
-$i = 0
-foreach ($p in $projs) {
-    $i++
-    Write-Host "[$i/$($projs.Count)] $($p.key) - $($p.name)" -NoNewline
-    $iss = @()
-
-    if (!$p.lead) { $iss += "No project lead" }
-    else {
-        $us = Get-US $p.lead.accountId
-        if ($us -ne "OK") { $iss += "Lead: $us" }
-    }
-
+﻿# Replace the entire ps/scheme block inside the foreach with this:
     $ps = Get-J "$BaseUrl/rest/api/3/project/$($p.key)/permissionscheme"
     if     ($ps -eq "DENIED") { $iss += "DENIED: scheme" }
     elseif (!$ps)              { $iss += "No permission scheme" }
@@ -59,31 +9,24 @@ foreach ($p in $projs) {
         $sd = $psCache[$ps.id]
         if ($sd -and $sd -ne "DENIED") {
             if (!($sd.permissions | Where-Object { $_.permission -eq "BROWSE_PROJECTS" })) { $iss += "BROWSE_PROJECTS missing" }
+            $missingGroups = @{}
             foreach ($perm in $sd.permissions) {
                 if ($perm.holder.type -eq "user") {
                     $us = Get-US $perm.holder.parameter
                     if ($us -in "MISSING","INACTIVE") { $iss += "Scheme: $us user in $($perm.permission)" }
                 } elseif ($perm.holder.type -eq "group") {
-                    $g = Get-J "$BaseUrl/rest/api/3/group?groupId=$($perm.holder.parameter)"
-                    if (!$g) { $iss += "Scheme: group '$($perm.holder.value)' missing" }
+                    $gid = $perm.holder.parameter
+                    if (!$gCache.ContainsKey($gid)) {
+                        $g = Get-J "$BaseUrl/rest/api/3/group?groupId=$gid"
+                        $gCache[$gid] = if ($g) { $g.name } else { "MISSING" }
+                    }
+                    if ($gCache[$gid] -eq "MISSING" -and !$missingGroups.ContainsKey($gid)) {
+                        $missingGroups[$gid] = if ($perm.holder.value) { $perm.holder.value } else { $gid }
+                    }
                 }
+            }
+            foreach ($kv in $missingGroups.GetEnumerator()) {
+                $iss += "Scheme: group '$($kv.Value)' [$($kv.Key)] missing"
             }
         }
     }
-
-    $comps = Get-J "$BaseUrl/rest/api/3/project/$($p.key)/components"
-    if ($comps -and $comps -ne "DENIED") {
-        foreach ($comp in ($comps | Where-Object { $_.lead })) {
-            $us = Get-US $comp.lead.accountId
-            if ($us -in "MISSING","INACTIVE") { $iss += "Component '$($comp.name)': lead $us" }
-        }
-    }
-
-    if ($iss.Count) {
-        Write-Host " ✗" -ForegroundColor Red
-        $iss | ForEach-Object { Write-Host "    → $_" -ForegroundColor Yellow }
-    } else {
-        Write-Host " ✓" -ForegroundColor Green
-    }
-}
-Write-Host "Done." -ForegroundColor Cyan
