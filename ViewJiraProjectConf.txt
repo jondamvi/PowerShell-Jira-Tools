@@ -59,4 +59,31 @@ foreach ($p in $projs) {
         $sd = $psCache[$ps.id]
         if ($sd -and $sd -ne "DENIED") {
             if (!($sd.permissions | Where-Object { $_.permission -eq "BROWSE_PROJECTS" })) { $iss += "BROWSE_PROJECTS missing" }
-            foreach ($perm in
+            foreach ($perm in $sd.permissions) {
+                if ($perm.holder.type -eq "user") {
+                    $us = Get-US $perm.holder.parameter
+                    if ($us -in "MISSING","INACTIVE") { $iss += "Scheme: $us user in $($perm.permission)" }
+                } elseif ($perm.holder.type -eq "group") {
+                    $g = Get-J "$BaseUrl/rest/api/3/group?groupId=$($perm.holder.parameter)"
+                    if (!$g) { $iss += "Scheme: group '$($perm.holder.value)' missing" }
+                }
+            }
+        }
+    }
+
+    $comps = Get-J "$BaseUrl/rest/api/3/project/$($p.key)/components"
+    if ($comps -and $comps -ne "DENIED") {
+        foreach ($comp in ($comps | Where-Object { $_.lead })) {
+            $us = Get-US $comp.lead.accountId
+            if ($us -in "MISSING","INACTIVE") { $iss += "Component '$($comp.name)': lead $us" }
+        }
+    }
+
+    if ($iss.Count) {
+        Write-Host " ✗" -ForegroundColor Red
+        $iss | ForEach-Object { Write-Host "    → $_" -ForegroundColor Yellow }
+    } else {
+        Write-Host " ✓" -ForegroundColor Green
+    }
+}
+Write-Host "Done." -ForegroundColor Cyan
