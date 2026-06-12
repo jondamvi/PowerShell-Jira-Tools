@@ -83,42 +83,36 @@ function Invoke-InsightApi {
     }
 }
 
-# --- Type maps ---------------------------------------------------------------
-# Insight DC attribute 'type' enum
-$typeNames = @{
-    0 = 'Default'; 1 = 'Object'; 2 = 'User'; 3 = 'Confluence'
-    4 = 'Group';   5 = 'Version'; 6 = 'Project'; 7 = 'Status'
-}
-# Not supported in JSM Cloud Assets (legacy types)
-$unsupportedTypes = @(3, 5, 6)
-
-# Default sub-types (for the optional Time check)
-$defaultTypeNames = @{
-    0='Text';1='Integer';2='Boolean';3='Double';4='Date';5='Time'
-    6='DateTime';7='URL';8='Email';9='Textarea';10='Select';11='IP Address'
-}
-
-# --- 1. Enumerate schemas ----------------------------------------------------
-Write-Host "Fetching object schemas from $BaseUrl ..." -ForegroundColor Cyan
-$schemaList = Invoke-InsightApi '/rest/insight/1.0/objectschema/list'
-$schemas = @($schemaList.objectschemas)
-
-if ($SchemaNameFilter) {
-    $schemas = @($schemas | Where-Object {
-        $name = $_.name
-        ($SchemaNameFilter | Where-Object { $_ -ieq $name }).Count -gt 0
-    })
-}
-Write-Host ("Schemas to scan: {0}" -f (($schemas | ForEach-Object { $_.name }) -join ', '))
-
-$results = New-Object System.Collections.Generic.List[object]
-$detailResults = New-Object System.Collections.Generic.List[object]
-
+# --- Helpers (must be defined before first API call) --------------------------
 # StrictMode-safe property access
 function Get-Prop {
     param($Object, [string]$Name, $Default = $null)
     if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { return $Object.$Name }
     return $Default
+}
+
+# Force a response into a flat one-item-per-element array, regardless of how
+# Invoke-RestMethod shaped it (single object, Object[], nested arrays, or a
+# wrapper object). Prevents member-enumeration bugs in downstream pipelines.
+function ConvertTo-FlatArray {
+    param($InputObject)
+    $out = New-Object System.Collections.Generic.List[object]
+    if ($null -eq $InputObject) { return ,@() }
+    $stack = New-Object System.Collections.Stack
+    $stack.Push($InputObject)
+    while ($stack.Count -gt 0) {
+        $item = $stack.Pop()
+        if ($null -eq $item) { continue }
+        if ($item -is [System.Collections.IEnumerable] -and $item -isnot [string] -and $item -isnot [System.Collections.IDictionary]) {
+            # Push in reverse to preserve order
+            $tmp = @($item)
+            for ($i = $tmp.Count - 1; $i -ge 0; $i--) { $stack.Push($tmp[$i]) }
+        }
+        else {
+            $out.Add($item)
+        }
+    }
+    return ,$out.ToArray()
 }
 
 # Flatten a single objectAttributeValue entry into display + raw strings
@@ -143,17 +137,74 @@ function Convert-AttrValue {
     }
 }
 
+# --- Type maps ---------------------------------------------------------------
+# Insight DC attribute 'type' enum
+$typeNames = @{
+    0 = 'Default'; 1 = 'Object'; 2 = 'User'; 3 = 'Confluence'
+    4 = 'Group';   5 = 'Version'; 6 = 'Project'; 7 = 'Status'
+}
+# Not supported in JSM Cloud Assets (legacy types)
+$unsupportedTypes = @(3, 5, 6)
+
+# Default sub-types (for the optional Time check)
+$defaultTypeNames = @{
+    0='Text';1='Integer';2='Boolean';3='Double';4='Date';5='Time'
+    6='DateTime';7='URL';8='Email';9='Textarea';10='Select';11='IP Address'
+}
+
+# --- 1. Enumerate schemas ----------------------------------------------------
+Write-Host "Fetching object schemas from $BaseUrl ..." -ForegroundColor Cyan
+$schemaList = Invoke-InsightApi '/rest/insight/1.0/objectschema/list'
+$schemas = ConvertTo-FlatArray (Get-Prop $schemaList 'objectschemas')
+
+if ($SchemaNameFilter) {
+    $schemas = @($schemas | Where-Object {
+        $name = $_.name
+        ($SchemaNameFilter | Where-Object { $_ -ieq $name }).Count -gt 0
+    })
+}
+Write-Host ("Schemas to scan: {0}" -f (($schemas | ForEach-Object { $_.name }) -join ', '))
+
+$results = New-Object System.Collections.Generic.List[object]
+$detailResults = New-Object System.Collections.Generic.List[object]
+
 foreach ($schema in $schemas) {
     Write-Host ("`n=== Schema [{0}] {1} (key: {2}) ===" -f $schema.id, $schema.name, $schema.objectSchemaKey) -ForegroundColor Yellow
 
     # --- 2. All attribute definitions in this schema -------------------------
-    $attributes = @(Invoke-InsightApi ("/rest/insight/1.0/objectschema/{0}/attributes" -f $schema.id))
+    $attrResponse = Invoke-InsightApi ("/rest/insight/1.0/objectschema/{0}/attributes" -f $schema.id)
+
+    # Some versions wrap the list; unwrap if so, then flatten to a clean array
+    if ($attrResponse -isnot [System.Collections.IEnumerable] -or $attrResponse -is [string]) {
+        $wrapped = Get-Prop $attrResponse 'objectTypeAttributes'
+        if ($null -ne $wrapped) { $attrResponse = $wrapped }
+    }
+    $attributes = ConvertTo-FlatArray $attrResponse
+    Write-Host ("  Attribute definitions found: {0}" -f $attributes.Count)
 
     # --- 3. Filter unsupported types ------------------------------------------
-    $flagged = @($attributes | Where-Object {
-        ($unsupportedTypes -contains [int]$_.type) -or
-        ($IncludeTimeType -and [int]$_.type -eq 0 -and $_.PSObject.Properties['defaultType'] -and $_.defaultType -and [int]$_.defaultType.id -eq 5)
-    })
+    # Explicit foreach + TryParse instead of pipeline Where-Object: immune to
+    # member enumeration and to 'type' arriving as string/missing.
+    $flagged = New-Object System.Collections.Generic.List[object]
+    foreach ($a in $attributes) {
+        if ($null -eq $a) { continue }
+        $rawType = Get-Prop $a 'type'
+        $tInt = 0
+        if ($null -eq $rawType -or -not [int]::TryParse([string]$rawType, [ref]$tInt)) {
+            Write-Verbose ("  Skipping attribute '{0}' - unparsable type value '{1}'" -f (Get-Prop $a 'name' '?'), $rawType)
+            continue
+        }
+        $isUnsupported = $unsupportedTypes -contains $tInt
+        $isTimeType = $false
+        if ($IncludeTimeType -and $tInt -eq 0) {
+            $dt = Get-Prop $a 'defaultType'
+            $dtId = 0
+            if ($null -ne $dt -and [int]::TryParse([string](Get-Prop $dt 'id' ''), [ref]$dtId) -and $dtId -eq 5) {
+                $isTimeType = $true
+            }
+        }
+        if ($isUnsupported -or $isTimeType) { $flagged.Add($a) }
+    }
 
     if ($flagged.Count -eq 0) {
         Write-Host "  No unsupported attribute types found." -ForegroundColor Green
@@ -162,15 +213,21 @@ foreach ($schema in $schemas) {
     Write-Host ("  Flagged attribute definitions: {0}" -f $flagged.Count) -ForegroundColor Magenta
 
     foreach ($attr in $flagged) {
-        $typeId   = [int]$attr.type
+        $typeId   = [int](Get-Prop $attr 'type' -1)
         $typeName = if ($typeNames.ContainsKey($typeId)) { $typeNames[$typeId] } else { "Unknown($typeId)" }
         if ($typeId -eq 0) {
-            $typeName = 'Default/' + $defaultTypeNames[[int]$attr.defaultType.id]
+            $dtId = [int](Get-Prop (Get-Prop $attr 'defaultType') 'id' -1)
+            $typeName = 'Default/' + $(if ($defaultTypeNames.ContainsKey($dtId)) { $defaultTypeNames[$dtId] } else { "Unknown($dtId)" })
         }
 
         # objectType is included in the per-schema attributes payload
-        $otId   = $attr.objectType.id
-        $otName = $attr.objectType.name
+        $ot     = Get-Prop $attr 'objectType'
+        $otId   = Get-Prop $ot 'id'
+        $otName = Get-Prop $ot 'name' '?'
+        if ($null -eq $otId) {
+            Write-Warning ("  Attribute '{0}' (id {1}) has no objectType in payload - skipping IQL count." -f (Get-Prop $attr 'name' '?'), (Get-Prop $attr 'id' '?'))
+            continue
+        }
 
         # --- 4. IQL: does this attribute hold data on any object? ------------
         # Use objectTypeId to avoid name-quoting issues; attribute name still needs quotes.
@@ -206,16 +263,16 @@ foreach ($schema in $schemas) {
                     break
                 }
                 $totalPages = [int](Get-Prop $pageResult 'pageSize' 1)
-                $entries = @(Get-Prop $pageResult 'objectEntries' @())
+                $entries = ConvertTo-FlatArray (Get-Prop $pageResult 'objectEntries')
 
                 foreach ($obj in $entries) {
                     $fetched++
                     # Pick only the flagged attribute off this object
-                    $objAttrs = @(Get-Prop $obj 'attributes' @())
-                    $match = $objAttrs | Where-Object { (Get-Prop $_ 'objectTypeAttributeId') -eq $attr.id }
+                    $objAttrs = ConvertTo-FlatArray (Get-Prop $obj 'attributes')
                     $values = @()
-                    foreach ($m in @($match)) {
-                        foreach ($v in @(Get-Prop $m 'objectAttributeValues' @())) {
+                    foreach ($m in $objAttrs) {
+                        if ([string](Get-Prop $m 'objectTypeAttributeId' '') -ne [string]$attr.id) { continue }
+                        foreach ($v in (ConvertTo-FlatArray (Get-Prop $m 'objectAttributeValues'))) {
                             $values += Convert-AttrValue $v
                         }
                     }
