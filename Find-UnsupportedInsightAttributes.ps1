@@ -351,7 +351,7 @@ foreach ($schema in $schemas) {
         $results.Add($row)
 
         $color = if ($objectsWithData -gt 0) { 'Red' } else { 'Gray' }
-        Write-Host ("    [{0}] {1}.{2} -> {3} object(s) with data" -f $typeName, $otName, $attr.name, $objectsWithData) -ForegroundColor $color
+        Write-Host ("    [{0}] ObjectType='{1}' | Attribute='{2}' (id {3}) -> {4} object(s) with data" -f $typeName, $otName, $attr.name, $attr.id, $objectsWithData) -ForegroundColor $color
     }
 }
 
@@ -362,7 +362,7 @@ if ($results.Count -eq 0) {
 }
 else {
     $results | Sort-Object -Property ObjectsWithData -Descending |
-        Format-Table SchemaName, ObjectTypeName, AttributeName, AttributeType, ObjectsWithData, MigrationImpact -AutoSize
+        Format-Table SchemaName, ObjectTypeName, AttributeName, AttributeId, AttributeType, ObjectsWithData, MigrationImpact -AutoSize
 
     $results | Export-Csv -Path $OutputCsv -NoTypeInformation -Encoding UTF8
     Write-Host ("Full report written to: {0}" -f (Resolve-Path $OutputCsv)) -ForegroundColor Cyan
