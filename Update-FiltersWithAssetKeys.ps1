@@ -1,20 +1,34 @@
 <#
 .SYNOPSIS
     Rewrites Jira Cloud filter JQLs that reference migrated asset object keys.
-    Converts:   field  = CMDB-1235   ->   field IN aqlFunction("oldKey = CMDB-1235")
-                field != CMDB-1235   ->   field NOT IN aqlFunction("oldKey = CMDB-1235")
-    DRY RUN by default — no writes unless -Commit is passed.
-    Keys found in other contexts (e.g. inside IN lists) are NOT rewritten; they are
-    flagged in the ManualReview column.
+
+    Handled patterns:
+      1. Direct:   field  = CMDB-74822        -> field IN aqlFunction("Legacy-Key = CMDB-74822")
+                   field != CMDB-74822        -> field NOT IN aqlFunction("Legacy-Key = CMDB-74822")
+      2. Arrays:   field in (CMDB-74822, CMDB-74825)
+                                              -> field IN aqlFunction("Legacy-Key IN (CMDB-74822, CMDB-74825)")
+                   (also NOT IN; items may be bare, quoted, or labeled "Name (KEY)")
+      3. Labeled:  field = "Hardware (CMDB-74822)"
+                                              -> field IN aqlFunction("Legacy-Key = CMDB-74822")
+
+    Safety:
+      - DRY RUN by default. Writes happen only with -Commit.
+      - Filters already containing aqlFunction( are never rewritten
+        (Status = SkippedAlreadyMigrated) so nested AQL cannot be corrupted.
+      - Quoted values are only converted if they ARE a key or END with "(KEY)".
+      - IN lists mixing keys with non-key values are left untouched; leftover
+        key tokens after rewrite set ManualReview = True.
+      - -Filters "name1","Test*" restricts processing to matching filter names
+        (wildcards supported). Works in both dry-run and commit mode.
 
 .EXAMPLE
-    # Dry run, review CSV first:
+    # Test mode, dry run on your 4 test filters:
     .\Update-FiltersWithAssetKeys.ps1 -JiraBaseUrl "https://yoursite.atlassian.net" `
         -Email "you@company.com" -ApiToken $token `
-        -AssetKeyPrefixes CMDB,JSRK -ExportCsv "replace-preview.csv"
+        -AssetKeyPrefixes CMDB,JSRK -Filters "AssetKeyTest*"
 
-    # Actually write:
-    .\Update-FiltersWithAssetKeys.ps1 ... -Commit
+    # Test mode, commit on one filter:
+    .\Update-FiltersWithAssetKeys.ps1 ... -Filters "AssetKeyTest-Direct" -Commit
 #>
 
 [CmdletBinding()]
@@ -29,10 +43,17 @@ param (
     [string]$ApiToken,
 
     [Parameter(Mandatory)]
-    [string[]]$AssetKeyPrefixes,        # e.g. CMDB, JSRK
+    [string[]]$AssetKeyPrefixes,          # e.g. CMDB, JSRK
 
-    # AQL attribute holding the old DC key on the migrated objects
-    [string]$AqlAttributeName = 'oldKey',
+    # AQL attribute holding the old DC key on migrated objects
+    [string]$AqlAttributeName = 'Legacy-Key',
+
+    # Wrap the attribute name in escaped quotes inside the AQL string:
+    # aqlFunction("\"Legacy-Key\" = CMDB-1"). Use if AQL rejects the bare hyphenated name.
+    [switch]$QuoteAqlAttribute,
+
+    # Restrict to these filter names (wildcards allowed). For testing.
+    [string[]]$Filters,
 
     [string]$ExportCsv,
 
@@ -53,27 +74,64 @@ $pair    = "{0}:{1}" -f $Email, $ApiToken
 $basic   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $headers = @{ Authorization = "Basic $basic"; Accept = 'application/json' }
 
+# --- Attribute as rendered inside the AQL string ---
+$script:AqlAttr = if ($QuoteAqlAttribute) { '\"{0}\"' -f $AqlAttributeName } else { $AqlAttributeName }
+
 # --- Regexes ---
-$prefixAlt = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }) -join '|'
+$prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }) -join '|'
+$keyPattern = "(?:$prefixAlt)-\d+"
+$tokenRegex = [regex]"\b$keyPattern\b"
 
-# Detection (same as find script): any key token anywhere
-$tokenRegex = [regex]"\b(?:$prefixAlt)-\d+\b"
-
-# Rewrite: operator (= or !=) followed by an optionally-quoted key token
-$rewriteRegex = [regex]"(!=|=)\s*""?((?:$prefixAlt)-\d+)""?"
-
-$evaluator = {
-    param($m)
-    $op = if ($m.Groups[1].Value -eq '!=') { 'NOT IN' } else { 'IN' }
-    '{0} aqlFunction("{1} = {2}")' -f $op, $AqlAttributeName, $m.Groups[2].Value
+# Extracts a key from a value: either the value IS a key, or it ends with "(KEY)".
+function Get-KeyFromValue {
+    param([string]$Value)
+    $v = $Value.Trim()
+    if ($v -match "^(?<k>$keyPattern)$")        { return $Matches['k'] }
+    if ($v -match "\((?<k>$keyPattern)\)\s*$")  { return $Matches['k'] }
+    return $null
 }
 
-Write-Host "Detection pattern : $($tokenRegex.ToString())"   -ForegroundColor Cyan
-Write-Host "Rewrite pattern   : $($rewriteRegex.ToString())" -ForegroundColor Cyan
-if ($Commit) {
-    Write-Host "MODE: COMMIT — filters WILL be updated." -ForegroundColor Red
-} else {
-    Write-Host "MODE: DRY RUN — no writes will be made." -ForegroundColor Green
+# Pattern 2: in / not in ( item, item, ... ) — items are quoted strings or bare tokens
+$listItem   = '"[^"]*"|''[^'']*''|[^,()\s]+'
+$arrayRegex = [regex]"(?i)\b(not\s+in|in)\s*\(\s*(?:$listItem)(?:\s*,\s*(?:$listItem))*\s*\)"
+
+$arrayEvaluator = {
+    param($m)
+    $op    = if ($m.Groups[1].Value -match '(?i)not') { 'NOT IN' } else { 'IN' }
+    $inner = $m.Value.Substring($m.Value.IndexOf('(') + 1)
+    $inner = $inner.Substring(0, $inner.LastIndexOf(')'))
+    $keys  = @()
+    foreach ($im in [regex]::Matches($inner, '"([^"]*)"|''([^'']*)''|([^,\s]+)')) {
+        $raw = if ($im.Groups[1].Success) { $im.Groups[1].Value }
+               elseif ($im.Groups[2].Success) { $im.Groups[2].Value }
+               else { $im.Groups[3].Value }
+        $k = Get-KeyFromValue $raw
+        if (-not $k) { return $m.Value }   # any non-key item -> leave whole list untouched
+        $keys += $k
+    }
+    if ($keys.Count -eq 0) { return $m.Value }
+    '{0} aqlFunction("{1} IN ({2})")' -f $op, $script:AqlAttr, ($keys -join ', ')
+}
+
+# Patterns 1 + 3: (= | !=) followed by bare key, "quoted", or 'quoted'
+$scalarRegex = [regex]"(!=|=)\s*(?:""([^""]*)""|'([^']*)'|($keyPattern)\b)"
+
+$scalarEvaluator = {
+    param($m)
+    $val = if ($m.Groups[2].Success) { $m.Groups[2].Value }
+           elseif ($m.Groups[3].Success) { $m.Groups[3].Value }
+           else { $m.Groups[4].Value }
+    $k = Get-KeyFromValue $val
+    if (-not $k) { return $m.Value }       # ordinary string comparison -> untouched
+    $op = if ($m.Groups[1].Value -eq '!=') { 'NOT IN' } else { 'IN' }
+    '{0} aqlFunction("{1} = {2}")' -f $op, $script:AqlAttr, $k
+}
+
+function Convert-Jql {
+    param([string]$Jql)
+    $out = $arrayRegex.Replace($Jql, [System.Text.RegularExpressions.MatchEvaluator]$arrayEvaluator)
+    $out = $scalarRegex.Replace($out, [System.Text.RegularExpressions.MatchEvaluator]$scalarEvaluator)
+    return $out
 }
 
 # --- Strip read-only 'id' from permission objects so GET output is PUT-compatible ---
@@ -85,10 +143,20 @@ function ConvertTo-PermissionRequest {
     })
 }
 
+Write-Host "Detection pattern : $($tokenRegex.ToString())" -ForegroundColor Cyan
+Write-Host "AQL attribute     : $AqlAttributeName"          -ForegroundColor Cyan
+if ($Filters) { Write-Host "Filter name scope : $($Filters -join ', ')" -ForegroundColor Cyan }
+if ($Commit) {
+    Write-Host "MODE: COMMIT — matching filters WILL be updated." -ForegroundColor Red
+} else {
+    Write-Host "MODE: DRY RUN — no writes will be made." -ForegroundColor Green
+}
+
 # --- Walk all filters (paginated) ---
-$startAt      = 0
-$totalScanned = 0
-$results      = New-Object System.Collections.Generic.List[object]
+$startAt        = 0
+$totalScanned   = 0
+$results        = New-Object System.Collections.Generic.List[object]
+$processedNames = New-Object System.Collections.Generic.List[string]
 
 do {
     $uri = "$JiraBaseUrl/rest/api/3/filter/search?startAt=$startAt&maxResults=$PageSize" +
@@ -99,46 +167,69 @@ do {
 
     foreach ($filter in $page.values) {
         $totalScanned++
-        if ([string]::IsNullOrWhiteSpace($filter.jql)) { continue }
+
+        if ($Filters) {
+            $nameHit = $false
+            foreach ($pattern in $Filters) {
+                if ($filter.name -like $pattern) { $nameHit = $true; break }
+            }
+            if (-not $nameHit) { continue }
+            $processedNames.Add($filter.name)
+        }
+
+        if ([string]::IsNullOrWhiteSpace($filter.jql)) {
+            if ($Filters) { Write-Host "[$($filter.name)] empty JQL — nothing to do" -ForegroundColor DarkGray }
+            continue
+        }
 
         $found = $tokenRegex.Matches($filter.jql)
-        if ($found.Count -eq 0) { continue }
-
-        $keys   = ($found | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ', '
-        $newJql = $rewriteRegex.Replace($filter.jql, $evaluator)
-
-        # Keys still present after rewrite = contexts the rewrite doesn't handle (IN lists etc.)
-        $leftover     = $tokenRegex.Matches($newJql)
-        $manualReview = ($leftover.Count -gt 0)
-        $changed      = ($newJql -ne $filter.jql)
-
-        $status = 'DryRun'
-        if ($Commit) {
-            if (-not $changed) {
-                $status = 'SkippedNoChange'
-            }
-            else {
-                try {
-                    $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
-                    if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                    $body = @{
-                        name             = $filter.name
-                        description      = $filter.description
-                        jql              = $newJql
-                        sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
-                        editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
-                    } | ConvertTo-Json -Depth 10
-                    Invoke-RestMethod -Uri $putUri -Headers $headers -Method Put `
-                        -ContentType 'application/json' -Body $body | Out-Null
-                    $status = 'Updated'
-                }
-                catch {
-                    $status = "FAILED: $($_.Exception.Message)"
-                }
-            }
+        if ($found.Count -eq 0) {
+            if ($Filters) { Write-Host "[$($filter.name)] no asset key references found" -ForegroundColor DarkGray }
+            continue
         }
-        elseif (-not $changed) {
-            $status = 'DryRun-NoChange'
+
+        $keys = ($found | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ', '
+
+        # Never touch filters that already use aqlFunction — nested AQL would be corrupted
+        $alreadyMigrated = $filter.jql -match '(?i)aqlFunction\s*\('
+        if ($alreadyMigrated) {
+            $newJql       = $filter.jql
+            $manualReview = $true
+            $status       = 'SkippedAlreadyMigrated'
+        }
+        else {
+            $newJql       = Convert-Jql -Jql $filter.jql
+            $manualReview = $tokenRegex.IsMatch($newJql)   # leftovers = unhandled contexts
+            $changed      = ($newJql -ne $filter.jql)
+
+            $status = 'DryRun'
+            if ($Commit) {
+                if (-not $changed) {
+                    $status = 'SkippedNoChange'
+                }
+                else {
+                    try {
+                        $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
+                        if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
+                        $body = @{
+                            name             = $filter.name
+                            description      = $filter.description
+                            jql              = $newJql
+                            sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
+                            editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
+                        } | ConvertTo-Json -Depth 10
+                        Invoke-RestMethod -Uri $putUri -Headers $headers -Method Put `
+                            -ContentType 'application/json' -Body $body | Out-Null
+                        $status = 'Updated'
+                    }
+                    catch {
+                        $status = "FAILED: $($_.Exception.Message)"
+                    }
+                }
+            }
+            elseif (-not $changed) {
+                $status = 'DryRun-NoChange'
+            }
         }
 
         $results.Add([PSCustomObject]@{
@@ -152,15 +243,21 @@ do {
             Status       = $status
         })
 
-        $color = if ($status -like 'FAILED*') { 'Red' } elseif ($manualReview) { 'Magenta' } else { 'Yellow' }
+        $color = if ($status -like 'FAILED*') { 'Red' }
+                 elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
+                 elseif ($manualReview) { 'Magenta' }
+                 else { 'Yellow' }
         Write-Host ("=" * 70) -ForegroundColor $color
         Write-Host "Filter ID    : $($filter.id)"
         Write-Host "Filter Name  : $($filter.name)"
         Write-Host "Matched Keys : $keys"
-        Write-Host "Old JQL      : $($filter.jql)"
-        Write-Host "New JQL      : $newJql" -ForegroundColor Green
-        if ($manualReview) {
-            Write-Host "MANUAL REVIEW: key(s) in unhandled context (IN list etc.) left untouched" -ForegroundColor Magenta
+        Write-Host "Current JQL  : $($filter.jql)"
+        Write-Host "Replace JQL  : $newJql" -ForegroundColor Green
+        if ($status -eq 'SkippedAlreadyMigrated') {
+            Write-Host "SKIPPED      : already contains aqlFunction — review manually" -ForegroundColor DarkYellow
+        }
+        elseif ($manualReview) {
+            Write-Host "MANUAL REVIEW: key(s) left in unhandled context" -ForegroundColor Magenta
         }
         Write-Host "Status       : $status"
     }
@@ -169,6 +266,17 @@ do {
     Write-Host "...scanned $totalScanned / $($page.total) filters" -ForegroundColor DarkGray
 
 } while (-not $page.isLast -and $page.values.Count -gt 0)
+
+# --- Warn about -Filters patterns that matched nothing ---
+if ($Filters) {
+    foreach ($pattern in $Filters) {
+        $hit = $false
+        foreach ($n in $processedNames) { if ($n -like $pattern) { $hit = $true; break } }
+        if (-not $hit) {
+            Write-Host "WARNING: no scanned filter matched -Filters pattern '$pattern'" -ForegroundColor Red
+        }
+    }
+}
 
 # --- Summary ---
 $updated = @($results | Where-Object { $_.Status -eq 'Updated' }).Count
