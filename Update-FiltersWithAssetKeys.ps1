@@ -154,13 +154,42 @@ function Convert-Jql {
     return $out
 }
 
-# --- Strip read-only 'id' from permission objects so GET output is PUT-compatible ---
+# --- Map GET permission objects to the minimal shapes the PUT input schema expects ---
 function ConvertTo-PermissionRequest {
     param($Permissions)
     if (-not $Permissions) { return @() }
-    return @($Permissions | ForEach-Object {
-        $_ | Select-Object -Property * -ExcludeProperty id
-    })
+    $out = @()
+    foreach ($p in $Permissions) {
+        switch ($p.type) {
+            'user'        { $out += @{ type = 'user'; user = @{ accountId = $p.user.accountId } } }
+            'group'       {
+                if ($p.group.groupId) { $out += @{ type = 'group'; group = @{ groupId = $p.group.groupId } } }
+                else                  { $out += @{ type = 'group'; group = @{ name = $p.group.name } } }
+            }
+            'project'     { $out += @{ type = 'project'; project = @{ id = "$($p.project.id)" } } }
+            'projectRole' { $out += @{ type = 'projectRole'; project = @{ id = "$($p.project.id)" }; role = @{ id = "$($p.role.id)" } } }
+            default       { $out += @{ type = $p.type } }   # global / loggedin / authenticated
+        }
+    }
+    return ,$out
+}
+
+# --- Extract the real error body from a failed REST call (PS 5.1 and 7.x) ---
+function Get-JiraErrorDetail {
+    param($ErrorRecord)
+    if ($ErrorRecord.ErrorDetails -and $ErrorRecord.ErrorDetails.Message) {
+        return $ErrorRecord.ErrorDetails.Message
+    }
+    try {
+        $stream = $ErrorRecord.Exception.Response.GetResponseStream()
+        if ($stream) {
+            if ($stream.CanSeek) { $stream.Position = 0 }
+            $reader = New-Object System.IO.StreamReader($stream)
+            $body = $reader.ReadToEnd()
+            if ($body) { return "$($ErrorRecord.Exception.Message) | $body" }
+        }
+    } catch { }
+    return $ErrorRecord.Exception.Message
 }
 
 # --- Paginated fetch; returns all filter objects for the given extra query ---
@@ -235,7 +264,7 @@ function Invoke-FilterProcessing {
                     $status = 'Updated'
                 }
                 catch {
-                    $status = "FAILED: $($_.Exception.Message)"
+                    $status = "FAILED: $(Get-JiraErrorDetail $_)"
                 }
             }
         }
