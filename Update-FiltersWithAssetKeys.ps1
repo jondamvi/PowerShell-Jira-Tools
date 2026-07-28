@@ -157,7 +157,7 @@ function Convert-Jql {
 # --- Map GET permission objects to the minimal shapes the PUT input schema expects ---
 function ConvertTo-PermissionRequest {
     param($Permissions)
-    if (-not $Permissions) { return @() }
+    if (-not $Permissions) { return ,@() }   # unary comma: without it @() unrolls to $null -> "sharePermissions": null -> 400
     $out = @()
     foreach ($p in $Permissions) {
         switch ($p.type) {
@@ -252,13 +252,14 @@ function Invoke-FilterProcessing {
                 try {
                     $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
                     if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                    $body = @{
+                    $bodyHash = @{
                         name             = $filter.name
-                        description      = $filter.description
                         jql              = $newJql
                         sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
                         editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
-                    } | ConvertTo-Json -Depth 10
+                    }
+                    if ($null -ne $filter.description) { $bodyHash.description = $filter.description }
+                    $body = $bodyHash | ConvertTo-Json -Depth 10
                     Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
                         -ContentType 'application/json' -Body $body | Out-Null
                     $status = 'Updated'
