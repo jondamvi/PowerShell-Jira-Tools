@@ -14,24 +14,25 @@
                    field in "APP (JRSK-36294)"
                                               -> field IN aqlFunction("Legacy-Key = JRSK-36294")
 
+    -Filters semantics:
+      - Names without wildcards: EXACT match. Each name is queried server-side
+        (filterName param), then the single filter whose name equals the given
+        name is selected. A name with no exact match processes nothing.
+      - Names with wildcards (* ? [ ]): full scan, client-side -like matching.
+
     Safety:
       - DRY RUN by default. Writes happen only with -Commit.
       - Filters already containing aqlFunction( are never rewritten
-        (Status = SkippedAlreadyMigrated) so nested AQL cannot be corrupted.
+        (Status = SkippedAlreadyMigrated).
       - Quoted values are only converted if they ARE a key or END with "(KEY)".
       - IN lists mixing keys with non-key values are left untouched; leftover
         key tokens after rewrite set ManualReview = True.
-      - -Filters "name1","Test*" restricts processing to matching filter names
-        (wildcards supported). Works in both dry-run and commit mode.
 
 .EXAMPLE
-    # Test mode, dry run on your 4 test filters:
     .\Update-FiltersWithAssetKeys.ps1 -JiraBaseUrl "https://yoursite.atlassian.net" `
         -Email "you@company.com" -ApiToken $token `
-        -AssetKeyPrefixes CMDB,JSRK -Filters "AssetKeyTest*"
-
-    # Test mode, commit on one filter:
-    .\Update-FiltersWithAssetKeys.ps1 ... -Filters "AssetKeyTest-Direct" -Commit
+        -AssetKeyPrefixes CMDB,JSRK -AqlAttributeName Key `
+        -Filters "TestFilter_Compound","TestFilter_Compound_Public"
 #>
 
 [CmdletBinding()]
@@ -55,12 +56,13 @@ param (
     # aqlFunction("\"Legacy-Key\" = CMDB-1"). Use if AQL rejects the bare hyphenated name.
     [switch]$QuoteAqlAttribute,
 
-    # Restrict to these filter names (wildcards allowed). For testing.
+    # Restrict to these filter names. No wildcards = exact name match via server-side
+    # query. Wildcards = full scan with client-side -like matching.
     [string[]]$Filters,
 
     [string]$ExportCsv,
 
-    # Requires Jira admin. Scans/edits ALL filters, not just ones visible to this account.
+    # Requires Administer Jira global permission (experimental API param).
     [switch]$OverrideSharePermissions,
 
     # Without this switch the script is a pure dry run — zero write calls.
@@ -84,7 +86,7 @@ try {
     $me = Invoke-RestMethod -Uri "$JiraBaseUrl/rest/api/3/myself" -Headers $headers -Method Get
 }
 catch {
-    throw "Auth preflight against /rest/api/3/myself failed: $($_.Exception.Message) — check -JiraBaseUrl, -Email, -ApiToken (watch for trailing whitespace/newline in the token)."
+    throw "Auth preflight against /rest/api/3/myself failed: $($_.Exception.Message) — check -JiraBaseUrl, -Email, -ApiToken (watch for trailing whitespace/newline in the token; note API tokens now expire, max 1 year)."
 }
 if (-not $me.accountId) {
     throw "Jira served the request as ANONYMOUS (no accountId from /myself). The -Email/-ApiToken pair is not authenticating."
@@ -161,6 +163,118 @@ function ConvertTo-PermissionRequest {
     })
 }
 
+# --- Paginated fetch; returns all filter objects for the given extra query ---
+$script:baseUri = "$JiraBaseUrl/rest/api/3/filter/search?maxResults=$PageSize" +
+                  "&expand=jql,description,sharePermissions,editPermissions"
+if ($OverrideSharePermissions) { $script:baseUri += "&overrideSharePermissions=true" }
+
+function Get-AllFilterPages {
+    param([string]$ExtraQuery = '')
+    $acc     = New-Object System.Collections.Generic.List[object]
+    $startAt = 0
+    do {
+        $uri  = "$($script:baseUri)&startAt=$startAt$ExtraQuery"
+        $page = Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Get
+        foreach ($f in @($page.values)) { if ($null -ne $f) { $acc.Add($f) } }
+        $startAt += @($page.values).Count
+    } while (-not $page.isLast -and @($page.values).Count -gt 0)
+    return ,$acc
+}
+
+# --- Per-filter processing (shared by both selection modes) ---
+$script:totalScanned = 0
+$script:results      = New-Object System.Collections.Generic.List[object]
+
+function Invoke-FilterProcessing {
+    param($filter)
+    $script:totalScanned++
+
+    if ([string]::IsNullOrWhiteSpace($filter.jql)) {
+        if ($Filters) { Write-Host "[$($filter.name)] empty JQL — nothing to do" -ForegroundColor DarkGray }
+        return
+    }
+
+    $found = $tokenRegex.Matches($filter.jql)
+    if ($found.Count -eq 0) {
+        if ($Filters) { Write-Host "[$($filter.name)] no asset key references found" -ForegroundColor DarkGray }
+        return
+    }
+
+    $keys = ($found | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ', '
+
+    # Never touch filters that already use aqlFunction — nested AQL would be corrupted
+    $alreadyMigrated = $filter.jql -match '(?i)aqlFunction\s*\('
+    if ($alreadyMigrated) {
+        $newJql       = $filter.jql
+        $manualReview = $true
+        $status       = 'SkippedAlreadyMigrated'
+    }
+    else {
+        $newJql       = Convert-Jql -Jql $filter.jql
+        $manualReview = $tokenRegex.IsMatch($newJql)   # leftovers = unhandled contexts
+        $changed      = ($newJql -ne $filter.jql)
+
+        $status = 'DryRun'
+        if ($Commit) {
+            if (-not $changed) {
+                $status = 'SkippedNoChange'
+            }
+            else {
+                try {
+                    $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
+                    if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
+                    $body = @{
+                        name             = $filter.name
+                        description      = $filter.description
+                        jql              = $newJql
+                        sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
+                        editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
+                    } | ConvertTo-Json -Depth 10
+                    Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
+                        -ContentType 'application/json' -Body $body | Out-Null
+                    $status = 'Updated'
+                }
+                catch {
+                    $status = "FAILED: $($_.Exception.Message)"
+                }
+            }
+        }
+        elseif (-not $changed) {
+            $status = 'DryRun-NoChange'
+        }
+    }
+
+    $script:results.Add([PSCustomObject]@{
+        FilterId     = $filter.id
+        FilterName   = $filter.name
+        Owner        = $filter.owner.displayName
+        MatchedKeys  = $keys
+        FilterJql    = $filter.jql
+        ReplaceJQL   = $newJql
+        ManualReview = $manualReview
+        Status       = $status
+    })
+
+    $color = if ($status -like 'FAILED*') { 'Red' }
+             elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
+             elseif ($manualReview) { 'Magenta' }
+             else { 'Yellow' }
+    Write-Host ("=" * 70) -ForegroundColor $color
+    Write-Host "Filter ID    : $($filter.id)"
+    Write-Host "Filter Name  : $($filter.name)"
+    Write-Host "Matched Keys : $keys"
+    Write-Host "Current JQL  : $($filter.jql)"
+    Write-Host "Replace JQL  : $newJql" -ForegroundColor Green
+    if ($status -eq 'SkippedAlreadyMigrated') {
+        Write-Host "SKIPPED      : already contains aqlFunction — review manually" -ForegroundColor DarkYellow
+    }
+    elseif ($manualReview) {
+        Write-Host "MANUAL REVIEW: key(s) left in unhandled context" -ForegroundColor Magenta
+    }
+    Write-Host "Status       : $status"
+}
+
+# --- Startup info ---
 Write-Host "Detection pattern : $($tokenRegex.ToString())" -ForegroundColor Cyan
 Write-Host "AQL attribute     : $AqlAttributeName"          -ForegroundColor Cyan
 if ($Filters) { Write-Host "Filter name scope : $($Filters -join ', ')" -ForegroundColor Cyan }
@@ -170,162 +284,54 @@ if ($Commit) {
     Write-Host "MODE: DRY RUN — no writes will be made." -ForegroundColor Green
 }
 
-# --- Walk all filters (paginated) ---
-$startAt        = 0
-$totalScanned   = 0
-$results        = New-Object System.Collections.Generic.List[object]
-$processedNames = New-Object System.Collections.Generic.List[string]
+# --- Selection ---
+$wildcardMode = [bool]($Filters | Where-Object { $_ -match '[\*\?\[\]]' })
 
-do {
-    $uri = "$JiraBaseUrl/rest/api/3/filter/search?startAt=$startAt&maxResults=$PageSize" +
-           "&expand=jql,description,sharePermissions,editPermissions"
-    if ($OverrideSharePermissions) { $uri += "&overrideSharePermissions=true" }
-
-    $page = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
-
-    if ($startAt -eq 0) {
-        Write-Host ("API reports {0} filter(s) visible to this account (isLast={1}, page size={2})" -f `
-            $page.total, $page.isLast, @($page.values).Count) -ForegroundColor Cyan
-        if ($page.total -eq 0) {
-            Write-Host "ZERO filters returned by the API. Filters exist on the site but this account/request can't see them:" -ForegroundColor Red
-            Write-Host "  - verify the authenticated account above is the one that owns/sees the filters" -ForegroundColor Red
-            Write-Host "  - -OverrideSharePermissions requires Administer Jira global permission (experimental param)" -ForegroundColor Red
-            Write-Host "  - verify -JiraBaseUrl points at the sandbox site, not another instance" -ForegroundColor Red
-        }
+if ($Filters -and -not $wildcardMode) {
+    # Exact-name mode: server-side name query per name, then exact equality, first match only
+    Write-Host "Scan strategy     : exact name match (server-side query per name)" -ForegroundColor Cyan
+    foreach ($name in $Filters) {
+        $candidates = Get-AllFilterPages -ExtraQuery ("&filterName=" + [uri]::EscapeDataString($name))
+        $target = $candidates | Where-Object { $_.name -eq $name } | Select-Object -First 1
+        if ($target) { Invoke-FilterProcessing -filter $target }
     }
-
-    foreach ($filter in $page.values) {
-        $totalScanned++
-
+}
+else {
+    if ($Filters) { Write-Host "Scan strategy     : full scan, client-side wildcard matching" -ForegroundColor Cyan }
+    $all = Get-AllFilterPages
+    Write-Host ("API reports {0} filter(s) visible to this account" -f $all.Count) -ForegroundColor Cyan
+    if ($all.Count -eq 0) {
+        Write-Host "ZERO filters returned. Verify the authenticated account, admin permission for -OverrideSharePermissions, and -JiraBaseUrl." -ForegroundColor Red
+    }
+    foreach ($f in $all) {
         if ($Filters) {
-            $nameHit = $false
-            foreach ($pattern in $Filters) {
-                if ($filter.name -like $pattern) { $nameHit = $true; break }
-            }
-            if (-not $nameHit) { continue }
-            $processedNames.Add($filter.name)
+            $hit = $false
+            foreach ($pattern in $Filters) { if ($f.name -like $pattern) { $hit = $true; break } }
+            if (-not $hit) { continue }
         }
-
-        if ([string]::IsNullOrWhiteSpace($filter.jql)) {
-            if ($Filters) { Write-Host "[$($filter.name)] empty JQL — nothing to do" -ForegroundColor DarkGray }
-            continue
-        }
-
-        $found = $tokenRegex.Matches($filter.jql)
-        if ($found.Count -eq 0) {
-            if ($Filters) { Write-Host "[$($filter.name)] no asset key references found" -ForegroundColor DarkGray }
-            continue
-        }
-
-        $keys = ($found | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ', '
-
-        # Never touch filters that already use aqlFunction — nested AQL would be corrupted
-        $alreadyMigrated = $filter.jql -match '(?i)aqlFunction\s*\('
-        if ($alreadyMigrated) {
-            $newJql       = $filter.jql
-            $manualReview = $true
-            $status       = 'SkippedAlreadyMigrated'
-        }
-        else {
-            $newJql       = Convert-Jql -Jql $filter.jql
-            $manualReview = $tokenRegex.IsMatch($newJql)   # leftovers = unhandled contexts
-            $changed      = ($newJql -ne $filter.jql)
-
-            $status = 'DryRun'
-            if ($Commit) {
-                if (-not $changed) {
-                    $status = 'SkippedNoChange'
-                }
-                else {
-                    try {
-                        $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
-                        if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                        $body = @{
-                            name             = $filter.name
-                            description      = $filter.description
-                            jql              = $newJql
-                            sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
-                            editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
-                        } | ConvertTo-Json -Depth 10
-                        Invoke-RestMethod -Uri $putUri -Headers $headers -Method Put `
-                            -ContentType 'application/json' -Body $body | Out-Null
-                        $status = 'Updated'
-                    }
-                    catch {
-                        $status = "FAILED: $($_.Exception.Message)"
-                    }
-                }
-            }
-            elseif (-not $changed) {
-                $status = 'DryRun-NoChange'
-            }
-        }
-
-        $results.Add([PSCustomObject]@{
-            FilterId     = $filter.id
-            FilterName   = $filter.name
-            Owner        = $filter.owner.displayName
-            MatchedKeys  = $keys
-            FilterJql    = $filter.jql
-            ReplaceJQL   = $newJql
-            ManualReview = $manualReview
-            Status       = $status
-        })
-
-        $color = if ($status -like 'FAILED*') { 'Red' }
-                 elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
-                 elseif ($manualReview) { 'Magenta' }
-                 else { 'Yellow' }
-        Write-Host ("=" * 70) -ForegroundColor $color
-        Write-Host "Filter ID    : $($filter.id)"
-        Write-Host "Filter Name  : $($filter.name)"
-        Write-Host "Matched Keys : $keys"
-        Write-Host "Current JQL  : $($filter.jql)"
-        Write-Host "Replace JQL  : $newJql" -ForegroundColor Green
-        if ($status -eq 'SkippedAlreadyMigrated') {
-            Write-Host "SKIPPED      : already contains aqlFunction — review manually" -ForegroundColor DarkYellow
-        }
-        elseif ($manualReview) {
-            Write-Host "MANUAL REVIEW: key(s) left in unhandled context" -ForegroundColor Magenta
-        }
-        Write-Host "Status       : $status"
-    }
-
-    $startAt += $page.values.Count
-    Write-Host "...scanned $totalScanned / $($page.total) filters" -ForegroundColor DarkGray
-
-} while (-not $page.isLast -and $page.values.Count -gt 0)
-
-# --- Warn about -Filters patterns that matched nothing ---
-if ($Filters) {
-    foreach ($pattern in $Filters) {
-        $hit = $false
-        foreach ($n in $processedNames) { if ($n -like $pattern) { $hit = $true; break } }
-        if (-not $hit) {
-            Write-Host "WARNING: no scanned filter matched -Filters pattern '$pattern'" -ForegroundColor Red
-        }
+        Invoke-FilterProcessing -filter $f
     }
 }
 
 # --- Summary ---
-$updated = @($results | Where-Object { $_.Status -eq 'Updated' }).Count
-$failed  = @($results | Where-Object { $_.Status -like 'FAILED*' }).Count
-$review  = @($results | Where-Object { $_.ManualReview }).Count
+$updated = @($script:results | Where-Object { $_.Status -eq 'Updated' }).Count
+$failed  = @($script:results | Where-Object { $_.Status -like 'FAILED*' }).Count
+$review  = @($script:results | Where-Object { $_.ManualReview }).Count
 
 Write-Host ""
 Write-Host ("-" * 50)
-Write-Host "Scanned        : $totalScanned filters" -ForegroundColor Cyan
-Write-Host "Flagged        : $($results.Count)"     -ForegroundColor Cyan
+Write-Host "Scanned        : $($script:totalScanned) filters" -ForegroundColor Cyan
+Write-Host "Flagged        : $($script:results.Count)"        -ForegroundColor Cyan
 if ($Commit) {
     Write-Host "Updated        : $updated" -ForegroundColor Green
     Write-Host "Failed         : $failed"  -ForegroundColor $(if ($failed) { 'Red' } else { 'Cyan' })
 }
 Write-Host "Manual review  : $review" -ForegroundColor $(if ($review) { 'Magenta' } else { 'Cyan' })
-if (-not $OverrideSharePermissions) {
+if (-not $OverrideSharePermissions -and -not $Filters) {
     Write-Host "Note: only filters visible to this account were scanned. Use -OverrideSharePermissions (admin) for all." -ForegroundColor DarkYellow
 }
 
-if ($ExportCsv -and $results.Count -gt 0) {
-    $results | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
+if ($ExportCsv -and $script:results.Count -gt 0) {
+    $script:results | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
     Write-Host "Exported to: $ExportCsv" -ForegroundColor Cyan
 }
