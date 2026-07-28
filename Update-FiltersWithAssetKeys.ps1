@@ -10,6 +10,9 @@
                    (also NOT IN; items may be bare, quoted, or labeled "Name (KEY)")
       3. Labeled:  field = "Hardware (CMDB-74822)"
                                               -> field IN aqlFunction("Legacy-Key = CMDB-74822")
+      4. Single-value IN without parentheses (DC oddity):
+                   field in "APP (JRSK-36294)"
+                                              -> field IN aqlFunction("Legacy-Key = JRSK-36294")
 
     Safety:
       - DRY RUN by default. Writes happen only with -Commit.
@@ -74,6 +77,20 @@ $pair    = "{0}:{1}" -f $Email, $ApiToken
 $basic   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $headers = @{ Authorization = "Basic $basic"; Accept = 'application/json' }
 
+# --- Preflight: verify credentials actually authenticate ---
+# A request Jira can't authenticate may be served as ANONYMOUS on read endpoints
+# instead of erroring — filter/search then silently returns zero filters.
+try {
+    $me = Invoke-RestMethod -Uri "$JiraBaseUrl/rest/api/3/myself" -Headers $headers -Method Get
+}
+catch {
+    throw "Auth preflight against /rest/api/3/myself failed: $($_.Exception.Message) — check -JiraBaseUrl, -Email, -ApiToken (watch for trailing whitespace/newline in the token)."
+}
+if (-not $me.accountId) {
+    throw "Jira served the request as ANONYMOUS (no accountId from /myself). The -Email/-ApiToken pair is not authenticating."
+}
+Write-Host "Authenticated as  : $($me.displayName) [$($me.accountId)]" -ForegroundColor Cyan
+
 # --- Attribute as rendered inside the AQL string ---
 $script:AqlAttr = if ($QuoteAqlAttribute) { '\"{0}\"' -f $AqlAttributeName } else { $AqlAttributeName }
 
@@ -113,8 +130,9 @@ $arrayEvaluator = {
     '{0} aqlFunction("{1} IN ({2})")' -f $op, $script:AqlAttr, ($keys -join ', ')
 }
 
-# Patterns 1 + 3: (= | !=) followed by bare key, "quoted", or 'quoted'
-$scalarRegex = [regex]"(!=|=)\s*(?:""([^""]*)""|'([^']*)'|($keyPattern)\b)"
+# Patterns 1 + 3 + single-value IN: (= | != | in | not in) followed by bare key, "quoted", or 'quoted'
+# Single-value IN covers the DC oddity:  "IT Service Team" in "APP (JRSK-36294)"  (no parentheses)
+$scalarRegex = [regex]"((?i:\bnot\s+in\b|\bin\b)|!=|=)\s*(?:""([^""]*)""|'([^']*)'|($keyPattern)\b)"
 
 $scalarEvaluator = {
     param($m)
@@ -123,7 +141,7 @@ $scalarEvaluator = {
            else { $m.Groups[4].Value }
     $k = Get-KeyFromValue $val
     if (-not $k) { return $m.Value }       # ordinary string comparison -> untouched
-    $op = if ($m.Groups[1].Value -eq '!=') { 'NOT IN' } else { 'IN' }
+    $op = if ($m.Groups[1].Value -eq '!=' -or $m.Groups[1].Value -match '(?i)^not') { 'NOT IN' } else { 'IN' }
     '{0} aqlFunction("{1} = {2}")' -f $op, $script:AqlAttr, $k
 }
 
@@ -164,6 +182,17 @@ do {
     if ($OverrideSharePermissions) { $uri += "&overrideSharePermissions=true" }
 
     $page = Invoke-RestMethod -Uri $uri -Headers $headers -Method Get
+
+    if ($startAt -eq 0) {
+        Write-Host ("API reports {0} filter(s) visible to this account (isLast={1}, page size={2})" -f `
+            $page.total, $page.isLast, @($page.values).Count) -ForegroundColor Cyan
+        if ($page.total -eq 0) {
+            Write-Host "ZERO filters returned by the API. Filters exist on the site but this account/request can't see them:" -ForegroundColor Red
+            Write-Host "  - verify the authenticated account above is the one that owns/sees the filters" -ForegroundColor Red
+            Write-Host "  - -OverrideSharePermissions requires Administer Jira global permission (experimental param)" -ForegroundColor Red
+            Write-Host "  - verify -JiraBaseUrl points at the sandbox site, not another instance" -ForegroundColor Red
+        }
+    }
 
     foreach ($filter in $page.values) {
         $totalScanned++
