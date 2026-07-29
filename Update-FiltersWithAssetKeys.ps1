@@ -7,32 +7,26 @@
                    field != CMDB-74822        -> field NOT IN aqlFunction("Legacy-Key = CMDB-74822")
       2. Arrays:   field in (CMDB-74822, CMDB-74825)
                                               -> field IN aqlFunction("Legacy-Key IN (CMDB-74822, CMDB-74825)")
-                   (also NOT IN; items may be bare, quoted, or labeled "Name (KEY)")
       3. Labeled:  field = "Hardware (CMDB-74822)"
                                               -> field IN aqlFunction("Legacy-Key = CMDB-74822")
-      4. Single-value IN without parentheses (DC oddity):
+      4. Single-value IN without parentheses:
                    field in "APP (JRSK-36294)"
                                               -> field IN aqlFunction("Legacy-Key = JRSK-36294")
 
     -Filters semantics:
-      - Names without wildcards: EXACT match. Each name is queried server-side
-        (filterName param), then the single filter whose name equals the given
-        name is selected. A name with no exact match processes nothing.
+      - Names without wildcards: EXACT name match via server-side query.
       - Names with wildcards (* ? [ ]): full scan, client-side -like matching.
 
-    Safety:
-      - DRY RUN by default. Writes happen only with -Commit.
-      - Filters already containing aqlFunction( are never rewritten
-        (Status = SkippedAlreadyMigrated).
-      - Quoted values are only converted if they ARE a key or END with "(KEY)".
-      - IN lists mixing keys with non-key values are left untouched; leftover
-        key tokens after rewrite set ManualReview = True.
+    Update mechanics:
+      - PUT body contains ONLY name + jql. Share permissions, edit permissions and
+        subscriptions are never sent, so Jira leaves them untouched.
+      - Before/after state (owner, viewers, editors, subscriptions, JQL) is fetched,
+        logged to console, and compared. Any drift is recorded in the Errors column.
+      - DRY RUN by default. -Commit asks for interactive confirmation (type YES);
+        -Force skips the prompt for unattended runs.
 
-.EXAMPLE
-    .\Update-FiltersWithAssetKeys.ps1 -JiraBaseUrl "https://yoursite.atlassian.net" `
-        -Email "you@company.com" -ApiToken $token `
-        -AssetKeyPrefixes CMDB,JSRK -AqlAttributeName Key `
-        -Filters "TestFilter_Compound","TestFilter_Compound_Public"
+    CSV columns: Filter Name, Filter ID, Owner Name, Owner Email, Owner ID,
+                 Viewers, Editors, Original JQL, Updated JQL, Errors, Comments
 #>
 
 [CmdletBinding()]
@@ -49,15 +43,12 @@ param (
     [Parameter(Mandatory)]
     [string[]]$AssetKeyPrefixes,          # e.g. CMDB, JSRK
 
-    # AQL attribute holding the old DC key on migrated objects
     [string]$AqlAttributeName = 'Legacy-Key',
 
-    # Wrap the attribute name in escaped quotes inside the AQL string:
-    # aqlFunction("\"Legacy-Key\" = CMDB-1"). Use if AQL rejects the bare hyphenated name.
+    # Wrap the attribute name in escaped quotes inside the AQL string.
     [switch]$QuoteAqlAttribute,
 
-    # Restrict to these filter names. No wildcards = exact name match via server-side
-    # query. Wildcards = full scan with client-side -like matching.
+    # No wildcards = exact name match (server-side query). Wildcards = full scan + -like.
     [string[]]$Filters,
 
     [string]$ExportCsv,
@@ -67,6 +58,9 @@ param (
 
     # Without this switch the script is a pure dry run — zero write calls.
     [switch]$Commit,
+
+    # Skip the interactive COMMIT confirmation prompt (for unattended runs).
+    [switch]$Force,
 
     [int]$PageSize = 50
 )
@@ -80,13 +74,11 @@ $basic   = [Convert]::ToBase64String([Text.Encoding]::ASCII.GetBytes($pair))
 $headers = @{ Authorization = "Basic $basic"; Accept = 'application/json' }
 
 # --- Preflight: verify credentials actually authenticate ---
-# A request Jira can't authenticate may be served as ANONYMOUS on read endpoints
-# instead of erroring — filter/search then silently returns zero filters.
 try {
     $me = Invoke-RestMethod -Uri "$JiraBaseUrl/rest/api/3/myself" -Headers $headers -Method Get
 }
 catch {
-    throw "Auth preflight against /rest/api/3/myself failed: $($_.Exception.Message) — check -JiraBaseUrl, -Email, -ApiToken (watch for trailing whitespace/newline in the token; note API tokens now expire, max 1 year)."
+    throw "Auth preflight against /rest/api/3/myself failed: $($_.Exception.Message) — check -JiraBaseUrl, -Email, -ApiToken (tokens expire, max 1 year)."
 }
 if (-not $me.accountId) {
     throw "Jira served the request as ANONYMOUS (no accountId from /myself). The -Email/-ApiToken pair is not authenticating."
@@ -101,7 +93,6 @@ $prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }
 $keyPattern = "(?:$prefixAlt)-\d+"
 $tokenRegex = [regex]"\b$keyPattern\b"
 
-# Extracts a key from a value: either the value IS a key, or it ends with "(KEY)".
 function Get-KeyFromValue {
     param([string]$Value)
     $v = $Value.Trim()
@@ -110,7 +101,6 @@ function Get-KeyFromValue {
     return $null
 }
 
-# Pattern 2: in / not in ( item, item, ... ) — items are quoted strings or bare tokens
 $listItem   = '"[^"]*"|''[^'']*''|[^,()\s]+'
 $arrayRegex = [regex]"(?i)\b(not\s+in|in)\s*\(\s*(?:$listItem)(?:\s*,\s*(?:$listItem))*\s*\)"
 
@@ -125,15 +115,13 @@ $arrayEvaluator = {
                elseif ($im.Groups[2].Success) { $im.Groups[2].Value }
                else { $im.Groups[3].Value }
         $k = Get-KeyFromValue $raw
-        if (-not $k) { return $m.Value }   # any non-key item -> leave whole list untouched
+        if (-not $k) { return $m.Value }
         $keys += $k
     }
     if ($keys.Count -eq 0) { return $m.Value }
     '{0} aqlFunction("{1} IN ({2})")' -f $op, $script:AqlAttr, ($keys -join ', ')
 }
 
-# Patterns 1 + 3 + single-value IN: (= | != | in | not in) followed by bare key, "quoted", or 'quoted'
-# Single-value IN covers the DC oddity:  "IT Service Team" in "APP (JRSK-36294)"  (no parentheses)
 $scalarRegex = [regex]"((?i:\bnot\s+in\b|\bin\b)|!=|=)\s*(?:""([^""]*)""|'([^']*)'|($keyPattern)\b)"
 
 $scalarEvaluator = {
@@ -142,7 +130,7 @@ $scalarEvaluator = {
            elseif ($m.Groups[3].Success) { $m.Groups[3].Value }
            else { $m.Groups[4].Value }
     $k = Get-KeyFromValue $val
-    if (-not $k) { return $m.Value }       # ordinary string comparison -> untouched
+    if (-not $k) { return $m.Value }
     $op = if ($m.Groups[1].Value -eq '!=' -or $m.Groups[1].Value -match '(?i)^not') { 'NOT IN' } else { 'IN' }
     '{0} aqlFunction("{1} = {2}")' -f $op, $script:AqlAttr, $k
 }
@@ -152,26 +140,6 @@ function Convert-Jql {
     $out = $arrayRegex.Replace($Jql, [System.Text.RegularExpressions.MatchEvaluator]$arrayEvaluator)
     $out = $scalarRegex.Replace($out, [System.Text.RegularExpressions.MatchEvaluator]$scalarEvaluator)
     return $out
-}
-
-# --- Map GET permission objects to the minimal shapes the PUT input schema expects ---
-function ConvertTo-PermissionRequest {
-    param($Permissions)
-    if (-not $Permissions) { return ,@() }   # unary comma: without it @() unrolls to $null -> "sharePermissions": null -> 400
-    $out = @()
-    foreach ($p in $Permissions) {
-        switch ($p.type) {
-            'user'        { $out += @{ type = 'user'; user = @{ accountId = $p.user.accountId } } }
-            'group'       {
-                if ($p.group.groupId) { $out += @{ type = 'group'; group = @{ groupId = $p.group.groupId } } }
-                else                  { $out += @{ type = 'group'; group = @{ name = $p.group.name } } }
-            }
-            'project'     { $out += @{ type = 'project'; project = @{ id = "$($p.project.id)" } } }
-            'projectRole' { $out += @{ type = 'projectRole'; project = @{ id = "$($p.project.id)" }; role = @{ id = "$($p.role.id)" } } }
-            default       { $out += @{ type = $p.type } }   # global / loggedin / authenticated
-        }
-    }
-    return ,$out
 }
 
 # --- Extract the real error body from a failed REST call (PS 5.1 and 7.x) ---
@@ -192,9 +160,62 @@ function Get-JiraErrorDetail {
     return $ErrorRecord.Exception.Message
 }
 
-# --- Paginated fetch; returns all filter objects for the given extra query ---
-$script:baseUri = "$JiraBaseUrl/rest/api/3/filter/search?maxResults=$PageSize" +
-                  "&expand=jql,description,sharePermissions,editPermissions"
+# --- Human-readable renderers for permissions and subscriptions ---
+function Format-Permissions {
+    param($Permissions)
+    if (-not $Permissions -or @($Permissions).Count -eq 0) { return 'Private' }
+    $parts = foreach ($p in $Permissions) {
+        switch ($p.type) {
+            'global'        { 'Public' }
+            'authenticated' { 'My Organization' }
+            'loggedin'      { 'My Organization' }
+            'project'       {
+                if ($p.role) { "Project: $($p.project.name) / Role: $($p.role.name)" }
+                else         { "Project: $($p.project.name)" }
+            }
+            'projectRole'   { "Project: $($p.project.name) / Role: $($p.role.name)" }
+            'group'         { "Group: $($p.group.name)" }
+            'user'          { "User: $($p.user.displayName)" }
+            default         { "Unknown type '$($p.type)'" }
+        }
+    }
+    return ($parts -join '; ')
+}
+
+function Format-Subscriptions {
+    param($Subscriptions)
+    $items = @($Subscriptions.items)
+    if ($items.Count -eq 0) { return 'None' }
+    $parts = foreach ($s in $items) {
+        if ($s.group -and $s.group.name) { "Group: $($s.group.name)" }
+        elseif ($s.user)                 { "User: $($s.user.displayName)" }
+        else                             { "Subscription id $($s.id)" }
+    }
+    return ($parts -join '; ')
+}
+
+# --- Fetch full single-filter state (permissions + subscriptions) ---
+function Get-FilterDetail {
+    param([string]$FilterId)
+    $uri = "$JiraBaseUrl/rest/api/3/filter/${FilterId}?expand=sharePermissions,editPermissions,subscriptions"
+    if ($OverrideSharePermissions) { $uri += "&overrideSharePermissions=true" }
+    return Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Get
+}
+
+function Write-FilterState {
+    param([string]$Label, $Detail)
+    Write-Host "--- $Label ---" -ForegroundColor Cyan
+    Write-Host ("  Name          : {0}" -f $Detail.name)
+    Write-Host ("  ID            : {0}" -f $Detail.id)
+    Write-Host ("  Owner         : {0} <{1}> [{2}]" -f $Detail.owner.displayName, $Detail.owner.emailAddress, $Detail.owner.accountId)
+    Write-Host ("  Viewers       : {0}" -f (Format-Permissions $Detail.sharePermissions))
+    Write-Host ("  Editors       : {0}" -f (Format-Permissions $Detail.editPermissions))
+    Write-Host ("  Subscriptions : {0}" -f (Format-Subscriptions $Detail.subscriptions))
+    Write-Host ("  JQL           : {0}" -f $Detail.jql)
+}
+
+# --- Paginated fetch ---
+$script:baseUri = "$JiraBaseUrl/rest/api/3/filter/search?maxResults=$PageSize&expand=jql"
 if ($OverrideSharePermissions) { $script:baseUri += "&overrideSharePermissions=true" }
 
 function Get-AllFilterPages {
@@ -210,8 +231,11 @@ function Get-AllFilterPages {
     return ,$acc
 }
 
-# --- Per-filter processing (shared by both selection modes) ---
+# --- Per-filter processing ---
 $script:totalScanned = 0
+$script:countUpdated = 0
+$script:countFailed  = 0
+$script:countReview  = 0
 $script:results      = New-Object System.Collections.Generic.List[object]
 
 function Invoke-FilterProcessing {
@@ -222,26 +246,40 @@ function Invoke-FilterProcessing {
         if ($Filters) { Write-Host "[$($filter.name)] empty JQL — nothing to do" -ForegroundColor DarkGray }
         return
     }
-
-    $found = $tokenRegex.Matches($filter.jql)
-    if ($found.Count -eq 0) {
+    if (-not $tokenRegex.IsMatch($filter.jql)) {
         if ($Filters) { Write-Host "[$($filter.name)] no asset key references found" -ForegroundColor DarkGray }
         return
     }
 
-    $keys = ($found | ForEach-Object { $_.Value } | Sort-Object -Unique) -join ', '
+    $errors = New-Object System.Collections.Generic.List[string]
 
-    # Never touch filters that already use aqlFunction — nested AQL would be corrupted
-    $alreadyMigrated = $filter.jql -match '(?i)aqlFunction\s*\('
+    # Full BEFORE state (fresh GET: permissions, subscriptions, current JQL)
+    $before = $null
+    try   { $before = Get-FilterDetail -FilterId $filter.id }
+    catch { $errors.Add("GET filter detail failed: $(Get-JiraErrorDetail $_)") }
+    if (-not $before) { $before = $filter }
+
+    Write-Host ("=" * 70) -ForegroundColor Yellow
+    Write-FilterState -Label "BEFORE update" -Detail $before
+
+    $originalJql = $before.jql
+
+    # Rewrite
+    $alreadyMigrated = $originalJql -match '(?i)aqlFunction\s*\('
     if ($alreadyMigrated) {
-        $newJql       = $filter.jql
-        $manualReview = $true
-        $status       = 'SkippedAlreadyMigrated'
+        $newJql = $originalJql
+        $errors.Add("WARN: already contains aqlFunction — skipped, review manually")
+        $script:countReview++
+        $status = 'SkippedAlreadyMigrated'
     }
     else {
-        $newJql       = Convert-Jql -Jql $filter.jql
-        $manualReview = $tokenRegex.IsMatch($newJql)   # leftovers = unhandled contexts
-        $changed      = ($newJql -ne $filter.jql)
+        $newJql       = Convert-Jql -Jql $originalJql
+        $manualReview = $tokenRegex.IsMatch($newJql)
+        $changed      = ($newJql -ne $originalJql)
+        if ($manualReview) {
+            $errors.Add("WARN: key(s) left in unhandled JQL context — manual review needed")
+            $script:countReview++
+        }
 
         $status = 'DryRun'
         if ($Commit) {
@@ -252,21 +290,41 @@ function Invoke-FilterProcessing {
                 try {
                     $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
                     if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                    $bodyHash = @{
-                        name             = $filter.name
-                        jql              = $newJql
-                        sharePermissions = ConvertTo-PermissionRequest $filter.sharePermissions
-                        editPermissions  = ConvertTo-PermissionRequest $filter.editPermissions
-                    }
-                    if ($null -ne $filter.description) { $bodyHash.description = $filter.description }
-                    $body = $bodyHash | ConvertTo-Json -Depth 10
+                    # Minimal body: ONLY name + jql. Permissions/subscriptions are never sent.
+                    $body = @{ name = $before.name; jql = $newJql } | ConvertTo-Json
                     Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
                         -ContentType 'application/json' -Body $body | Out-Null
                     $status = 'Updated'
+                    $script:countUpdated++
                 }
                 catch {
-                    $status = "FAILED: $(Get-JiraErrorDetail $_)"
+                    $status = 'FAILED'
+                    $errors.Add("PUT failed: $(Get-JiraErrorDetail $_)")
+                    $script:countFailed++
                 }
+            }
+
+            # AFTER state + built-in validation
+            try {
+                $after = Get-FilterDetail -FilterId $filter.id
+                Write-FilterState -Label "AFTER update" -Detail $after
+
+                if ($status -eq 'Updated' -and $after.jql -ne $newJql) {
+                    $errors.Add("VALIDATION: JQL after update differs from intended value")
+                }
+                $checks = @(
+                    @{ Label = 'Viewers';       B = (Format-Permissions  $before.sharePermissions); A = (Format-Permissions  $after.sharePermissions) },
+                    @{ Label = 'Editors';       B = (Format-Permissions  $before.editPermissions);  A = (Format-Permissions  $after.editPermissions)  },
+                    @{ Label = 'Subscriptions'; B = (Format-Subscriptions $before.subscriptions);   A = (Format-Subscriptions $after.subscriptions)   }
+                )
+                foreach ($c in $checks) {
+                    if ($c.B -ne $c.A) {
+                        $errors.Add("VALIDATION: $($c.Label) changed: [$($c.B)] -> [$($c.A)]")
+                    }
+                }
+            }
+            catch {
+                $errors.Add("GET after-state failed: $(Get-JiraErrorDetail $_)")
             }
         }
         elseif (-not $changed) {
@@ -274,34 +332,27 @@ function Invoke-FilterProcessing {
         }
     }
 
-    $script:results.Add([PSCustomObject]@{
-        FilterId     = $filter.id
-        FilterName   = $filter.name
-        Owner        = $filter.owner.displayName
-        MatchedKeys  = $keys
-        FilterJql    = $filter.jql
-        ReplaceJQL   = $newJql
-        ManualReview = $manualReview
-        Status       = $status
-    })
+    Write-Host "Proposed JQL : $newJql" -ForegroundColor Green
+    Write-Host "Status       : $status" -ForegroundColor $(
+        if ($status -eq 'FAILED') { 'Red' }
+        elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
+        elseif ($errors.Count -gt 0) { 'Magenta' }
+        else { 'Yellow' })
+    foreach ($e in $errors) { Write-Host "  ! $e" -ForegroundColor Magenta }
 
-    $color = if ($status -like 'FAILED*') { 'Red' }
-             elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
-             elseif ($manualReview) { 'Magenta' }
-             else { 'Yellow' }
-    Write-Host ("=" * 70) -ForegroundColor $color
-    Write-Host "Filter ID    : $($filter.id)"
-    Write-Host "Filter Name  : $($filter.name)"
-    Write-Host "Matched Keys : $keys"
-    Write-Host "Current JQL  : $($filter.jql)"
-    Write-Host "Replace JQL  : $newJql" -ForegroundColor Green
-    if ($status -eq 'SkippedAlreadyMigrated') {
-        Write-Host "SKIPPED      : already contains aqlFunction — review manually" -ForegroundColor DarkYellow
-    }
-    elseif ($manualReview) {
-        Write-Host "MANUAL REVIEW: key(s) left in unhandled context" -ForegroundColor Magenta
-    }
-    Write-Host "Status       : $status"
+    $script:results.Add([PSCustomObject]([ordered]@{
+        'Filter Name'  = $before.name
+        'Filter ID'    = $before.id
+        'Owner Name'   = $before.owner.displayName
+        'Owner Email'  = "$($before.owner.emailAddress)"
+        'Owner ID'     = $before.owner.accountId
+        'Viewers'      = (Format-Permissions $before.sharePermissions)
+        'Editors'      = (Format-Permissions $before.editPermissions)
+        'Original JQL' = $originalJql
+        'Updated JQL'  = $newJql
+        'Errors'       = ($errors -join "`n")
+        'Comments'     = ''
+    }))
 }
 
 # --- Startup info ---
@@ -310,6 +361,13 @@ Write-Host "AQL attribute     : $AqlAttributeName"          -ForegroundColor Cya
 if ($Filters) { Write-Host "Filter name scope : $($Filters -join ', ')" -ForegroundColor Cyan }
 if ($Commit) {
     Write-Host "MODE: COMMIT — matching filters WILL be updated." -ForegroundColor Red
+    if (-not $Force) {
+        $answer = Read-Host "Type YES (uppercase) to confirm committing JQL updates"
+        if ($answer -cne 'YES') {
+            Write-Host "Not confirmed — aborting without changes." -ForegroundColor Yellow
+            return
+        }
+    }
 } else {
     Write-Host "MODE: DRY RUN — no writes will be made." -ForegroundColor Green
 }
@@ -318,7 +376,6 @@ if ($Commit) {
 $wildcardMode = [bool]($Filters | Where-Object { $_ -match '[\*\?\[\]]' })
 
 if ($Filters -and -not $wildcardMode) {
-    # Exact-name mode: server-side name query per name, then exact equality, first match only
     Write-Host "Scan strategy     : exact name match (server-side query per name)" -ForegroundColor Cyan
     foreach ($name in $Filters) {
         $candidates = Get-AllFilterPages -ExtraQuery ("&filterName=" + [uri]::EscapeDataString($name))
@@ -344,22 +401,15 @@ else {
 }
 
 # --- Summary ---
-$updated = @($script:results | Where-Object { $_.Status -eq 'Updated' }).Count
-$failed  = @($script:results | Where-Object { $_.Status -like 'FAILED*' }).Count
-$review  = @($script:results | Where-Object { $_.ManualReview }).Count
-
 Write-Host ""
 Write-Host ("-" * 50)
 Write-Host "Scanned        : $($script:totalScanned) filters" -ForegroundColor Cyan
 Write-Host "Flagged        : $($script:results.Count)"        -ForegroundColor Cyan
 if ($Commit) {
-    Write-Host "Updated        : $updated" -ForegroundColor Green
-    Write-Host "Failed         : $failed"  -ForegroundColor $(if ($failed) { 'Red' } else { 'Cyan' })
+    Write-Host "Updated        : $($script:countUpdated)" -ForegroundColor Green
+    Write-Host "Failed         : $($script:countFailed)"  -ForegroundColor $(if ($script:countFailed) { 'Red' } else { 'Cyan' })
 }
-Write-Host "Manual review  : $review" -ForegroundColor $(if ($review) { 'Magenta' } else { 'Cyan' })
-if (-not $OverrideSharePermissions -and -not $Filters) {
-    Write-Host "Note: only filters visible to this account were scanned. Use -OverrideSharePermissions (admin) for all." -ForegroundColor DarkYellow
-}
+Write-Host "Manual review  : $($script:countReview)" -ForegroundColor $(if ($script:countReview) { 'Magenta' } else { 'Cyan' })
 
 if ($ExportCsv -and $script:results.Count -gt 0) {
     $script:results | Export-Csv -Path $ExportCsv -NoTypeInformation -Encoding UTF8
