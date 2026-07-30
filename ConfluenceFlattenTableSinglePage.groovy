@@ -95,14 +95,16 @@ def buildReplacement = { Map params, int occurrence ->
 
 // ---------------------------------------------------------------
 def pageManager = ComponentLocator.getComponent(PageManager)
-def log = new StringBuilder()
+def report = new StringBuilder()
 def page = pageManager.getPage(PAGE_ID)
 
 if (page == null) {
     return "<pre>ABORT: no page with id ${PAGE_ID} (blog post? use BlogPost / ContentEntityManager)</pre>"
 }
-if (page.getOriginalVersion() != null) {
-    return "<pre>ABORT: id ${PAGE_ID} is a HISTORICAL version, not the current one.</pre>"
+// A historical version carries a pointer back to the current one; current versions return null.
+if (page.getOriginalVersionId() != null) {
+    return "<pre>ABORT: id ${PAGE_ID} is a HISTORICAL version " +
+           "(current version id = ${page.getOriginalVersionId()}), not the current one.</pre>"
 }
 
 String original = page.getBodyAsString()
@@ -110,7 +112,7 @@ def counter = 0
 def details = []
 
 def rewritePass = { String body, Pattern pattern, int macroGroup ->
-    StringBuffer out = new StringBuffer()
+    StringBuffer buf = new StringBuffer()
     Matcher m = pattern.matcher(body)
     while (m.find()) {
         counter++
@@ -118,10 +120,10 @@ def rewritePass = { String body, Pattern pattern, int macroGroup ->
         def params = parseParams(macroXml)
         def r = buildReplacement(params, counter)
         details << [n: counter, params: params, r: r, old: m.group(0)]
-        m.appendReplacement(out, Matcher.quoteReplacement(r.html))
+        m.appendReplacement(buf, Matcher.quoteReplacement(r.html))
     }
-    m.appendTail(out)
-    out.toString()
+    m.appendTail(buf)
+    buf.toString()
 }
 
 String updated
@@ -136,7 +138,7 @@ try {
 }
 
 if (P_SELFCLOSED.matcher(original).find()) {
-    log << "WARNING: a self-closing (parameterless) ${MACRO_NAME} macro is present and was NOT touched.\n"
+    report << "WARNING: a self-closing (parameterless) ${MACRO_NAME} macro is present and was NOT touched.\n"
 }
 
 if (counter == 0) {
@@ -145,18 +147,18 @@ if (counter == 0) {
 }
 
 // ---------------------------------------------------------------
-log << "Page      : ${page.title} (id ${PAGE_ID}, space ${page.spaceKey}, version ${page.version})\n"
-log << "Occurrences replaced: ${counter}\n"
-log << "Mode      : ${DRY_RUN ? 'DRY RUN - nothing written' : 'APPLY'}\n\n"
+report << "Page      : ${page.title} (id ${PAGE_ID}, space ${page.spaceKey}, version ${page.version})\n"
+report << "Occurrences replaced: ${counter}\n"
+report << "Mode      : ${DRY_RUN ? 'DRY RUN - nothing written' : 'APPLY'}\n\n"
 details.each {
-    log << "--- occurrence #${it.n}: relevance=${it.r.relevance} sumImpact=${it.r.sum} -> ${it.r.pct}%\n"
-    log << "OLD:\n${xmlEsc(it.old)}\n"
-    log << "NEW:\n${xmlEsc(it.r.html)}\n\n"
+    report << "--- occurrence #${it.n}: relevance=${it.r.relevance} sumImpact=${it.r.sum} -> ${it.r.pct}%\n"
+    report << "OLD:\n${xmlEsc(it.old)}\n"
+    report << "NEW:\n${xmlEsc(it.r.html)}\n\n"
 }
-log << "=== ORIGINAL FULL BODY (keep this - it is your rollback copy) ===\n"
-log << xmlEsc(original) << "\n\n"
-log << "=== NEW FULL BODY ===\n"
-log << xmlEsc(updated) << "\n"
+report << "=== ORIGINAL FULL BODY (keep this - it is your rollback copy) ===\n"
+report << xmlEsc(original) << "\n\n"
+report << "=== NEW FULL BODY ===\n"
+report << xmlEsc(updated) << "\n"
 
 if (!DRY_RUN) {
     // DefaultSaveContext(suppressNotifications, updateLastModifier, suppressEvents)
@@ -164,8 +166,8 @@ if (!DRY_RUN) {
     def saveContext = new DefaultSaveContext(true, !PRESERVE_LAST_MODIFIER, false)
     pageManager.saveNewVersion(page, { Page p -> p.setBodyAsString(updated) } as Modification, saveContext)
     def after = pageManager.getPage(PAGE_ID)
-    log << "\nSAVED. New version = ${after.version}. Macro still present in body: " +
+    report << "\nSAVED. New version = ${after.version}. Macro still present in body: " +
            "${after.getBodyAsString().contains('ac:name="' + MACRO_NAME + '"')}\n"
 }
 
-return "<pre>${log}</pre>"
+return "<pre>${report}</pre>"
