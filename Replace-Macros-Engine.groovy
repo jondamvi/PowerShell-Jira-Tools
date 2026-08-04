@@ -361,13 +361,19 @@ Object reflectCall(Object target, String method, Class[] sig, Object[] args) {
     }
 }
 
-Map<String, String> discoverDefaults(String macroName) {
+/**
+ * Route 1 - macro browser metadata. Correct method name is
+ * getMacroMetadataByName; getMacroMetadata does not exist on this instance.
+ */
+Map<String, String> discoverFromMetadata(String macroName) {
     Map<String, String> found = new LinkedHashMap<String, String>()
     Object mgr
     try { mgr = ContainerManager.getComponent('macroMetadataManager') } catch (Throwable t) { return found }
-    Object md = reflectCall(mgr, 'getMacroMetadata', [String] as Class[], [macroName] as Object[])
+    Object md = reflectCall(mgr, 'getMacroMetadataByName', [String] as Class[], [macroName] as Object[])
+    if (md == null) md = reflectCall(mgr, 'getMacroMetadata', [String] as Class[], [macroName] as Object[])
     Object form = reflectCall(md, 'getFormDetails', new Class[0], new Object[0])
     Object plist = reflectCall(form, 'getParameters', new Class[0], new Object[0])
+    if (plist == null) plist = reflectCall(md, 'getParameters', new Class[0], new Object[0])
     if (!(plist instanceof Collection)) return found
     for (Object p : (Collection) plist) {
         Object n = reflectCall(p, 'getName', new Class[0], new Object[0])
@@ -375,6 +381,49 @@ Map<String, String> discoverDefaults(String macroName) {
         if (n != null && d != null && !d.toString().trim().isEmpty()) {
             found.put(n.toString(), d.toString().trim())
         }
+    }
+    return found
+}
+
+/**
+ * Route 2 - user macro Velocity template. This is where the ~50 user macros
+ * keep their defaults: "## @param Name:title=X|type=enum|enumValues=A,B|default=C".
+ * Correct accessor is userMacroLibrary.getMacro(name).
+ */
+Map<String, String> discoverFromUserMacro(String macroName) {
+    Map<String, String> found = new LinkedHashMap<String, String>()
+    Object lib
+    try { lib = ContainerManager.getComponent('userMacroLibrary') } catch (Throwable t) { return found }
+    Object cfg = reflectCall(lib, 'getMacro', [String] as Class[], [macroName] as Object[])
+    if (cfg == null) return found
+    Object tpl = reflectCall(cfg, 'getTemplate', new Class[0], new Object[0])
+    if (tpl == null) tpl = reflectCall(cfg, 'getBody', new Class[0], new Object[0])
+    if (tpl == null) return found
+
+    Pattern pp = Pattern.compile('^\\s*##\\s*@param\\s+([^:\\s]+)\\s*:?(.*)$')
+    for (String line : tpl.toString().readLines()) {
+        Matcher m = pp.matcher(line)
+        if (!m.matches()) continue
+        String name = m.group(1).trim()
+        String rest = m.group(2) == null ? '' : m.group(2).trim()
+        for (String seg : rest.split('\\|')) {
+            int eq = seg.indexOf('=')
+            if (eq <= 0) continue
+            String k = seg.substring(0, eq).trim()
+            String v = seg.substring(eq + 1).trim()
+            if (k == 'default' && !v.isEmpty()) found.put(name, v)
+        }
+    }
+    return found
+}
+
+/** Metadata first, user macro template second; neither overwrites the other. */
+Map<String, String> discoverDefaults(String macroName) {
+    Map<String, String> found = new LinkedHashMap<String, String>()
+    found.putAll(discoverFromUserMacro(macroName))
+    Map<String, String> meta = discoverFromMetadata(macroName)
+    for (Map.Entry<String, String> e : meta.entrySet()) {
+        if (!found.containsKey(e.getKey())) found.put(e.getKey(), e.getValue())
     }
     return found
 }
