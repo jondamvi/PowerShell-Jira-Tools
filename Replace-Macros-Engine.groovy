@@ -46,6 +46,7 @@ import com.atlassian.confluence.core.Modification
 import com.atlassian.confluence.core.VersionHistorySummary
 import com.atlassian.confluence.pages.Page
 import com.atlassian.confluence.pages.PageManager
+import com.atlassian.confluence.setup.settings.SettingsManager
 import com.atlassian.sal.api.component.ComponentLocator
 import com.atlassian.spring.container.ContainerManager
 import com.onresolve.scriptrunner.db.DatabaseUtil
@@ -102,6 +103,18 @@ import java.util.regex.Pattern
 // large bulk runs, where the output would be unmanageable.
 @Field boolean PRINT_ORIGINAL_BODIES = true
 @Field int MAX_BODY_DUMPS = 25
+
+// After each write, re-read the entity and confirm the source macro is gone.
+// This catches a save that silently did not persist. It does NOT validate that
+// the replacement content is semantically correct - see Validate-QualificationRender.groovy.
+@Field boolean VERIFY_AFTER_WRITE = true
+
+// Output listing the pages that were (or would be) changed.
+//   TABLE - HTML table: page id, space, title, versions changed, link
+//   CSV   - comma separated, quoted, one row per page, ready for Excel
+//   LIST  - plain page URLs, one per line
+//   NONE  - omit the section
+@Field String RESULT_FORMAT = 'TABLE'
 
 // -----------------------------------------------------------------------------
 //  MIGRATIONS
@@ -252,7 +265,7 @@ class Migration {
     Map<String, String> discoveredDefaults = new LinkedHashMap<String, String>()
     // counters
     int pagesFound, currentRows, histRows
-    int versionsSeen, versionsChanged, occReplaced, occSkipped
+    int versionsSeen, versionsChanged, occReplaced, occSkipped, occFailed, verifyFailed
     long evalNanos, writeNanos
     List<String> failures = new ArrayList<String>()
     List<String> notes = new ArrayList<String>()
@@ -262,10 +275,22 @@ class VersionOutcome {
     long pageId, contentId
     int version
     boolean isCurrent
-    int replaced, skipped
+    int occurrences, replaced, skipped, failed
+    String migId
+    String status = ''
     String originalBody
     String newBody
     String error
+}
+
+/** One row of the results listing: everything changed on a single page. */
+class PageResult {
+    long pageId
+    String spaceKey = ''
+    String title = ''
+    boolean currentChanged
+    List<String> histVersions = new ArrayList<String>()
+    int occurrences
 }
 
 // =============================================================================
@@ -596,21 +621,42 @@ String transform(Migration mig, String sourceXml, List<String> notes) {
 //  STORAGE REWRITING
 // =============================================================================
 
-/** result: [newBody, replacedCount, skippedCount] */
+/**
+ * result: [newBody, replacedCount, skippedCount, failedCount]
+ *
+ * skipped = deliberately left alone (unresolved parameters under ON_MISSING=SKIP)
+ * failed  = could not be processed (nested macro, or the transform threw)
+ * Both leave the original macro untouched in the body; the distinction is
+ * whether it was a policy decision or a problem.
+ */
 List<Object> rewritePass(Migration mig, String body, Pattern pattern, List<String> notes) {
     StringBuffer buf = new StringBuffer()
     Matcher m = pattern.matcher(body)
-    int replaced = 0, skipped = 0
+    int replaced = 0, skipped = 0, failed = 0
     while (m.find()) {
         String whole = m.group(0)
         String macroXml = whole
         if (containsNestedMacro(macroXml)) {
-            skipped++
-            notes.add('skipped occurrence - contains a nested macro, cannot be matched safely')
+            failed++
+            notes.add('failed occurrence - contains a nested macro, cannot be matched safely')
             m.appendReplacement(buf, Matcher.quoteReplacement(whole))
             continue
         }
-        String out = transform(mig, macroXml, notes)
+        String out
+        try {
+            out = transform(mig, macroXml, notes)
+        } catch (IllegalStateException ise) {
+            if (ON_MISSING == 'FAIL') throw ise      // FAIL aborts the whole version
+            failed++
+            notes.add('failed occurrence - ' + ise.getMessage())
+            m.appendReplacement(buf, Matcher.quoteReplacement(whole))
+            continue
+        } catch (Exception ex) {
+            failed++
+            notes.add('failed occurrence - ' + ex.getClass().getSimpleName() + ': ' + ex.getMessage())
+            m.appendReplacement(buf, Matcher.quoteReplacement(whole))
+            continue
+        }
         if (out == null) {
             skipped++
             m.appendReplacement(buf, Matcher.quoteReplacement(whole))
@@ -620,7 +666,7 @@ List<Object> rewritePass(Migration mig, String body, Pattern pattern, List<Strin
         }
     }
     m.appendTail(buf)
-    return [buf.toString(), replaced as Integer, skipped as Integer]
+    return [buf.toString(), replaced as Integer, skipped as Integer, failed as Integer]
 }
 
 VersionOutcome evaluateVersion(Migration mig, ContentEntityObject ceo, long pageId, boolean isCurrent) {
@@ -629,22 +675,27 @@ VersionOutcome evaluateVersion(Migration mig, ContentEntityObject ceo, long page
     vo.contentId = ceo.getId()
     vo.version = ceo.getVersion()
     vo.isCurrent = isCurrent
+    vo.migId = mig.id
 
     String body = ceo.getBodyAsString()
     vo.originalBody = body
     List<String> notes = new ArrayList<String>()
-    int replaced = 0, skipped = 0
+    int replaced = 0, skipped = 0, failed = 0
 
     if (mig.unwrapParagraph) {
         List<Object> r = rewritePass(mig, body, macroInParagraphPattern(mig.source), notes)
-        body = (String) r.get(0); replaced += (Integer) r.get(1); skipped += (Integer) r.get(2)
+        body = (String) r.get(0)
+        replaced += (Integer) r.get(1); skipped += (Integer) r.get(2); failed += (Integer) r.get(3)
     }
     List<Object> r2 = rewritePass(mig, body, macroPattern(mig.source), notes)
-    body = (String) r2.get(0); replaced += (Integer) r2.get(1); skipped += (Integer) r2.get(2)
+    body = (String) r2.get(0)
+    replaced += (Integer) r2.get(1); skipped += (Integer) r2.get(2); failed += (Integer) r2.get(3)
 
     vo.newBody = body
     vo.replaced = replaced
     vo.skipped = skipped
+    vo.failed = failed
+    vo.occurrences = replaced + skipped + failed
     for (String n : notes) {
         if (mig.notes.size() < 200) mig.notes.add('page ' + pageId + ' v' + vo.version + ': ' + n)
     }
@@ -654,6 +705,28 @@ VersionOutcome evaluateVersion(Migration mig, ContentEntityObject ceo, long page
 // =============================================================================
 //  PERSISTENCE
 // =============================================================================
+
+/**
+ * success       - every occurrence on this version was replaced
+ * partial-failed- some replaced, some failed
+ * failed        - nothing replaced, or the write did not persist
+ * "skipped" occurrences are a policy decision and do not by themselves make a
+ * version failed; they are reported in their own column.
+ */
+String statusFor(int replaced, int failed, boolean writeOk) {
+    if (!writeOk) return 'failed'
+    if (failed > 0 && replaced > 0) return 'partial-failed'
+    if (failed > 0) return 'failed'
+    if (replaced > 0) return 'success'
+    return 'success'
+}
+
+/** true when the source macro is no longer present in the persisted body. */
+boolean verifyGone(PageManager pm, long contentId, String macroName) {
+    ContentEntityObject fresh = pm.getPage(contentId)
+    if (fresh == null) return false
+    return !fresh.getBodyAsString().contains('ac:name="' + macroName + '"')
+}
 
 void writeCurrent(PageManager pm, Page page, String newBody) {
     if (CURRENT_CREATES_NEW_VERSION) {
@@ -789,6 +862,7 @@ if (ON_MISSING != 'SKIP' && ON_MISSING != 'FAIL') {
 }
 
 List<VersionOutcome> changed = new ArrayList<VersionOutcome>()
+Map<Long, PageResult> pageMeta = new LinkedHashMap<Long, PageResult>()
 List<Migration> selected = new ArrayList<Migration>()
 for (Map<String, Object> cfg : MIGRATIONS) {
     Migration m = toMigration(cfg)
@@ -856,6 +930,14 @@ for (Migration mig : selected) {
             continue
         }
 
+        if (!pageMeta.containsKey(pid)) {
+            PageResult pr = new PageResult()
+            pr.pageId = pid.longValue()
+            pr.spaceKey = page.getSpace()?.getKey() == null ? '' : page.getSpace().getKey()
+            pr.title = page.getTitle() == null ? '' : page.getTitle()
+            pageMeta.put(pid, pr)
+        }
+
         // Each version is guarded on its own, so ON_MISSING='FAIL' on one version
         // no longer prevents the remaining versions of the page being inspected.
         try {
@@ -865,20 +947,34 @@ for (Migration mig : selected) {
             mig.versionsSeen++
             mig.occReplaced += cur.replaced
             mig.occSkipped += cur.skipped
+            mig.occFailed += cur.failed
 
+            boolean writeOk = true
             if (cur.replaced > 0) {
                 mig.versionsChanged++
-                changed.add(cur)
                 if (apply) {
                     long w0 = System.nanoTime()
                     writeCurrent(pageManager, page, cur.newBody)
                     mig.writeNanos += System.nanoTime() - w0
+                    if (VERIFY_AFTER_WRITE && !verifyGone(pageManager, cur.contentId, mig.source)) {
+                        mig.verifyFailed++
+                        writeOk = false
+                        mig.failures.add(pid + ' v(current) - WRITE NOT PERSISTED: source macro still present after save')
+                    }
                 }
             }
+            cur.status = statusFor(cur.replaced, cur.failed, writeOk)
+            if (cur.occurrences > 0) changed.add(cur)
         } catch (Exception e) {
             log.error("Macro engine ${mig.id}: page ${pid} current version failed", e)
             mig.versionsSeen++
             mig.failures.add(pid + ' v(current) - ' + e.getClass().getSimpleName() + ': ' + e.getMessage())
+            VersionOutcome stub = new VersionOutcome()
+            stub.pageId = pid.longValue(); stub.contentId = pid.longValue()
+            stub.version = page.getVersion(); stub.isCurrent = true; stub.migId = mig.id
+            stub.status = 'failed'
+            stub.occurrences = 0
+            changed.add(stub)
         }
 
         try {
@@ -899,21 +995,36 @@ for (Migration mig : selected) {
                         mig.versionsSeen++
                         mig.occReplaced += vo.replaced
                         mig.occSkipped += vo.skipped
+                        mig.occFailed += vo.failed
 
+                        boolean hWriteOk = true
                         if (vo.replaced > 0) {
                             mig.versionsChanged++
-                            changed.add(vo)
                             if (apply) {
                                 long w1 = System.nanoTime()
                                 writeHistorical(pageManager, hist, vo.newBody)
                                 mig.writeNanos += System.nanoTime() - w1
+                                if (VERIFY_AFTER_WRITE && !verifyGone(pageManager, vo.contentId, mig.source)) {
+                                    mig.verifyFailed++
+                                    hWriteOk = false
+                                    mig.failures.add(pid + ' v' + vo.version +
+                                            ' - WRITE NOT PERSISTED: source macro still present after save')
+                                }
                             }
                         }
+                        vo.status = statusFor(vo.replaced, vo.failed, hWriteOk)
+                        if (vo.occurrences > 0) changed.add(vo)
                     } catch (Exception ve) {
                         log.error("Macro engine ${mig.id}: page ${pid} v${hist.getVersion()} failed", ve)
                         mig.versionsSeen++
                         mig.failures.add(pid + ' v' + hist.getVersion() + ' - ' +
                                 ve.getClass().getSimpleName() + ': ' + ve.getMessage())
+                        VersionOutcome stub = new VersionOutcome()
+                        stub.pageId = pid.longValue(); stub.contentId = hid
+                        stub.version = hist.getVersion(); stub.isCurrent = false; stub.migId = mig.id
+                        stub.status = 'failed'
+                        stub.occurrences = 0
+                        changed.add(stub)
                     }
                 }
             }
@@ -947,7 +1058,9 @@ for (Migration mig : selected) {
 
     outp.append('  RESULT "').append(mig.id).append('" - replaced: ').append(mig.occReplaced)
         .append(', skipped: ').append(mig.occSkipped)
-        .append(', failed pages: ').append(mig.failures.size()).append('\n')
+        .append(', failed occurrences: ').append(mig.occFailed)
+        .append(', failed versions: ').append(mig.failures.size())
+        .append(', write-verify failures: ').append(mig.verifyFailed).append('\n')
 
     if (!mig.failures.isEmpty()) {
         outp.append('\n  FAILED PAGES\n')
@@ -984,5 +1097,91 @@ if (PRINT_ORIGINAL_BODIES && !changed.isEmpty()) {
 long totalMs = System.currentTimeMillis() - runStart
 outp.append('TOTAL ELAPSED: ').append(humanTime(totalMs)).append('\n')
 
+// =============================================================================
+//  RESULTS LISTING - pages that were, or would be, changed
+// =============================================================================
+StringBuilder results = new StringBuilder()
+
+if (RESULT_FORMAT != 'NONE' && !changed.isEmpty()) {
+    String baseUrl = ''
+    try {
+        baseUrl = ComponentLocator.getComponent(SettingsManager).getGlobalSettings().getBaseUrl()
+    } catch (Throwable t) { baseUrl = '' }
+
+    for (Migration mig : selected) {
+        List<VersionOutcome> rows = new ArrayList<VersionOutcome>()
+        for (VersionOutcome vo : changed) { if (vo.migId == mig.id) rows.add(vo) }
+        if (rows.isEmpty()) continue
+
+        // page-level metadata, looked up once per page
+        Set<Long> distinctPages = new LinkedHashSet<Long>()
+        for (VersionOutcome vo : rows) distinctPages.add(vo.pageId as Long)
+
+        String heading = textEsc(mig.source) + ' &mdash; ' +
+                (MODE == 'APPLY' ? 'RESULT' : 'DETECTED') + ': ' +
+                rows.size() + ' versions across ' + distinctPages.size() + ' pages'
+
+        if (RESULT_FORMAT == 'TABLE') {
+            results.append('<h3>').append(heading).append('</h3>')
+            results.append('<table border="1" cellpadding="4" cellspacing="0">')
+            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Version</th>')
+                   .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
+                   .append('<th>Failed</th><th>Status</th></tr>')
+            for (VersionOutcome vo : rows) {
+                PageResult meta = pageMeta.get(vo.pageId as Long)
+                String url = baseUrl + '/pages/viewpage.action?pageId=' + vo.pageId
+                results.append('<tr><td>').append(vo.pageId)
+                       .append('</td><td>').append(textEsc(meta == null ? '' : meta.title))
+                       .append('</td><td><a href="').append(url).append('" target="_blank">')
+                       .append(textEsc(url)).append('</a>')
+                       .append('</td><td>').append(vo.version)
+                       .append('</td><td>').append(vo.isCurrent ? 'yes' : '-')
+                       .append('</td><td>').append(vo.occurrences)
+                       .append('</td><td>').append(vo.replaced)
+                       .append('</td><td>').append(vo.skipped)
+                       .append('</td><td>').append(vo.failed)
+                       .append('</td><td>').append(textEsc(vo.status))
+                       .append('</td></tr>')
+            }
+            results.append('</table>')
+
+        } else if (RESULT_FORMAT == 'CSV') {
+            StringBuilder csv = new StringBuilder()
+            csv.append('page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
+            for (VersionOutcome vo : rows) {
+                PageResult meta = pageMeta.get(vo.pageId as Long)
+                List<String> f = new ArrayList<String>()
+                f.add(vo.pageId as String)
+                f.add(meta == null ? '' : meta.title)
+                f.add(baseUrl + '/pages/viewpage.action?pageId=' + vo.pageId)
+                f.add(vo.version as String)
+                f.add(vo.isCurrent ? 'yes' : 'no')
+                f.add(vo.occurrences as String)
+                f.add(vo.replaced as String)
+                f.add(vo.skipped as String)
+                f.add(vo.failed as String)
+                f.add(vo.status)
+                List<String> quoted = new ArrayList<String>()
+                for (String v : f) quoted.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                csv.append(quoted.join(',')).append('\n')
+            }
+            results.append('<h3>').append(heading).append('</h3>')
+            results.append('<pre>').append(textEsc(csv.toString())).append('</pre>')
+
+        } else if (RESULT_FORMAT == 'LIST') {
+            StringBuilder list = new StringBuilder()
+            for (Long pgid : distinctPages) {
+                list.append(baseUrl).append('/pages/viewpage.action?pageId=').append(pgid).append('\n')
+            }
+            results.append('<h3>').append(textEsc(mig.source)).append(' &mdash; ')
+                   .append(distinctPages.size()).append(' page URLs</h3>')
+            results.append('<pre>').append(textEsc(list.toString())).append('</pre>')
+
+        } else {
+            results.append('<pre>RESULT_FORMAT must be TABLE, CSV, LIST or NONE.</pre>')
+        }
+    }
+}
+
 log.warn("Macro engine: mode=${MODE}, migrations=${selected.size()}, elapsed=${totalMs} ms")
-return '<pre>' + textEsc(outp.toString()) + '</pre>'
+return '<pre>' + textEsc(outp.toString()) + '</pre>' + results.toString()
