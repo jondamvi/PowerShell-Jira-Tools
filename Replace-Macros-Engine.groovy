@@ -134,7 +134,12 @@ import java.util.regex.Pattern
         // Fill from the verification described in the notes. Leave empty to let
         // auto-discovery supply them; occurrences that still cannot resolve are
         // skipped and listed.
-        paramDefaults   : [:],
+        // Confirmed empirically: a page with 5 impacts omitted rendered 17%, which
+        // is only consistent with the omitted impacts defaulting to 0.
+        paramDefaults   : ['impactFinance': '0', 'impactSales': '0',
+                           'impactProductmanagement': '0', 'impactMarketing': '0',
+                           'impactOuS': '0', 'impactHR': '0', 'impactGF': '0',
+                           'impactLR': '0', 'impactASUS': '0'],
         requiredParams  : ['impactFinance', 'impactSales', 'impactProductmanagement',
                            'impactMarketing', 'impactOuS', 'impactHR', 'impactGF',
                            'impactLR', 'impactASUS', 'relevance'],
@@ -770,7 +775,10 @@ for (Migration mig : selected) {
         outp.append(' (from PAGE_IDS_OVERRIDE)')
     }
     outp.append('\n  discovered defaults: ')
-        .append(mig.discoveredDefaults.isEmpty() ? 'none' : mig.discoveredDefaults.toString()).append('\n')
+        .append(mig.discoveredDefaults.isEmpty()
+                ? 'NONE - macro metadata exposed no defaults for "' + mig.source +
+                  '". Fill paramDefaults in the migration config.'
+                : mig.discoveredDefaults.toString()).append('\n')
 
     for (Long pid : pageIds) {
         if (MAX_VERSIONS > 0 && mig.versionsSeen >= MAX_VERSIONS) break
@@ -784,6 +792,8 @@ for (Migration mig : selected) {
             continue
         }
 
+        // Each version is guarded on its own, so ON_MISSING='FAIL' on one version
+        // no longer prevents the remaining versions of the page being inspected.
         try {
             long t0 = System.nanoTime()
             VersionOutcome cur = evaluateVersion(mig, page, pid.longValue(), true)
@@ -800,7 +810,13 @@ for (Migration mig : selected) {
                     mig.writeNanos += System.nanoTime() - w0
                 }
             }
+        } catch (Exception e) {
+            log.error("Macro engine ${mig.id}: page ${pid} current version failed", e)
+            mig.versionsSeen++
+            mig.failures.add(pid + ' v(current) - ' + e.getClass().getSimpleName() + ': ' + e.getMessage())
+        }
 
+        try {
             if (UPDATE_HISTORICAL_VERSIONS) {
                 Page refreshed = pageManager.getPage(pid.longValue())
                 List<VersionHistorySummary> history = pageManager.getVersionHistorySummaries(refreshed)
@@ -811,20 +827,27 @@ for (Migration mig : selected) {
                     ContentEntityObject hist = pageManager.getPage(hid)
                     if (hist == null) continue
 
-                    long t1 = System.nanoTime()
-                    VersionOutcome vo = evaluateVersion(mig, hist, pid.longValue(), false)
-                    mig.evalNanos += System.nanoTime() - t1
-                    mig.versionsSeen++
-                    mig.occReplaced += vo.replaced
-                    mig.occSkipped += vo.skipped
+                    try {
+                        long t1 = System.nanoTime()
+                        VersionOutcome vo = evaluateVersion(mig, hist, pid.longValue(), false)
+                        mig.evalNanos += System.nanoTime() - t1
+                        mig.versionsSeen++
+                        mig.occReplaced += vo.replaced
+                        mig.occSkipped += vo.skipped
 
-                    if (vo.replaced > 0) {
-                        mig.versionsChanged++
-                        if (apply) {
-                            long w1 = System.nanoTime()
-                            writeHistorical(pageManager, hist, vo.newBody)
-                            mig.writeNanos += System.nanoTime() - w1
+                        if (vo.replaced > 0) {
+                            mig.versionsChanged++
+                            if (apply) {
+                                long w1 = System.nanoTime()
+                                writeHistorical(pageManager, hist, vo.newBody)
+                                mig.writeNanos += System.nanoTime() - w1
+                            }
                         }
+                    } catch (Exception ve) {
+                        log.error("Macro engine ${mig.id}: page ${pid} v${hist.getVersion()} failed", ve)
+                        mig.versionsSeen++
+                        mig.failures.add(pid + ' v' + hist.getVersion() + ' - ' +
+                                ve.getClass().getSimpleName() + ': ' + ve.getMessage())
                     }
                 }
             }
