@@ -96,6 +96,13 @@ import java.util.regex.Pattern
 // Cap on versions processed per run. 0 = no cap. Useful for a staged rollout.
 @Field int MAX_VERSIONS = 0
 
+// Print the pre-change storage of every version that is modified. This is the
+// ONLY rollback available for historical versions - page history cannot undo
+// them - so keep it on for the first APPLY of any migration. Turn it off for
+// large bulk runs, where the output would be unmanageable.
+@Field boolean PRINT_ORIGINAL_BODIES = true
+@Field int MAX_BODY_DUMPS = 25
+
 // -----------------------------------------------------------------------------
 //  MIGRATIONS
 //
@@ -256,6 +263,7 @@ class VersionOutcome {
     int version
     boolean isCurrent
     int replaced, skipped
+    String originalBody
     String newBody
     String error
 }
@@ -623,6 +631,7 @@ VersionOutcome evaluateVersion(Migration mig, ContentEntityObject ceo, long page
     vo.isCurrent = isCurrent
 
     String body = ceo.getBodyAsString()
+    vo.originalBody = body
     List<String> notes = new ArrayList<String>()
     int replaced = 0, skipped = 0
 
@@ -779,6 +788,7 @@ if (ON_MISSING != 'SKIP' && ON_MISSING != 'FAIL') {
     return '<pre>ABORT: ON_MISSING must be SKIP or FAIL.</pre>'
 }
 
+List<VersionOutcome> changed = new ArrayList<VersionOutcome>()
 List<Migration> selected = new ArrayList<Migration>()
 for (Map<String, Object> cfg : MIGRATIONS) {
     Migration m = toMigration(cfg)
@@ -858,6 +868,7 @@ for (Migration mig : selected) {
 
             if (cur.replaced > 0) {
                 mig.versionsChanged++
+                changed.add(cur)
                 if (apply) {
                     long w0 = System.nanoTime()
                     writeCurrent(pageManager, page, cur.newBody)
@@ -891,6 +902,7 @@ for (Migration mig : selected) {
 
                         if (vo.replaced > 0) {
                             mig.versionsChanged++
+                            changed.add(vo)
                             if (apply) {
                                 long w1 = System.nanoTime()
                                 writeHistorical(pageManager, hist, vo.newBody)
@@ -944,6 +956,27 @@ for (Migration mig : selected) {
     if (!mig.notes.isEmpty()) {
         outp.append('\n  NOTES (first ').append(mig.notes.size()).append(')\n')
         for (String n : mig.notes) outp.append('    ').append(n).append('\n')
+    }
+    outp.append('\n----------------------------------------------------------------\n\n')
+}
+
+if (PRINT_ORIGINAL_BODIES && !changed.isEmpty()) {
+    outp.append('ROLLBACK COPIES - storage BEFORE the change\n')
+    outp.append('  Historical versions cannot be restored from page history. If you need\n')
+    outp.append('  to undo one, this is the only copy. Save this output.\n')
+    outp.append('================================================================\n')
+    int shown = 0
+    for (VersionOutcome vo : changed) {
+        if (shown >= MAX_BODY_DUMPS) {
+            outp.append('  ... ').append(changed.size() - shown)
+                .append(' more not shown (raise MAX_BODY_DUMPS)\n')
+            break
+        }
+        shown++
+        outp.append('\n---- page ').append(vo.pageId).append(' / contentid ').append(vo.contentId)
+            .append(' / v').append(vo.version).append(vo.isCurrent ? ' / CURRENT' : '').append('\n')
+        outp.append('BEFORE:\n').append(vo.originalBody).append('\n')
+        outp.append('AFTER:\n').append(vo.newBody).append('\n')
     }
     outp.append('\n----------------------------------------------------------------\n\n')
 }
