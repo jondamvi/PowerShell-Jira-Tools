@@ -136,10 +136,12 @@ import java.util.regex.Pattern
         // skipped and listed.
         // Confirmed empirically: a page with 5 impacts omitted rendered 17%, which
         // is only consistent with the omitted impacts defaulting to 0.
+        // Backup only - auto-discovery now returns these from the macro definition.
+        // Confirmed: every impact parameter defaults to 0, relevance defaults to 1.
         paramDefaults   : ['impactFinance': '0', 'impactSales': '0',
                            'impactProductmanagement': '0', 'impactMarketing': '0',
                            'impactOuS': '0', 'impactHR': '0', 'impactGF': '0',
-                           'impactLR': '0', 'impactASUS': '0'],
+                           'impactLR': '0', 'impactASUS': '0', 'relevance': '1'],
         requiredParams  : ['impactFinance', 'impactSales', 'impactProductmanagement',
                            'impactMarketing', 'impactOuS', 'impactHR', 'impactGF',
                            'impactLR', 'impactASUS', 'relevance'],
@@ -371,7 +373,10 @@ Map<String, String> discoverFromMetadata(String macroName) {
     try { mgr = ContainerManager.getComponent('macroMetadataManager') } catch (Throwable t) { return found }
     Object md = reflectCall(mgr, 'getMacroMetadataByName', [String] as Class[], [macroName] as Object[])
     if (md == null) md = reflectCall(mgr, 'getMacroMetadata', [String] as Class[], [macroName] as Object[])
-    Object form = reflectCall(md, 'getFormDetails', new Class[0], new Object[0])
+    // NOTE: the accessor is getFromDetails - that spelling is Atlassian's, not a
+    // typo here. getFormDetails does not exist on MacroMetadata.
+    Object form = reflectCall(md, 'getFromDetails', new Class[0], new Object[0])
+    if (form == null) form = reflectCall(md, 'getFormDetails', new Class[0], new Object[0])
     Object plist = reflectCall(form, 'getParameters', new Class[0], new Object[0])
     if (plist == null) plist = reflectCall(md, 'getParameters', new Class[0], new Object[0])
     if (!(plist instanceof Collection)) return found

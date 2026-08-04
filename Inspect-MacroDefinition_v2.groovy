@@ -118,7 +118,9 @@ if (mmm == null) {
         outp.append('  metadata class: ').append(md.getClass().getName()).append('\n')
         if (DUMP_METHODS) outp.append('  metadata methods: ').append(methods(md)).append('\n')
 
-        Object form = call0(md, 'getFormDetails')
+        // Atlassian's own spelling is getFromDetails; getFormDetails does not exist.
+        Object form = call0(md, 'getFromDetails')
+        if (form == null) form = call0(md, 'getFormDetails')
         Object plist = form == null ? null : call0(form, 'getParameters')
         if (plist == null) plist = call0(md, 'getParameters')
 
