@@ -265,7 +265,7 @@ class Migration {
     Map<String, String> discoveredDefaults = new LinkedHashMap<String, String>()
     // counters
     int pagesFound, currentRows, histRows
-    int versionsSeen, versionsChanged, occReplaced, occSkipped, occFailed, verifyFailed
+    int versionsSeen, versionsChanged, occReplaced, occSkipped, occFailed, verifyFailed, noSpace
     long evalNanos, writeNanos
     List<String> failures = new ArrayList<String>()
     List<String> notes = new ArrayList<String>()
@@ -926,14 +926,24 @@ for (Migration mig : selected) {
         if (page.getOriginalVersionId() != null) {
             mig.failures.add(pid + ' - historical id supplied, expected a current page id'); continue
         }
-        if (!SPACE_KEYS.isEmpty() && !SPACE_KEYS.contains(page.getSpace()?.getKey())) {
+        // Content with no space cannot be processed: Confluence's own version-history
+        // and save paths dereference the space (permission checks, event publishing)
+        // and throw NPE. Space-less content is reported, never attempted.
+        if (page.getSpace() == null) {
+            mig.noSpace++
+            mig.failures.add(pid + ' v' + page.getVersion() +
+                    ' - SKIPPED: page has no space (orphaned content). Investigate before remediating.')
+            continue
+        }
+
+        if (!SPACE_KEYS.isEmpty() && !SPACE_KEYS.contains(page.getSpace().getKey())) {
             continue
         }
 
         if (!pageMeta.containsKey(pid)) {
             PageResult pr = new PageResult()
             pr.pageId = pid.longValue()
-            pr.spaceKey = page.getSpace()?.getKey() == null ? '' : page.getSpace().getKey()
+            pr.spaceKey = page.getSpace().getKey()
             pr.title = page.getTitle() == null ? '' : page.getTitle()
             pageMeta.put(pid, pr)
         }
@@ -1060,7 +1070,13 @@ for (Migration mig : selected) {
         .append(', skipped: ').append(mig.occSkipped)
         .append(', failed occurrences: ').append(mig.occFailed)
         .append(', failed versions: ').append(mig.failures.size())
-        .append(', write-verify failures: ').append(mig.verifyFailed).append('\n')
+        .append(', write-verify failures: ').append(mig.verifyFailed)
+        .append(', skipped for no space: ').append(mig.noSpace).append('\n')
+    if (mig.noSpace > 0) {
+        outp.append('  NOTE: ').append(mig.noSpace).append(' page(s) had no space and were NOT touched.\n')
+        outp.append('        Their macros are still in place. Run Diagnose-NoSpacePages.groovy\n')
+        outp.append('        to see what they are before deciding whether to remediate them.\n')
+    }
 
     if (!mig.failures.isEmpty()) {
         outp.append('\n  FAILED PAGES\n')
