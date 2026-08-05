@@ -769,39 +769,6 @@ class Discovery {
     int currentRows, histRows
 }
 
-/**
- * Runs when discovery finds nothing, to distinguish "macro genuinely unused"
- * from "wrong ac:name". Returns a human-readable explanation.
- */
-String probeMacroName(String macroName) {
-    long exact = 0, loose = 0
-    try {
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            sql.eachRow('SELECT count(*) AS n FROM bodycontent WHERE body LIKE :p',
-                        [p: '%ac:name="' + macroName + '"%']) { row -> exact = ((Number) row['n']).longValue() }
-            sql.eachRow('SELECT count(*) AS n FROM bodycontent WHERE body LIKE :p',
-                        [p: '%' + macroName + '%']) { row -> loose = ((Number) row['n']).longValue() }
-        }
-    } catch (Exception e) {
-        return 'probe failed: ' + e.getMessage()
-    }
-    StringBuilder b = new StringBuilder()
-    b.append('bodycontent rows containing ac:name="').append(macroName).append('" = ').append(exact)
-     .append('; rows containing the bare string "').append(macroName).append('" = ').append(loose)
-    if (exact == 0 && loose > 0) {
-        b.append('\n    -> the string occurs but never as an exact ac:name. The macro is\n')
-         .append('       probably registered under a different name. Check the storage\n')
-         .append('       format of a page that uses it.')
-    } else if (exact == 0 && loose == 0) {
-        b.append('\n    -> the string does not appear anywhere in any page body. Either the\n')
-         .append('       macro is genuinely unused, or the name is wrong.')
-    } else if (exact > 0) {
-        b.append('\n    -> rows DO exist. They were filtered out by SPACE_KEYS or\n')
-         .append('       INCLUDE_STATUSES, or excluded by PAGE_IDS_OVERRIDE.')
-    }
-    return b.toString()
-}
-
 Discovery discoverPages(String macroName) {
     Discovery d = new Discovery()
     Map<String, Object> params = new LinkedHashMap<String, Object>()
@@ -1155,11 +1122,6 @@ for (Migration mig : selected) {
     mig.pagesMatched = matchedPages.size()
     outp.append('  pages containing the macro: ').append(mig.pagesMatched)
         .append(' of ').append(mig.pagesExamined).append(' examined\n')
-
-    if (mig.occReplaced + mig.occSkipped + mig.occFailed == 0) {
-        outp.append('\n  NO OCCURRENCES FOUND - diagnosing "').append(mig.source).append('":\n    ')
-            .append(probeMacroName(mig.source)).append('\n\n')
-    }
 
     outp.append('  RESULT "').append(mig.id).append('" - replaced: ').append(mig.occReplaced)
         .append(', skipped: ').append(mig.occSkipped)
