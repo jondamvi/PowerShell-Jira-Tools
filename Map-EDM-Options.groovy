@@ -3,23 +3,24 @@
  *  BUILD THE value -> option-id MAP FOR AN EASYDROPDOWN SET   (READ ONLY)
  * =============================================================================
  *
- *  Input: what you can read off any page that already uses the target macro.
+ *  Input: three values copied from any page that already uses the target macro.
  *      set-id                (constant for the whole set)
- *      option-id + its value (one example pair, used to identify the columns)
+ *      option-id + its value (one example pair, used to identify columns)
  *
- *  Output: a paste-ready perValueParams block for the replacement engine,
- *  covering EVERY option in the set - including values not currently used on
- *  any page, which is what harvesting from pages cannot give you.
+ *  Output: a paste-ready perValueParams block covering EVERY option in the set,
+ *  including values not currently used on any page.
  *
- *  How it works, without assuming any schema:
- *    1. find which AO_1313EC_* table has a text column containing the set-id
- *       in more than one row -> that is the option table
- *    2. within it, find the column holding the known option-id  -> id column
- *       and the column holding the known value                  -> value column
- *    3. read every row for that set-id and emit the pairs
+ *  HOW THE SCHEMA WORKS
+ *  Active Objects relates tables by INTEGER primary key, not by the GUIDs that
+ *  appear in page storage. So the set GUID is only present in the set table;
+ *  the option table points back to it with an integer foreign key. The lookup
+ *  is therefore two hops:
+ *      1. set table   : row where <some column> = SET_ID  ->  its integer ID
+ *      2. option table: rows where <fk column> = that ID   ->  option GUIDs
  *
- *  Re-runnable on a fresh instance: the set-id and one example pair change,
- *  nothing else.
+ *  Tables whose name matches HISTORY_TABLE_HINT are excluded from the registry
+ *  search: a change log contains the same GUIDs but only for options that were
+ *  edited, so it looks like a match while being an incomplete answer.
  * =============================================================================
  */
 
@@ -31,19 +32,21 @@ import groovy.transform.Field
 final String DB_RESOURCE = 'ConfluenceDB'
 
 // Straight from a page's storage format.
-final String SET_ID           = 'cd84552-7994-5a53-bec34a2434678ee'
-final String KNOWN_OPTION_ID  = 'da44632-6712-6eae-556a434365a3733'
-final String KNOWN_VALUE      = 'Geschlossen'
+final String SET_ID          = 'cd84552-7994-5a53-bec34a2434678ee'
+final String KNOWN_OPTION_ID = 'da44632-6712-6eae-556a434365a3733'
+final String KNOWN_VALUE     = 'Geschlossen'
 
-// Table name prefix for the app. AO_1313EC_ is EasyDropDown on this instance.
+// Escaped underscores: '/' is the LIKE escape char, so /_ means a literal _.
 final String TABLE_PREFIX = 'AO/_1313EC/_%'
 
-// Emit the config block for this migration id.
+// Name fragments that mark a table as a change log rather than a registry.
+final List<String> HISTORY_TABLE_HINT = ['HISTORY', 'AUDIT', 'CHANGE']
+
+// The id of the entry in the engine's MIGRATIONS list, used in the printed hint.
 final String MIGRATION_ID = 'blackboard-status'
 // ================================================================
 
 @Field String SCHEMA = 'public'
-@Field int PREVIEW = 200
 
 StringBuilder outp = new StringBuilder()
 
@@ -55,17 +58,12 @@ String qt(String t) { return SCHEMA + '."' + t.replace('"', '""') + '"' }
 String cut(Object v) {
     if (v == null) return '(null)'
     String s = v.toString().replace('\n', ' ')
-    return s.length() <= PREVIEW ? s : s.substring(0, PREVIEW) + '...'
-}
-boolean isText(String type) {
-    if (type == null) return false
-    String t = type.toLowerCase()
-    return t.contains('char') || t.contains('text') || t.contains('clob')
+    return s.length() <= 200 ? s : s.substring(0, 200) + '...'
 }
 
 DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
 
-    // ---- enumerate candidate tables and their columns ----------------------
+    // ---- phase 0: inventory, printed in full -------------------------------
     List<String> tables = new ArrayList<String>()
     sql.eachRow('''SELECT table_name FROM information_schema.tables
                    WHERE table_schema = :s AND table_type = 'BASE TABLE'
@@ -73,10 +71,15 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
                    ORDER BY table_name''', [s: SCHEMA, p: TABLE_PREFIX]) { row ->
         tables.add(row['table_name'] as String)
     }
-    outp.append('Candidate tables: ').append(tables.size()).append('\n\n')
 
+    outp.append('PHASE 0 - tables in scope\n')
+    outp.append('----------------------------------------------------------------\n')
     Map<String, List<List<String>>> colsByTable = new LinkedHashMap<String, List<List<String>>>()
     for (String t : tables) {
+        long cnt = -1
+        try {
+            sql.eachRow('SELECT count(*) AS n FROM ' + qt(t)) { row -> cnt = ((Number) row['n']).longValue() }
+        } catch (Exception ignored) { }
         List<List<String>> cols = new ArrayList<List<String>>()
         try {
             sql.eachRow('SELECT * FROM ' + qt(t) + ' LIMIT 1') { row ->
@@ -87,85 +90,146 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
             }
         } catch (Exception ignored) { }
         colsByTable.put(t, cols)
+
+        boolean isHistory = false
+        for (String h : HISTORY_TABLE_HINT) { if (t.toUpperCase().contains(h)) isHistory = true }
+        outp.append(String.format('  %-38s %-8s cols: %s%s%n', t,
+                cnt < 0 ? '?' : cnt as String,
+                cols.isEmpty() ? '(unreadable)' : cols.collect { List<String> c -> c.get(0) }.join(', '),
+                isHistory ? '   [excluded: change log]' : ''))
     }
+    outp.append('\n')
 
-    // ---- step 1: which table holds the set-id, in how many rows ------------
-    outp.append('STEP 1 - where does the set-id appear?\n')
+    // ---- phase 1: locate the SET row ---------------------------------------
+    outp.append('PHASE 1 - where does the set-id live?\n')
     outp.append('----------------------------------------------------------------\n')
-    String optionTable = null, setIdColumn = null
-    long bestCount = 0
-
+    String setTable = null, setGuidCol = null
     for (String t : tables) {
+        boolean isHistory = false
+        for (String h : HISTORY_TABLE_HINT) { if (t.toUpperCase().contains(h)) isHistory = true }
         for (List<String> c : colsByTable.get(t)) {
-            if (!isText(c.get(1))) continue
             long cnt = 0
             try {
                 sql.eachRow('SELECT count(*) AS n FROM ' + qt(t) +
-                            ' WHERE "' + c.get(0) + '"::text LIKE :p', [p: '%' + SET_ID + '%']) { row ->
+                            ' WHERE "' + c.get(0) + '"::text = :v', [v: SET_ID]) { row ->
                     cnt = ((Number) row['n']).longValue()
                 }
             } catch (Exception ignored) { }
             if (cnt > 0) {
-                outp.append('  ').append(t).append('.').append(c.get(0))
-                    .append('  -> ').append(cnt).append(' row(s)\n')
-                if (cnt > bestCount) { bestCount = cnt; optionTable = t; setIdColumn = c.get(0) }
+                outp.append('  ').append(t).append('.').append(c.get(0)).append(' -> ').append(cnt)
+                    .append(' row(s)').append(isHistory ? '   [change log, ignored]' : '').append('\n')
+                if (!isHistory && setTable == null) { setTable = t; setGuidCol = c.get(0) }
+            }
+        }
+    }
+    if (setTable == null) {
+        outp.append('\n  Set row not found outside change logs. Verify SET_ID is exact.\n')
+        return
+    }
+    outp.append('\n  set table: ').append(setTable).append('.').append(setGuidCol).append('\n\n')
+
+    // ---- phase 2: read the set row, capture its integer key ----------------
+    outp.append('PHASE 2 - the set row\n')
+    outp.append('----------------------------------------------------------------\n')
+    Map<String, String> setRow = new LinkedHashMap<String, String>()
+    sql.eachRow('SELECT * FROM ' + qt(setTable) + ' WHERE "' + setGuidCol + '"::text = :v', [v: SET_ID]) { row ->
+        int n = row.getMetaData().getColumnCount()
+        for (int i = 1; i <= n; i++) {
+            String cn = row.getMetaData().getColumnName(i)
+            setRow.put(cn, row.getObject(i) == null ? null : row.getObject(i).toString())
+            outp.append('    ').append(String.format('%-24s', cn)).append(' = ').append(cut(row.getObject(i))).append('\n')
+        }
+    }
+    outp.append('\n')
+
+    // ---- phase 3: find the option table via the integer FK -----------------
+    outp.append('PHASE 3 - option table, located by integer foreign key\n')
+    outp.append('----------------------------------------------------------------\n')
+    String optTable = null, fkCol = null, idCol = null, valCol = null
+
+    for (Map.Entry<String, String> keyEntry : setRow.entrySet()) {
+        String keyVal = keyEntry.getValue()
+        if (keyVal == null || !(keyVal ==~ /\d+/)) continue     // integer keys only
+
+        for (String t : tables) {
+            if (t == setTable) continue
+            boolean isHistory = false
+            for (String h : HISTORY_TABLE_HINT) { if (t.toUpperCase().contains(h)) isHistory = true }
+            if (isHistory) continue
+
+            // does this table contain the known option-id at all?
+            boolean hasKnown = false
+            for (List<String> c : colsByTable.get(t)) {
+                try {
+                    sql.eachRow('SELECT count(*) AS n FROM ' + qt(t) +
+                                ' WHERE "' + c.get(0) + '"::text = :v', [v: KNOWN_OPTION_ID]) { row ->
+                        if (((Number) row['n']).longValue() > 0) hasKnown = true
+                    }
+                } catch (Exception ignored) { }
+            }
+            if (!hasKnown) continue
+
+            for (List<String> c : colsByTable.get(t)) {
+                long cnt = 0
+                try {
+                    sql.eachRow('SELECT count(*) AS n FROM ' + qt(t) +
+                                ' WHERE "' + c.get(0) + '"::text = :v', [v: keyVal]) { row ->
+                        cnt = ((Number) row['n']).longValue()
+                    }
+                } catch (Exception ignored) { }
+                if (cnt > 0) {
+                    outp.append('  ').append(t).append('.').append(c.get(0))
+                        .append(' = ').append(setTable).append('.').append(keyEntry.getKey())
+                        .append(' (').append(keyVal).append(')  -> ').append(cnt).append(' row(s)\n')
+                    if (optTable == null) { optTable = t; fkCol = c.get(0) }
+                }
             }
         }
     }
 
-    if (optionTable == null) {
-        outp.append('\n  set-id not found in any ').append(TABLE_PREFIX).append(' table.\n')
-        outp.append('  Check the value is copied exactly, or widen TABLE_PREFIX.\n')
+    if (optTable == null) {
+        outp.append('\n  No option table found by integer FK.\n')
+        outp.append('  Check PHASE 0: which table holds the known option-id ')
+            .append(KNOWN_OPTION_ID).append('?\n')
+        outp.append('  If it is only the change log, the registry may store options\n')
+        outp.append('  differently - paste PHASE 0 output and we will read it directly.\n')
         return
     }
-    outp.append('\n  Option table (most rows for this set): ').append(optionTable)
-        .append('  via column ').append(setIdColumn).append('\n\n')
+    outp.append('\n  option table: ').append(optTable).append(' via ').append(fkCol).append('\n\n')
 
-    // ---- step 2: identify the id column and the value column ---------------
-    outp.append('STEP 2 - identify columns from the known example pair\n')
-    outp.append('----------------------------------------------------------------\n')
-    String idCol = null, valCol = null
-    for (List<String> c : colsByTable.get(optionTable)) {
-        if (!isText(c.get(1))) continue
+    // ---- phase 4: identify columns and emit --------------------------------
+    for (List<String> c : colsByTable.get(optTable)) {
         try {
-            sql.eachRow('SELECT count(*) AS n FROM ' + qt(optionTable) +
+            sql.eachRow('SELECT count(*) AS n FROM ' + qt(optTable) +
                         ' WHERE "' + c.get(0) + '"::text = :v', [v: KNOWN_OPTION_ID]) { row ->
                 if (((Number) row['n']).longValue() > 0 && idCol == null) idCol = c.get(0)
             }
-            sql.eachRow('SELECT count(*) AS n FROM ' + qt(optionTable) +
+            sql.eachRow('SELECT count(*) AS n FROM ' + qt(optTable) +
                         ' WHERE "' + c.get(0) + '"::text = :v', [v: KNOWN_VALUE]) { row ->
                 if (((Number) row['n']).longValue() > 0 && valCol == null) valCol = c.get(0)
             }
         } catch (Exception ignored) { }
     }
+    outp.append('PHASE 4 - options in this set\n')
+    outp.append('----------------------------------------------------------------\n')
     outp.append('  option-id column: ').append(idCol == null ? 'NOT FOUND' : idCol).append('\n')
     outp.append('  value column    : ').append(valCol == null ? 'NOT FOUND' : valCol).append('\n\n')
 
-    // ---- step 3: full row dump for this set --------------------------------
-    outp.append('STEP 3 - every option in set ').append(SET_ID).append('\n')
-    outp.append('----------------------------------------------------------------\n')
     List<List<String>> pairs = new ArrayList<List<String>>()
-    try {
-        sql.eachRow('SELECT * FROM ' + qt(optionTable) +
-                    ' WHERE "' + setIdColumn + '"::text LIKE :p', [p: '%' + SET_ID + '%']) { row ->
-            outp.append('  ---\n')
-            int n = row.getMetaData().getColumnCount()
-            for (int i = 1; i <= n; i++) {
-                outp.append('    ').append(String.format('%-24s', row.getMetaData().getColumnName(i)))
-                    .append(' = ').append(cut(row.getObject(i))).append('\n')
-            }
-            if (idCol != null && valCol != null) {
-                Object v = row[valCol]
-                Object id = row[idCol]
-                if (v != null && id != null) pairs.add([v.toString(), id.toString()])
-            }
+    sql.eachRow('SELECT * FROM ' + qt(optTable) + ' WHERE "' + fkCol + '"::text = :v',
+                [v: setRow.get(setRow.keySet().find { String k -> setRow.get(k) ==~ /\d+/ })]) { row ->
+        outp.append('  ---\n')
+        int n = row.getMetaData().getColumnCount()
+        for (int i = 1; i <= n; i++) {
+            outp.append('    ').append(String.format('%-24s', row.getMetaData().getColumnName(i)))
+                .append(' = ').append(cut(row.getObject(i))).append('\n')
         }
-    } catch (Exception e) {
-        outp.append('  ERROR: ').append(e.getMessage()).append('\n')
+        if (idCol != null && valCol != null && row[valCol] != null && row[idCol] != null) {
+            pairs.add([row[valCol].toString(), row[idCol].toString()])
+        }
     }
 
-    // ---- step 4: emit engine config ----------------------------------------
-    outp.append('\nSTEP 4 - paste into the "').append(MIGRATION_ID).append('" migration\n')
+    outp.append('\nPASTE INTO THE "').append(MIGRATION_ID).append('" MIGRATION\n')
     outp.append('----------------------------------------------------------------\n')
     if (pairs.isEmpty()) {
         outp.append('  No pairs built - resolve the NOT FOUND columns above first.\n')
@@ -176,10 +240,7 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
             outp.append('            \'').append(pr.get(0)).append('\': [\'option-id\': \'')
                 .append(pr.get(1)).append('\'],\n')
         }
-        outp.append('        ],\n\n')
-        outp.append('  ').append(pairs.size()).append(' option(s). Check this list against the values\n')
-        outp.append('  the SOURCE macro can hold - any source value missing here has no\n')
-        outp.append('  target option and will be skipped by the engine.\n')
+        outp.append('        ],\n\n  ').append(pairs.size()).append(' option(s).\n')
     }
 }
 
