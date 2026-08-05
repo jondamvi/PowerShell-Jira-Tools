@@ -116,6 +116,11 @@ import java.util.regex.Pattern
 // made in between is lost.
 @Field int WRITE_RETRIES = 2
 
+// Log one line per macro occurrence: which source value was read, where it came
+// from (page or default), and the target parameters produced. Turn off for bulk
+// runs; keep on whenever occurrences look identical when they should not.
+@Field boolean TRACE_MAPPING = true
+
 // Historical rows normally have spaceid NULL by design. Leave both of these off
 // unless a stack trace shows the save path needs the space.
 //   SKIP_SPACELESS_HISTORICAL - skip such rows entirely (skips ALL history if
@@ -586,6 +591,7 @@ String transformMap(Migration mig, String sourceXml, List<String> notes) {
     // build target parameters
     Map<String, String> outParams = new LinkedHashMap<String, String>()
     outParams.putAll(mig.staticParams)
+    String traceSrc = ''
 
     for (Map.Entry<String, String> e : resolved.entrySet()) {
         String srcKey = e.getKey()
@@ -598,6 +604,11 @@ String transformMap(Migration mig, String sourceXml, List<String> notes) {
         String tgtVal = mig.valueMap.get(srcVal)
         if (tgtVal == null) tgtVal = srcVal
         outParams.put(tgtKey, tgtVal)
+
+        if (mig.paramMap.containsKey(srcKey)) {
+            traceSrc = srcKey + '="' + srcVal + '"' +
+                       (onPage.containsKey(srcKey) ? ' [from page]' : ' [FROM DEFAULT - not in storage]')
+        }
 
         Map<String, String> extra = mig.perValueParams.get(srcVal)
         if (extra != null) {
@@ -614,6 +625,10 @@ String transformMap(Migration mig, String sourceXml, List<String> notes) {
     }
 
     String macroId = mig.reuseSourceMacroId ? extractMacroId(sourceXml) : UUID.randomUUID().toString()
+    if (TRACE_MAPPING) {
+        notes.add('occurrence: ' + (traceSrc.isEmpty() ? '(no mapped parameter)' : traceSrc) +
+                  '  parsed=' + onPage + '  ->  ' + outParams + '  macro-id=' + macroId)
+    }
     return buildMacroElement(mig.target, mig.targetSchemaVersion, macroId, outParams)
 }
 
@@ -751,7 +766,7 @@ VersionOutcome evaluateVersion(Migration mig, ContentEntityObject ceo, long page
     vo.failed = failed
     vo.occurrences = replaced + skipped + failed
     for (String n : notes) {
-        if (mig.notes.size() < 200) mig.notes.add('page ' + pageId + ' v' + vo.version + ': ' + n)
+        if (mig.notes.size() < 500) mig.notes.add('page ' + pageId + ' v' + vo.version + ': ' + n)
     }
     return vo
 }
