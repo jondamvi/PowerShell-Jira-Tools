@@ -352,18 +352,36 @@ String humanTime(long millis) {
     return b.toString()
 }
 
-/** Matches a macro element by ac:name, self-closing or not. */
+/*
+ * The macro body is matched with a TEMPERED expression:
+ *     (?:(?!</ac:structured-macro>).)*
+ * rather than a lazy .*?
+ *
+ * A lazy .*? tries the nearest closing tag first, but the regex engine will
+ * BACKTRACK and extend it if that makes the rest of the pattern match. With two
+ * macros inside one paragraph, <p>\s*MACRO\s*</p> therefore extended across the
+ * first macro's closing tag and swallowed BOTH macros plus the paragraph,
+ * replacing them with a single element and silently losing the second macro's
+ * parameters. The tempered form cannot cross a closing tag at all, so a match
+ * always stops at the first </ac:structured-macro>.
+ */
+private static final String MACRO_BODY = '(?:[^>]*/>|[^>]*>(?:(?!</ac:structured-macro>).)*</ac:structured-macro>)'
+
+/** Matches one macro element by ac:name, self-closing or not. Never matches
+ *  surrounding markup - a <div> or <p> wrapper is left exactly as it was. */
 Pattern macroPattern(String name) {
     String q = Pattern.quote(name)
-    return Pattern.compile('(?s)<ac:structured-macro\\b(?=[^>]*ac:name="' + q + '")' +
-            '(?:[^>]*/>|[^>]*>.*?</ac:structured-macro>)')
+    return Pattern.compile('(?s)<ac:structured-macro\\b(?=[^>]*ac:name="' + q + '")' + MACRO_BODY)
 }
 
-/** Same, but consuming a paragraph that contains nothing but the macro. */
+/** Consumes a paragraph ONLY when it contains that macro and nothing else.
+ *  Used where the replacement emits a block element (a table) that may not sit
+ *  inside a <p>. A paragraph holding two macros, or a macro plus text, does not
+ *  match here and its macros are replaced individually instead. */
 Pattern macroInParagraphPattern(String name) {
     String q = Pattern.quote(name)
     return Pattern.compile('(?s)<p>\\s*(?:<ac:structured-macro\\b(?=[^>]*ac:name="' + q + '")' +
-            '(?:[^>]*/>|[^>]*>.*?</ac:structured-macro>))\\s*</p>')
+            MACRO_BODY + ')\\s*</p>')
 }
 
 @Field Pattern P_PARAM = Pattern.compile(
