@@ -109,6 +109,13 @@ import java.util.regex.Pattern
 // the replacement content is semantically correct - see Validate-QualificationRender.groovy.
 @Field boolean VERIFY_AFTER_WRITE = true
 
+// Retries for HibernateOptimisticLockingFailureException ("unexpected row
+// count ... expected: 1"). That means the entity went stale - typically because
+// an earlier migration in the SAME run already wrote this page. On retry the
+// page is re-read and the transform re-applied to the fresh body, so no change
+// made in between is lost.
+@Field int WRITE_RETRIES = 2
+
 // Historical rows normally have spaceid NULL by design. Leave both of these off
 // unless a stack trace shows the save path needs the space.
 //   SKIP_SPACELESS_HISTORICAL - skip such rows entirely (skips ALL history if
@@ -365,7 +372,8 @@ String humanTime(long millis) {
  * parameters. The tempered form cannot cross a closing tag at all, so a match
  * always stops at the first </ac:structured-macro>.
  */
-private static final String MACRO_BODY = '(?:[^>]*/>|[^>]*>(?:(?!</ac:structured-macro>).)*</ac:structured-macro>)'
+// @Field, not a plain local: the methods below cannot see script-level locals.
+@Field String MACRO_BODY = '(?:[^>]*/>|[^>]*>(?:(?!</ac:structured-macro>).)*</ac:structured-macro>)'
 
 /** Matches one macro element by ac:name, self-closing or not. Never matches
  *  surrounding markup - a <div> or <p> wrapper is left exactly as it was. */
@@ -384,15 +392,28 @@ Pattern macroInParagraphPattern(String name) {
             MACRO_BODY + ')\\s*</p>')
 }
 
+/*
+ * Tolerant on purpose:
+ *   - attribute quoted with " or '
+ *   - self-closing <ac:parameter ac:name="X"/> (empty value)
+ *   - any whitespace inside the tag
+ * The value itself is matched with .*? under DOTALL, so it is byte-transparent:
+ * umlauts, entities and newlines all pass through untouched.
+ */
 @Field Pattern P_PARAM = Pattern.compile(
-        '(?s)<ac:parameter\\s+ac:name="([^"]+)"\\s*>(.*?)</ac:parameter>')
+        '(?s)<ac:parameter\\s+[^>]*?ac:name=(?:"([^"]*)"|\'([^\']*)\')\\s*' +
+        '(?:/>|>(.*?)</ac:parameter>)')
 @Field Pattern P_MACRO_ID = Pattern.compile('ac:macro-id="([^"]*)"')
 @Field Pattern P_ANY_MACRO_OPEN = Pattern.compile('<ac:structured-macro\\b')
 
 Map<String, String> parseParams(String macroXml) {
     Map<String, String> found = new LinkedHashMap<String, String>()
     Matcher m = P_PARAM.matcher(macroXml)
-    while (m.find()) found.put(m.group(1), m.group(2).trim())
+    while (m.find()) {
+        String name = m.group(1) != null ? m.group(1) : m.group(2)
+        String value = m.group(3) == null ? '' : m.group(3).trim()
+        if (name != null) found.put(name, value)
+    }
     return found
 }
 
@@ -552,7 +573,10 @@ String transformMap(Migration mig, String sourceXml, List<String> notes) {
     }
 
     if (!unresolved.isEmpty()) {
-        String msg = 'unresolved parameter(s) ' + unresolved + ' (on page: ' + onPage.keySet() + ')'
+        String snippet = sourceXml.length() > 400 ? sourceXml.substring(0, 400) + ' ...' : sourceXml
+        String msg = 'unresolved parameter(s) ' + unresolved +
+                     '; parameters actually parsed from this macro: ' + onPage +
+                     '; storage: ' + snippet
         if (ON_MISSING == 'FAIL') throw new IllegalStateException(msg)
         notes.add('skipped occurrence - ' + msg)
         return null
@@ -768,6 +792,42 @@ void writeCurrent(PageManager pm, Page page, String newBody) {
     } else {
         page.setBodyAsString(newBody)
         pm.saveContentEntity(page, new DefaultSaveContext(true, false, false))
+    }
+}
+
+/**
+ * Writes the current version, retrying on optimistic-lock failure.
+ * Returns null on success, or an error string.
+ *
+ * Each attempt re-reads the page and re-runs the transform against whatever is
+ * in the database now - it never re-applies a body computed from a stale read,
+ * which would silently discard the other write.
+ */
+String writeCurrentRetrying(PageManager pm, Migration mig, long pageId, String firstBody) {
+    int attempt = 0
+    String body = firstBody
+    while (true) {
+        try {
+            Page target = pm.getPage(pageId)
+            if (target == null) return 'page disappeared before write'
+            writeCurrent(pm, target, body)
+            return null
+        } catch (Exception e) {
+            String cn = e.getClass().getName()
+            String msg = e.getMessage() == null ? '' : e.getMessage()
+            boolean staleEntity = cn.contains('OptimisticLocking') || cn.contains('StaleObject') ||
+                                  msg.contains('unexpected row count')
+            attempt++
+            if (!staleEntity || attempt > WRITE_RETRIES) {
+                return e.getClass().getSimpleName() + ': ' + msg +
+                       (staleEntity ? '  (still stale after ' + WRITE_RETRIES + ' retries)' : '')
+            }
+            Page fresh = pm.getPage(pageId)
+            if (fresh == null) return 'page disappeared during retry'
+            VersionOutcome again = evaluateVersion(mig, fresh, pageId, true)
+            if (again.replaced == 0) return null      // already replaced by the other write
+            body = again.newBody
+        }
     }
 }
 
@@ -1018,9 +1078,12 @@ for (Migration mig : selected) {
                 mig.versionsChanged++
                 if (apply) {
                     long w0 = System.nanoTime()
-                    writeCurrent(pageManager, page, cur.newBody)
+                    String werr = writeCurrentRetrying(pageManager, mig, pid.longValue(), cur.newBody)
                     mig.writeNanos += System.nanoTime() - w0
-                    if (VERIFY_AFTER_WRITE && !verifyGone(pageManager, cur.contentId, mig.source)) {
+                    if (werr != null) {
+                        writeOk = false
+                        mig.failures.add(pid + ' v(current) - ' + werr)
+                    } else if (VERIFY_AFTER_WRITE && !verifyGone(pageManager, cur.contentId, mig.source)) {
                         mig.verifyFailed++
                         writeOk = false
                         mig.failures.add(pid + ' v(current) - WRITE NOT PERSISTED: source macro still present after save')
