@@ -995,8 +995,16 @@ for (Migration mig : selected) {
                     if (MAX_VERSIONS > 0 && mig.versionsSeen >= MAX_VERSIONS) break
                     long hid = vhs.getId()
                     if (hid == pid.longValue()) continue
-                    ContentEntityObject hist = pageManager.getPage(hid)
+                    Page hist = pageManager.getPage(hid)
                     if (hist == null) continue
+                    // Same guard as the current version: a space-less historical row
+                    // makes Confluence's own save path throw NPE.
+                    if (hist.getSpace() == null) {
+                        mig.noSpace++
+                        mig.failures.add(pid + ' v' + hist.getVersion() +
+                                ' - SKIPPED: historical version has no space (contentid ' + hid + ')')
+                        continue
+                    }
 
                     try {
                         long t1 = System.nanoTime()
