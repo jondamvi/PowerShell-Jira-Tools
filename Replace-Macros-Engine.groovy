@@ -273,8 +273,8 @@ class Migration {
     List<String> requiredParams
     Map<String, String> discoveredDefaults = new LinkedHashMap<String, String>()
     // counters
-    int pagesFound, currentRows, histRows
-    int versionsSeen, versionsChanged, occReplaced, occSkipped, occFailed, verifyFailed, noSpace
+    int pagesExamined, pagesMatched, currentRows, histRows
+    int versionsSeen, versionsChanged, occReplaced, occSkipped, occFailed, verifyFailed, noSpace, spaceFiltered
     long evalNanos, writeNanos
     List<String> failures = new ArrayList<String>()
     List<String> notes = new ArrayList<String>()
@@ -769,6 +769,39 @@ class Discovery {
     int currentRows, histRows
 }
 
+/**
+ * Runs when discovery finds nothing, to distinguish "macro genuinely unused"
+ * from "wrong ac:name". Returns a human-readable explanation.
+ */
+String probeMacroName(String macroName) {
+    long exact = 0, loose = 0
+    try {
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            sql.eachRow('SELECT count(*) AS n FROM bodycontent WHERE body LIKE :p',
+                        [p: '%ac:name="' + macroName + '"%']) { row -> exact = ((Number) row['n']).longValue() }
+            sql.eachRow('SELECT count(*) AS n FROM bodycontent WHERE body LIKE :p',
+                        [p: '%' + macroName + '%']) { row -> loose = ((Number) row['n']).longValue() }
+        }
+    } catch (Exception e) {
+        return 'probe failed: ' + e.getMessage()
+    }
+    StringBuilder b = new StringBuilder()
+    b.append('bodycontent rows containing ac:name="').append(macroName).append('" = ').append(exact)
+     .append('; rows containing the bare string "').append(macroName).append('" = ').append(loose)
+    if (exact == 0 && loose > 0) {
+        b.append('\n    -> the string occurs but never as an exact ac:name. The macro is\n')
+         .append('       probably registered under a different name. Check the storage\n')
+         .append('       format of a page that uses it.')
+    } else if (exact == 0 && loose == 0) {
+        b.append('\n    -> the string does not appear anywhere in any page body. Either the\n')
+         .append('       macro is genuinely unused, or the name is wrong.')
+    } else if (exact > 0) {
+        b.append('\n    -> rows DO exist. They were filtered out by SPACE_KEYS or\n')
+         .append('       INCLUDE_STATUSES, or excluded by PAGE_IDS_OVERRIDE.')
+    }
+    return b.toString()
+}
+
 Discovery discoverPages(String macroName) {
     Discovery d = new Discovery()
     Map<String, Object> params = new LinkedHashMap<String, Object>()
@@ -882,12 +915,30 @@ for (Map<String, Object> cfg : MIGRATIONS) {
 }
 if (selected.isEmpty()) return '<pre>ABORT: RUN matched no migration ids.</pre>'
 
+List<String> knownIds = new ArrayList<String>()
+for (Map<String, Object> cfg : MIGRATIONS) knownIds.add((String) cfg.get('id'))
+List<String> unknownRun = new ArrayList<String>()
+for (String r : RUN) { if (!knownIds.contains(r)) unknownRun.add(r) }
+
 StringBuilder outp = new StringBuilder()
 outp.append('MODE: ').append(MODE).append(MODE == 'APPLY' ? '   *** WRITES ENABLED ***' : '   (read only)').append('\n')
 outp.append('Spaces: ').append(SPACE_KEYS.isEmpty() ? 'all' : SPACE_KEYS.join(', '))
     .append('   Statuses: ').append(INCLUDE_STATUSES.isEmpty() ? 'all' : INCLUDE_STATUSES.join(', '))
     .append('   History: ').append(UPDATE_HISTORICAL_VERSIONS ? 'included' : 'skipped').append('\n')
 outp.append('Migrations: ').append(selected.collect { Migration mm -> mm.id }.join(', ')).append('\n')
+if (!unknownRun.isEmpty()) {
+    outp.append('WARNING: RUN lists ids that are not in MIGRATIONS and were ignored: ')
+        .append(unknownRun.join(', ')).append('\n')
+}
+if (!PAGE_IDS_OVERRIDE.isEmpty()) {
+    outp.append('WARNING: PAGE_IDS_OVERRIDE is set (').append(PAGE_IDS_OVERRIDE.size())
+        .append(' page(s)). Database discovery is BYPASSED FOR EVERY MIGRATION in this\n')
+        .append('         run - each macro is looked for only on those pages. Clear it to\n')
+        .append('         search the whole instance.\n')
+}
+if (!SPACE_KEYS.isEmpty()) {
+    outp.append('WARNING: SPACE_KEYS restricts this run to: ').append(SPACE_KEYS.join(', ')).append('\n')
+}
 outp.append('================================================================\n\n')
 
 if (MODE == 'HARVEST') {
@@ -903,6 +954,7 @@ for (Migration mig : selected) {
         mig.discoveredDefaults.putAll(discoverDefaults(mig.source))
     }
 
+    Set<Long> matchedPages = new LinkedHashSet<Long>()
     List<Long> pageIds
     if (!PAGE_IDS_OVERRIDE.isEmpty()) {
         pageIds = PAGE_IDS_OVERRIDE
@@ -913,16 +965,20 @@ for (Migration mig : selected) {
         mig.currentRows = d.currentRows
         mig.histRows = d.histRows
     }
-    mig.pagesFound = pageIds.size()
+    mig.pagesExamined = pageIds.size()
 
     outp.append('Macro "').append(mig.source).append('"')
     if (mig.target != null) outp.append(' -> "').append(mig.target).append('"')
-    outp.append('\n  found on ').append(mig.pagesFound).append(' pages')
     if (mig.currentRows >= 0) {
-        outp.append(' (').append(mig.currentRows).append(' current bodies, ')
-            .append(mig.histRows).append(' historical bodies)')
+        outp.append('\n  discovery: found in ').append(mig.currentRows).append(' current bodies and ')
+            .append(mig.histRows).append(' historical bodies, across ')
+            .append(mig.pagesExamined).append(' page(s)')
     } else {
-        outp.append(' (from PAGE_IDS_OVERRIDE)')
+        // PAGE_IDS_OVERRIDE bypasses discovery entirely, so this count is the
+        // number of pages to LOOK AT - it says nothing about whether the macro
+        // is present on any of them.
+        outp.append('\n  discovery: SKIPPED (PAGE_IDS_OVERRIDE). Examining ')
+            .append(mig.pagesExamined).append(' supplied page(s) - not a match count.')
     }
     outp.append('\n  discovered defaults: ')
         .append(mig.discoveredDefaults.isEmpty()
@@ -949,6 +1005,7 @@ for (Migration mig : selected) {
         }
 
         if (!SPACE_KEYS.isEmpty() && !SPACE_KEYS.contains(page.getSpace().getKey())) {
+            mig.spaceFiltered++
             continue
         }
 
@@ -986,7 +1043,7 @@ for (Migration mig : selected) {
                 }
             }
             cur.status = statusFor(cur.replaced, cur.failed, writeOk)
-            if (cur.occurrences > 0) changed.add(cur)
+            if (cur.occurrences > 0) { changed.add(cur); matchedPages.add(pid) }
         } catch (Exception e) {
             log.error("Macro engine ${mig.id}: page ${pid} current version failed", e)
             mig.versionsSeen++
@@ -1052,7 +1109,7 @@ for (Migration mig : selected) {
                             }
                         }
                         vo.status = statusFor(vo.replaced, vo.failed, hWriteOk)
-                        if (vo.occurrences > 0) changed.add(vo)
+                        if (vo.occurrences > 0) { changed.add(vo); matchedPages.add(pid) }
                     } catch (Exception ve) {
                         log.error("Macro engine ${mig.id}: page ${pid} v${hist.getVersion()} failed", ve)
                         mig.versionsSeen++
@@ -1095,12 +1152,22 @@ for (Migration mig : selected) {
             .append(mig.versionsChanged).append(' writes x ').append(WRITE_MS_PER_VERSION).append(' ms assumed)\n')
     }
 
+    mig.pagesMatched = matchedPages.size()
+    outp.append('  pages containing the macro: ').append(mig.pagesMatched)
+        .append(' of ').append(mig.pagesExamined).append(' examined\n')
+
+    if (mig.occReplaced + mig.occSkipped + mig.occFailed == 0) {
+        outp.append('\n  NO OCCURRENCES FOUND - diagnosing "').append(mig.source).append('":\n    ')
+            .append(probeMacroName(mig.source)).append('\n\n')
+    }
+
     outp.append('  RESULT "').append(mig.id).append('" - replaced: ').append(mig.occReplaced)
         .append(', skipped: ').append(mig.occSkipped)
         .append(', failed occurrences: ').append(mig.occFailed)
         .append(', failed versions: ').append(mig.failures.size())
         .append(', write-verify failures: ').append(mig.verifyFailed)
-        .append(', skipped for no space: ').append(mig.noSpace).append('\n')
+        .append(', skipped for no space: ').append(mig.noSpace)
+        .append(', filtered by SPACE_KEYS: ').append(mig.spaceFiltered).append('\n')
     if (mig.noSpace > 0) {
         outp.append('  NOTE: ').append(mig.noSpace).append(' page(s) had no space and were NOT touched.\n')
         outp.append('        Their macros are still in place. Run Diagnose-NoSpacePages.groovy\n')
