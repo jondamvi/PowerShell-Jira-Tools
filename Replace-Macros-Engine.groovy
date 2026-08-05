@@ -109,6 +109,15 @@ import java.util.regex.Pattern
 // the replacement content is semantically correct - see Validate-QualificationRender.groovy.
 @Field boolean VERIFY_AFTER_WRITE = true
 
+// Historical rows normally have spaceid NULL by design. Leave both of these off
+// unless a stack trace shows the save path needs the space.
+//   SKIP_SPACELESS_HISTORICAL - skip such rows entirely (skips ALL history if
+//                               every historical row is space-less, which is normal)
+//   INHERIT_SPACE_FOR_HISTORICAL - set the page's space on the entity before
+//                               saving; this persists spaceid onto the history row
+@Field boolean SKIP_SPACELESS_HISTORICAL = false
+@Field boolean INHERIT_SPACE_FOR_HISTORICAL = false
+
 // Output listing the pages that were (or would be) changed.
 //   TABLE - HTML table: page id, space, title, versions changed, link
 //   CSV   - comma separated, quoted, one row per page, ready for Excel
@@ -997,13 +1006,22 @@ for (Migration mig : selected) {
                     if (hid == pid.longValue()) continue
                     Page hist = pageManager.getPage(hid)
                     if (hist == null) continue
-                    // Same guard as the current version: a space-less historical row
-                    // makes Confluence's own save path throw NPE.
-                    if (hist.getSpace() == null) {
+
+                    // NOTE: historical rows normally carry spaceid NULL - that is the
+                    // Confluence data model, not corruption. Skipping every space-less
+                    // historical row would skip ALL history, so this is opt-in only.
+                    if (SKIP_SPACELESS_HISTORICAL && hist.getSpace() == null) {
                         mig.noSpace++
                         mig.failures.add(pid + ' v' + hist.getVersion() +
-                                ' - SKIPPED: historical version has no space (contentid ' + hid + ')')
+                                ' - SKIPPED: no space (contentid ' + hid + ')')
                         continue
+                    }
+                    // Workaround candidate: lend the historical row the page's space in
+                    // memory before saving, for rows where Confluence's save path
+                    // dereferences it. This DOES persist spaceid onto the history row,
+                    // which Confluence normally leaves NULL - verify before enabling.
+                    if (INHERIT_SPACE_FOR_HISTORICAL && hist.getSpace() == null) {
+                        hist.setSpace(page.getSpace())
                     }
 
                     try {
