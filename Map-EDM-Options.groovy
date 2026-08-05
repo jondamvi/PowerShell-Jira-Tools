@@ -29,11 +29,19 @@ import groovy.sql.Sql
 // ============================ CONFIG ============================
 final String DB_RESOURCE = 'ConfluenceDB'
 
-// Exact set names. Empty = list every set instead of emitting config.
-final List<String> SET_NAMES = []
+// One entry per migration you want generated:
+//     [ exact EDM set name, migration id, source user macro name ]
+// Empty = list every set instead of emitting config.
+final List<List<String>> WANTED = [
+//      ['artikel-status-ed',    'artikel-status',    'artikel-status'],
+//      ['it-artikel-status-ed', 'it-artikel-status', 'it-artikel-status'],
+]
 
-// Alternative lookup by GUID from a page's storage. Ignored if SET_NAMES is set.
-final String SET_ID = ''
+// Constant across every EDM set - the set-id parameter is what distinguishes them.
+final String TARGET_MACRO      = 'easy-dropdown-menu-status'
+final String TARGET_SCHEMA_VER = '2'
+// Parameter on the SOURCE user macro that carries the selected value.
+final String SOURCE_PARAM      = 'Status'
 
 final String T_SET     = 'AO_1313EC_LOZENGE_SET'
 final String T_OPTION  = 'AO_1313EC_LOZENGE_OPTION'
@@ -58,7 +66,7 @@ String esc(Object v) {
 DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
 
     // ---- no filter: inventory of every set ---------------------------------
-    if (SET_NAMES.isEmpty() && SET_ID.trim().isEmpty()) {
+    if (WANTED.isEmpty()) {
         outp.append('ALL EASYDROPDOWN SETS\n')
         outp.append('================================================================\n')
         outp.append(String.format('  %-8s %-40s %-8s %s%n', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
@@ -73,76 +81,88 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
                     row['pk'] as String, row['nm'] as String,
                     row['optcount'] as String, row['guid'] as String))
         }
-        outp.append('\n  Put the exact SET_NAME(s) into SET_NAMES and re-run to get the\n')
-        outp.append('  engine config. Names are matched exactly - a name that is a prefix\n')
+        outp.append('\n  Add entries to WANTED as [set name, migration id, source macro]\n')
+        outp.append('  and re-run. Names are matched exactly, so a name that is a prefix\n')
         outp.append('  of another will not collide.\n')
         return
     }
 
-    // ---- resolve the requested sets ----------------------------------------
-    List<List<String>> sets = new ArrayList<List<String>>()   // [pk, name, guid]
-    Map<String, Object> params = new LinkedHashMap<String, Object>()
-    String where
-    if (!SET_NAMES.isEmpty()) {
-        List<String> ph = new ArrayList<String>()
-        for (int i = 0; i < SET_NAMES.size(); i++) { ph.add(':n' + i); params.put('n' + i, SET_NAMES.get(i)) }
-        where = 's."' + C_SET_NAME + '" IN (' + ph.join(', ') + ')'
-    } else {
-        where = 's."' + C_SET_GUID + '" = :g'
-        params.put('g', SET_ID.trim())
-    }
+    // ---- emit one config block per wanted set ------------------------------
+    StringBuilder cfg = new StringBuilder()
+    StringBuilder detail = new StringBuilder()
+    int emitted = 0
 
-    sql.eachRow('SELECT s."' + C_SET_PK + '" AS pk, s."' + C_SET_NAME + '" AS nm, s."' +
-                C_SET_GUID + '" AS guid FROM ' + qt(T_SET) + ' s WHERE ' + where +
-                ' ORDER BY s."' + C_SET_NAME + '"', params) { row ->
-        sets.add([row['pk'] as String, row['nm'] as String, row['guid'] as String])
-    }
+    for (List<String> want : WANTED) {
+        String setName = want.get(0)
+        String migId   = want.get(1)
+        String srcMacro= want.get(2)
 
-    if (sets.isEmpty()) {
-        outp.append('No set matched. Run with SET_NAMES and SET_ID both empty to list them.\n')
-        return
-    }
-    if (!SET_NAMES.isEmpty() && sets.size() != SET_NAMES.size()) {
-        List<String> found = sets.collect { List<String> r -> r.get(1) }
-        for (String want : SET_NAMES) {
-            if (!found.contains(want)) outp.append('WARNING: no set named "').append(want).append('"\n')
+        List<String> setRow = null
+        sql.eachRow('SELECT s."' + C_SET_PK + '" AS pk, s."' + C_SET_GUID + '" AS guid FROM ' +
+                    qt(T_SET) + ' s WHERE s."' + C_SET_NAME + '" = :n', [n: setName]) { row ->
+            setRow = [row['pk'] as String, row['guid'] as String]
         }
-        outp.append('\n')
-    }
 
-    // ---- emit per set ------------------------------------------------------
-    for (List<String> st : sets) {
-        String pk = st.get(0), name = st.get(1), guid = st.get(2)
-        outp.append('================================================================\n')
-        outp.append('SET "').append(name).append('"   pk=').append(pk).append('\n')
-        outp.append('set-id: ').append(guid).append('\n\n')
+        if (setRow == null) {
+            detail.append('WARNING: no EDM set named "').append(setName)
+                  .append('" - no config generated for migration "').append(migId).append('"\n\n')
+            continue
+        }
 
         List<List<String>> pairs = new ArrayList<List<String>>()
-        sql.eachRow('SELECT o."' + C_OPT_PK + '" AS opk, o."' + C_OPT_NAME + '" AS onm, o."' +
-                    C_OPT_GUID + '" AS oguid FROM ' + qt(T_OPTION) + ' o WHERE o."' +
-                    C_OPT_FK + '" = :pk ORDER BY o."' + C_OPT_PK + '"',
-                    [pk: Integer.parseInt(pk)]) { row ->
-            pairs.add([row['onm'] as String, row['oguid'] as String, row['opk'] as String])
+        sql.eachRow('SELECT o."' + C_OPT_NAME + '" AS onm, o."' + C_OPT_GUID + '" AS oguid FROM ' +
+                    qt(T_OPTION) + ' o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."' + C_OPT_PK + '"',
+                    [pk: Integer.parseInt(setRow.get(0))]) { row ->
+            pairs.add([row['onm'] as String, row['oguid'] as String])
         }
 
-        outp.append(String.format('  %-8s %-32s %s%n', 'PK', 'OPTION_NAME', 'OPTION_ID'))
+        detail.append('SET "').append(setName).append('"  pk=').append(setRow.get(0))
+              .append('  options=').append(pairs.size()).append('\n')
         for (List<String> pr : pairs) {
-            outp.append(String.format('  %-8s %-32s %s%n', pr.get(2), pr.get(0), pr.get(1)))
+            detail.append('    ').append(String.format('%-32s %s', pr.get(0), pr.get(1))).append('\n')
         }
-        outp.append('\n  ').append(pairs.size()).append(' option(s)\n\n')
+        if (pairs.isEmpty()) {
+            detail.append('    WARNING: this set has no options - the generated block is unusable\n')
+        }
+        detail.append('\n')
 
-        outp.append('  ENGINE CONFIG\n')
-        outp.append('        staticParams   : [\'set-id\': \'').append(guid).append('\'],\n')
-        outp.append('        perValueParams : [\n')
+        // longest option name, so the generated map lines align
+        int w = 0
+        for (List<String> pr : pairs) { if (pr.get(0).length() > w) w = pr.get(0).length() }
+
+        cfg.append('    [\n')
+        cfg.append("        id                 : '").append(migId).append("',\n")
+        cfg.append("        source             : '").append(srcMacro).append("',\n")
+        cfg.append("        target             : '").append(TARGET_MACRO).append("',\n")
+        cfg.append("        targetSchemaVersion: '").append(TARGET_SCHEMA_VER).append("',\n")
+        cfg.append('        unwrapParagraph    : false,\n')
+        cfg.append("        paramMap           : ['").append(SOURCE_PARAM)
+           .append("': 'current-option-value'],\n")
+        cfg.append("        staticParams       : ['set-id': '").append(setRow.get(1)).append("'],\n")
+        cfg.append('        perValueParams     : [\n')
         for (List<String> pr : pairs) {
-            outp.append('            \'').append(pr.get(0)).append('\': [\'option-id\': \'')
-                .append(pr.get(1)).append('\'],\n')
+            String q = "'" + pr.get(0).replace("'", "\\'") + "'"
+            cfg.append('            ').append(String.format('%-' + (w + 2) + 's', q))
+               .append(": ['option-id': '").append(pr.get(1)).append("'],\n")
         }
-        outp.append('        ],\n\n')
-        outp.append('  Check these OPTION_NAMEs against the source macro\'s enumValues\n')
-        outp.append('  (Inspect-MacroDefinition.groovy). Any source value missing here has\n')
-        outp.append('  no target option and the engine will skip it.\n\n')
+        cfg.append('        ],\n')
+        cfg.append("        requiredParams     : ['").append(SOURCE_PARAM).append("'],\n")
+        cfg.append('        dropUnmapped       : true,\n')
+        cfg.append("        harvestKeyParam    : 'current-option-value',\n")
+        cfg.append('    ],\n')
+        emitted++
     }
+
+    outp.append('DISCOVERED SETS AND OPTIONS\n')
+    outp.append('================================================================\n')
+    outp.append(detail)
+    outp.append('PASTE INTO THE ENGINE\'S MIGRATIONS LIST  (').append(emitted).append(' block(s))\n')
+    outp.append('================================================================\n')
+    outp.append(cfg)
+    outp.append('\n  Cross-check each perValueParams key list against the source macro\'s\n')
+    outp.append('  enumValues (Inspect-MacroDefinition.groovy). A source value with no\n')
+    outp.append('  entry here is reported as a FAILED occurrence by the engine, not\n')
+    outp.append('  silently skipped.\n')
 }
 
 log.warn('EDM set/option mapping completed')

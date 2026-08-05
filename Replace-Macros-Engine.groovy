@@ -561,10 +561,13 @@ String transformMap(Migration mig, String sourceXml, List<String> notes) {
         if (extra != null) {
             outParams.putAll(extra)
         } else if (!mig.perValueParams.isEmpty() && mig.paramMap.containsKey(srcKey)) {
-            String msg = 'no perValueParams entry for value "' + srcVal + '"'
-            if (ON_MISSING == 'FAIL') throw new IllegalStateException(msg)
-            notes.add('skipped occurrence - ' + msg)
-            return null
+            // An unmapped source value is an ERROR, not a policy skip: the target
+            // macro would be written without the parameters that value needs.
+            // Thrown either way - rewritePass counts it as a failed occurrence
+            // under ON_MISSING=SKIP, and aborts the version under FAIL.
+            throw new IllegalStateException('no perValueParams entry for source value "' +
+                    srcVal + '" (parameter ' + srcKey + '). Known values: ' +
+                    mig.perValueParams.keySet())
         }
     }
 
