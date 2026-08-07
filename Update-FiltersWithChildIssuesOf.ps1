@@ -65,6 +65,13 @@ param (
     # applies the JQL fix, then restores the original owner. Owner drift is validated.
     [switch]$TakeOwnershipTemporarily,
 
+    # Back up every processed filter BEFORE any change into
+    # .\FiltersBackup_<BackupName>_<yyyyMMdd_HHmmss>\ containing <FilterID>.json
+    # (full filter object incl. permissions/subscriptions) and <FilterID>.JQL.txt
+    # (raw JQL string only). Also active in dry run. In commit mode a failed
+    # backup blocks modification of that filter.
+    [string]$Backup,
+
     [int]$PageSize = 50
 )
 
@@ -88,6 +95,23 @@ if (-not $me.accountId) {
 }
 Write-Host "Authenticated as  : $($me.displayName) [$($me.accountId)]" -ForegroundColor Cyan
 $script:MyAccountId = $me.accountId
+
+# --- Backup directory ---
+$script:BackupDir = $null
+if ($Backup) {
+    $stamp = Get-Date -Format 'yyyyMMdd_HHmmss'
+    $script:BackupDir = Join-Path -Path (Get-Location) -ChildPath ("FiltersBackup_{0}_{1}" -f $Backup, $stamp)
+    New-Item -ItemType Directory -Path $script:BackupDir -Force | Out-Null
+    Write-Host "Backup directory  : $script:BackupDir" -ForegroundColor Cyan
+}
+
+function Backup-Filter {
+    param($Detail)
+    $jsonPath = Join-Path $script:BackupDir "$($Detail.id).json"
+    $jqlPath  = Join-Path $script:BackupDir "$($Detail.id).JQL.txt"
+    $Detail | ConvertTo-Json -Depth 20 | Set-Content -Path $jsonPath -Encoding UTF8
+    Set-Content -Path $jqlPath -Value "$($Detail.jql)" -Encoding UTF8
+}
 
 # --- Detection / rewrite regex ---
 # Matches the bare function name childIssuesOf only when followed by "(",
@@ -225,6 +249,12 @@ function Invoke-FilterProcessing {
     Write-Host ("=" * 70) -ForegroundColor Yellow
     Write-FilterState -Label "BEFORE update" -Detail $before
 
+    $backupFailed = $false
+    if ($script:BackupDir) {
+        try   { Backup-Filter -Detail $before }
+        catch { $backupFailed = $true; $errors.Add("BACKUP FAILED: $($_.Exception.Message) — filter will NOT be modified") }
+    }
+
     $originalJql = $before.jql
     $newJql      = Convert-Jql -Jql $originalJql
 
@@ -233,7 +263,11 @@ function Invoke-FilterProcessing {
     }
 
     $status = 'Found'
-    if ($Commit) {
+    if ($backupFailed -and $Commit) {
+        $status = 'Update Error'
+        $script:countFailed++
+    }
+    elseif ($Commit) {
         if ($newJql -eq $originalJql) {
             $status = 'Found'   # nothing to change (should not occur past detection)
         }
