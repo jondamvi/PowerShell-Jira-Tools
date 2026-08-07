@@ -144,10 +144,34 @@ $scalarEvaluator = {
     '{0} aqlFunction("{1} = {2}")' -f $op, $script:AqlAttr, $k
 }
 
+# Text-search operands: values after ~ or !~ are free-text CONTENT searches, not
+# Assets field references. They are masked before rewriting so nothing inside them
+# can ever be modified (e.g. prose containing "in (CMDB-123)" or "= CMDB-123"),
+# then restored untouched. Keys found only inside them are reported as INFO.
+$textOpRegex = [regex]'(!~|~)\s*("[^"]*"|''[^'']*''|[^\s()"'']+)'
+
+function Get-TextMaskedJql {
+    # Returns @{ Masked = jql with text operands replaced by tokens; Store = token -> operand }
+    param([string]$Jql)
+    $store = @{}
+    $out   = $Jql
+    $found = $textOpRegex.Matches($Jql)
+    for ($i = $found.Count - 1; $i -ge 0; $i--) {
+        $g     = $found[$i].Groups[2]
+        $token = "%%TXTOPERAND$i%%"
+        $store[$token] = $g.Value
+        $out = $out.Remove($g.Index, $g.Length).Insert($g.Index, $token)
+    }
+    return @{ Masked = $out; Store = $store }
+}
+
 function Convert-Jql {
     param([string]$Jql)
-    $out = $arrayRegex.Replace($Jql, [System.Text.RegularExpressions.MatchEvaluator]$arrayEvaluator)
-    $out = $scalarRegex.Replace($out, [System.Text.RegularExpressions.MatchEvaluator]$scalarEvaluator)
+    $mask = Get-TextMaskedJql -Jql $Jql
+    $out  = $mask.Masked
+    $out  = $arrayRegex.Replace($out, [System.Text.RegularExpressions.MatchEvaluator]$arrayEvaluator)
+    $out  = $scalarRegex.Replace($out, [System.Text.RegularExpressions.MatchEvaluator]$scalarEvaluator)
+    foreach ($token in $mask.Store.Keys) { $out = $out.Replace($token, $mask.Store[$token]) }
     return $out
 }
 
@@ -290,15 +314,26 @@ function Invoke-FilterProcessing {
     }
     else {
         $newJql       = Convert-Jql -Jql $originalJql
-        $manualReview = $tokenRegex.IsMatch($newJql)
         $changed      = ($newJql -ne $originalJql)
-        if ($manualReview) {
+        # Leftover analysis: keys inside ~ / !~ text operands are informational only;
+        # keys anywhere else after the rewrite genuinely need manual review.
+        $outsideText  = (Get-TextMaskedJql -Jql $newJql).Masked
+        $manualReview = $tokenRegex.IsMatch($outsideText)
+        $textOnly     = (-not $changed) -and (-not $manualReview) -and $tokenRegex.IsMatch($newJql)
+        if ($textOnly) {
+            # Every key sits inside a ~ text-search operand — content match, nothing to replace.
+            $errors.Add("Skipped: body content matching (~ text search) — not relevant for replace")
+        }
+        elseif ($manualReview) {
             $errors.Add("WARN: key(s) left in unhandled JQL context — manual review needed")
             $script:countReview++
         }
+        elseif ($tokenRegex.IsMatch($newJql)) {
+            $errors.Add("INFO: some asset key(s) also appear inside text-search (~) operands — content match, left untouched")
+        }
 
-        $status = 'DryRun'
-        if ($Commit) {
+        $status = if ($textOnly) { 'Skipped' } else { 'DryRun' }
+        if ($Commit -and -not $textOnly) {
             if (-not $changed) {
                 $status = 'SkippedNoChange'
             }
@@ -370,14 +405,20 @@ function Invoke-FilterProcessing {
                 $errors.Add("GET after-state failed: $(Get-JiraErrorDetail $_)")
             }
         }
-        elseif (-not $changed) {
+        elseif (-not $changed -and -not $textOnly) {
             $status = 'DryRun-NoChange'
         }
     }
 
-    Write-Host "Proposed JQL : $newJql" -ForegroundColor Green
+    if ($status -eq 'Skipped') {
+        Write-Host "Proposed JQL : (none — skipped, body content matching)" -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "Proposed JQL : $newJql" -ForegroundColor Green
+    }
     Write-Host "Status       : $status" -ForegroundColor $(
         if ($status -eq 'FAILED') { 'Red' }
+        elseif ($status -eq 'Skipped') { 'DarkGray' }
         elseif ($status -eq 'SkippedAlreadyMigrated') { 'DarkYellow' }
         elseif ($errors.Count -gt 0) { 'Magenta' }
         else { 'Yellow' })
@@ -392,7 +433,8 @@ function Invoke-FilterProcessing {
         'Viewers'      = (Format-Permissions $before.sharePermissions)
         'Editors'      = (Format-Permissions $before.editPermissions)
         'Original JQL' = $originalJql
-        'Updated JQL'  = $newJql
+        'Updated JQL'  = $(if ($status -eq 'Skipped') { '' } else { $newJql })
+        'Status'       = $status
         'Errors'       = ($errors -join "`n")
         'Comments'     = ''
     }))
