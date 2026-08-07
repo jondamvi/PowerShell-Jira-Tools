@@ -1,14 +1,11 @@
 <#
 .SYNOPSIS
-    Finds Jira Cloud filters whose JQL uses the Data Center Advanced Roadmaps
-    function childIssuesOf(...) — unsupported in Cloud — and rewrites it to the
-    Cloud equivalent portfolioChildIssuesOf(...), preserving arguments as-is.
+    Rewrites Jira Cloud filter JQLs that use the deprecated childIssuesOf() JQL
+    function, replacing it with portfolioChildIssuesOf(). Function arguments and
+    the rest of the JQL are left byte-for-byte untouched — the rewrite renames
+    the function only.
 
-        issuekey in childIssuesOf("INIT-001")
-            -> issuekey in portfolioChildIssuesOf("INIT-001")
-
-    Detection is case-insensitive and word-bounded, so existing
-    portfolioChildIssuesOf(...) occurrences are never touched or double-prefixed.
+        issue in childIssuesOf("PROJ-123")   ->   issue in portfolioChildIssuesOf("PROJ-123")
 
     -Filters semantics:
       - Names without wildcards: EXACT name match via server-side query.
@@ -21,14 +18,15 @@
         logged to console, and compared. Any drift is recorded in the Errors column.
       - DRY RUN by default. -Commit asks for interactive confirmation (type YES);
         -Force skips the prompt for unattended runs.
+      - -OverrideSharePermissions (admin) includes other users' private filters in
+        scanning and state reads. Jira refuses JQL updates on filters you don't own
+        or can't edit (admin rights and overrideSharePermissions do NOT bypass this);
+        -TakeOwnershipTemporarily swaps ownership to you for the update and restores
+        the original owner immediately after, with owner drift validated.
 
-    Status column semantics:
-      - Found        : dry-run mode, filter matched (would be updated)
-      - Fixed        : -Commit mode, PUT succeeded and post-update JQL verified
-      - Update Error : -Commit mode, PUT or post-update validation failed
-
-    CSV columns: Filter Name, Filter ID, Owner Name, Owner ID, Owner Email,
+    CSV columns: Filter Name, Filter ID, Owner Name, Owner Email, Owner ID,
                  Viewers, Editors, JQL Before, JQL After, Status, Errors, Comments
+    Status values: Found (dry run), Fixed (committed), Update Error (PUT failed)
 #>
 
 [CmdletBinding()]
@@ -42,8 +40,8 @@ param (
     [Parameter(Mandatory)]
     [string]$ApiToken,
 
-    # Cloud function name written into JQL. Documented casing per Atlassian docs.
-    [string]$ReplacementFunctionName = 'portfolioChildIssuesOf',
+    # Replacement function name. Default per Atlassian's supported Cloud function.
+    [string]$ReplacementFunction = 'portfolioChildIssuesOf',
 
     # No wildcards = exact name match (server-side query). Wildcards = full scan + -like.
     [string[]]$Filters,
@@ -51,6 +49,8 @@ param (
     [string]$ExportCsv,
 
     # Requires Administer Jira global permission (experimental API param).
+    # Includes other users' private filters when scanning and reading filter state.
+    # NOTE: does NOT allow updating filters you don't own — see -TakeOwnershipTemporarily.
     [switch]$OverrideSharePermissions,
 
     # Without this switch the script is a pure dry run — zero write calls.
@@ -58,6 +58,12 @@ param (
 
     # Skip the interactive COMMIT confirmation prompt (for unattended runs).
     [switch]$Force,
+
+    # Jira refuses JQL updates on filters you don't own or can't edit — admin rights
+    # and overrideSharePermissions do NOT bypass this. This switch temporarily
+    # reassigns ownership to the authenticated admin via PUT /filter/{id}/owner,
+    # applies the JQL fix, then restores the original owner. Owner drift is validated.
+    [switch]$TakeOwnershipTemporarily,
 
     [int]$PageSize = 50
 )
@@ -81,16 +87,16 @@ if (-not $me.accountId) {
     throw "Jira served the request as ANONYMOUS (no accountId from /myself). The -Email/-ApiToken pair is not authenticating."
 }
 Write-Host "Authenticated as  : $($me.displayName) [$($me.accountId)]" -ForegroundColor Cyan
+$script:MyAccountId = $me.accountId
 
-# --- Detection regex ---
-# \b before 'childIssuesOf' guarantees no match inside 'portfolioChildIssuesOf'
-# (no word boundary between 'portfolio' and 'childIssuesOf'). Lookahead requires
-# an opening parenthesis so plain text mentions are not rewritten.
-$funcRegex = [regex]'(?i)\bchildIssuesOf\b(?=\s*\()'
+# --- Detection / rewrite regex ---
+# Matches the bare function name childIssuesOf only when followed by "(",
+# and never inside portfolioChildIssuesOf (word boundary + explicit lookbehind).
+$funcRegex = [regex]'(?i)(?<!portfolio)\bchildIssuesOf(?=\s*\()'
 
 function Convert-Jql {
     param([string]$Jql)
-    return $funcRegex.Replace($Jql, $ReplacementFunctionName)
+    return $funcRegex.Replace($Jql, $ReplacementFunction)
 }
 
 # --- Extract the real error body from a failed REST call (PS 5.1 and 7.x) ---
@@ -153,6 +159,13 @@ function Get-FilterDetail {
     return Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Get
 }
 
+function Set-FilterOwner {
+    param([string]$FilterId, [string]$AccountId)
+    $uri  = "$JiraBaseUrl/rest/api/3/filter/${FilterId}/owner"
+    $body = @{ accountId = $AccountId } | ConvertTo-Json
+    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json' -Body $body | Out-Null
+}
+
 function Write-FilterState {
     param([string]$Label, $Detail)
     Write-Host "--- $Label ---" -ForegroundColor Cyan
@@ -184,7 +197,7 @@ function Get-AllFilterPages {
 
 # --- Per-filter processing ---
 $script:totalScanned = 0
-$script:countUpdated = 0
+$script:countFixed   = 0
 $script:countFailed  = 0
 $script:results      = New-Object System.Collections.Generic.List[object]
 
@@ -197,7 +210,7 @@ function Invoke-FilterProcessing {
         return
     }
     if (-not $funcRegex.IsMatch($filter.jql)) {
-        if ($Filters) { Write-Host "[$($filter.name)] no childIssuesOf() usage found" -ForegroundColor DarkGray }
+        if ($Filters) { Write-Host "[$($filter.name)] no childIssuesOf usage found" -ForegroundColor DarkGray }
         return
     }
 
@@ -210,22 +223,34 @@ function Invoke-FilterProcessing {
     if (-not $before) { $before = $filter }
 
     Write-Host ("=" * 70) -ForegroundColor Yellow
-    Write-Host "WARNING: filter uses Cloud-unsupported function childIssuesOf()" -ForegroundColor Magenta
     Write-FilterState -Label "BEFORE update" -Detail $before
 
     $originalJql = $before.jql
     $newJql      = Convert-Jql -Jql $originalJql
-    $changed     = ($newJql -ne $originalJql)
+
+    if ($funcRegex.IsMatch($newJql)) {
+        $errors.Add("VALIDATION: childIssuesOf still present after rewrite — inspect manually")
+    }
 
     $status = 'Found'
     if ($Commit) {
-        if (-not $changed) {
-            # Should not occur (regex matched above), kept as a safety net.
-            $status = 'Found'
-            $errors.Add("WARN: matched but rewrite produced no change — review manually")
+        if ($newJql -eq $originalJql) {
+            $status = 'Found'   # nothing to change (should not occur past detection)
         }
         else {
+            $ownershipTaken  = $false
+            $originalOwnerId = "$($before.owner.accountId)"
             try {
+                if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
+                    if ($TakeOwnershipTemporarily) {
+                        Write-Host "Taking temporary ownership (original owner: $($before.owner.displayName) [$originalOwnerId])" -ForegroundColor DarkYellow
+                        Set-FilterOwner -FilterId $filter.id -AccountId $script:MyAccountId
+                        $ownershipTaken = $true
+                    }
+                    else {
+                        Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                    }
+                }
                 $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
                 if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
                 # Minimal body: ONLY name + jql. Permissions/subscriptions are never sent.
@@ -233,12 +258,26 @@ function Invoke-FilterProcessing {
                 Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
                     -ContentType 'application/json' -Body $body | Out-Null
                 $status = 'Fixed'
-                $script:countUpdated++
+                $script:countFixed++
             }
             catch {
                 $status = 'Update Error'
-                $errors.Add("PUT failed: $(Get-JiraErrorDetail $_)")
+                $errors.Add("PUT/ownership failed: $(Get-JiraErrorDetail $_)")
+                if (-not $TakeOwnershipTemporarily) {
+                    $errors.Add("HINT: only the filter owner (or edit-permission grantees) may modify a filter — re-run with -TakeOwnershipTemporarily")
+                }
                 $script:countFailed++
+            }
+            finally {
+                if ($ownershipTaken) {
+                    try {
+                        Set-FilterOwner -FilterId $filter.id -AccountId $originalOwnerId
+                        Write-Host "Restored original owner [$originalOwnerId]" -ForegroundColor DarkYellow
+                    }
+                    catch {
+                        $errors.Add("CRITICAL: failed to restore original owner [$originalOwnerId]: $(Get-JiraErrorDetail $_) — restore manually via Jira admin filter management")
+                    }
+                }
             }
         }
 
@@ -248,10 +287,10 @@ function Invoke-FilterProcessing {
             Write-FilterState -Label "AFTER update" -Detail $after
 
             if ($status -eq 'Fixed' -and $after.jql -ne $newJql) {
-                $status = 'Update Error'
                 $errors.Add("VALIDATION: JQL after update differs from intended value")
             }
             $checks = @(
+                @{ Label = 'Owner';         B = "$($before.owner.accountId)"; A = "$($after.owner.accountId)" },
                 @{ Label = 'Viewers';       B = (Format-Permissions  $before.sharePermissions); A = (Format-Permissions  $after.sharePermissions) },
                 @{ Label = 'Editors';       B = (Format-Permissions  $before.editPermissions);  A = (Format-Permissions  $after.editPermissions)  },
                 @{ Label = 'Subscriptions'; B = (Format-Subscriptions $before.subscriptions);   A = (Format-Subscriptions $after.subscriptions)   }
@@ -270,8 +309,7 @@ function Invoke-FilterProcessing {
     Write-Host "Proposed JQL : $newJql" -ForegroundColor Green
     Write-Host "Status       : $status" -ForegroundColor $(
         if ($status -eq 'Update Error') { 'Red' }
-        elseif ($status -eq 'Fixed')    { 'Green' }
-        elseif ($errors.Count -gt 0)    { 'Magenta' }
+        elseif ($errors.Count -gt 0) { 'Magenta' }
         else { 'Yellow' })
     foreach ($e in $errors) { Write-Host "  ! $e" -ForegroundColor Magenta }
 
@@ -279,8 +317,8 @@ function Invoke-FilterProcessing {
         'Filter Name' = $before.name
         'Filter ID'   = $before.id
         'Owner Name'  = $before.owner.displayName
-        'Owner ID'    = $before.owner.accountId
         'Owner Email' = "$($before.owner.emailAddress)"
+        'Owner ID'    = $before.owner.accountId
         'Viewers'     = (Format-Permissions $before.sharePermissions)
         'Editors'     = (Format-Permissions $before.editPermissions)
         'JQL Before'  = $originalJql
@@ -293,7 +331,7 @@ function Invoke-FilterProcessing {
 
 # --- Startup info ---
 Write-Host "Detection pattern : $($funcRegex.ToString())"  -ForegroundColor Cyan
-Write-Host "Replacement       : $ReplacementFunctionName"  -ForegroundColor Cyan
+Write-Host "Replacement       : $ReplacementFunction"      -ForegroundColor Cyan
 if ($Filters) { Write-Host "Filter name scope : $($Filters -join ', ')" -ForegroundColor Cyan }
 if ($Commit) {
     Write-Host "MODE: COMMIT — matching filters WILL be updated." -ForegroundColor Red
@@ -340,10 +378,10 @@ else {
 Write-Host ""
 Write-Host ("-" * 50)
 Write-Host "Scanned        : $($script:totalScanned) filters" -ForegroundColor Cyan
-Write-Host "Flagged        : $($script:results.Count)"        -ForegroundColor Cyan
+Write-Host "Found          : $($script:results.Count)"        -ForegroundColor Cyan
 if ($Commit) {
-    Write-Host "Fixed          : $($script:countUpdated)" -ForegroundColor Green
-    Write-Host "Update errors  : $($script:countFailed)"  -ForegroundColor $(if ($script:countFailed) { 'Red' } else { 'Cyan' })
+    Write-Host "Fixed          : $($script:countFixed)"  -ForegroundColor Green
+    Write-Host "Update Errors  : $($script:countFailed)" -ForegroundColor $(if ($script:countFailed) { 'Red' } else { 'Cyan' })
 }
 
 if ($ExportCsv -and $script:results.Count -gt 0) {

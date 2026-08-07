@@ -54,6 +54,8 @@ param (
     [string]$ExportCsv,
 
     # Requires Administer Jira global permission (experimental API param).
+    # Includes other users' private filters when scanning and reading filter state.
+    # NOTE: does NOT allow updating filters you don't own — see -TakeOwnershipTemporarily.
     [switch]$OverrideSharePermissions,
 
     # Without this switch the script is a pure dry run — zero write calls.
@@ -61,6 +63,12 @@ param (
 
     # Skip the interactive COMMIT confirmation prompt (for unattended runs).
     [switch]$Force,
+
+    # Jira refuses JQL updates on filters you don't own or can't edit — admin rights
+    # and overrideSharePermissions do NOT bypass this. This switch temporarily
+    # reassigns ownership to the authenticated admin via PUT /filter/{id}/owner,
+    # applies the JQL fix, then restores the original owner. Owner drift is validated.
+    [switch]$TakeOwnershipTemporarily,
 
     [int]$PageSize = 50
 )
@@ -84,6 +92,7 @@ if (-not $me.accountId) {
     throw "Jira served the request as ANONYMOUS (no accountId from /myself). The -Email/-ApiToken pair is not authenticating."
 }
 Write-Host "Authenticated as  : $($me.displayName) [$($me.accountId)]" -ForegroundColor Cyan
+$script:MyAccountId = $me.accountId
 
 # --- Attribute as rendered inside the AQL string ---
 $script:AqlAttr = if ($QuoteAqlAttribute) { '\"{0}\"' -f $AqlAttributeName } else { $AqlAttributeName }
@@ -202,6 +211,13 @@ function Get-FilterDetail {
     return Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Get
 }
 
+function Set-FilterOwner {
+    param([string]$FilterId, [string]$AccountId)
+    $uri  = "$JiraBaseUrl/rest/api/3/filter/${FilterId}/owner"
+    $body = @{ accountId = $AccountId } | ConvertTo-Json
+    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json' -Body $body | Out-Null
+}
+
 function Write-FilterState {
     param([string]$Label, $Detail)
     Write-Host "--- $Label ---" -ForegroundColor Cyan
@@ -287,7 +303,19 @@ function Invoke-FilterProcessing {
                 $status = 'SkippedNoChange'
             }
             else {
+                $ownershipTaken  = $false
+                $originalOwnerId = "$($before.owner.accountId)"
                 try {
+                    if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
+                        if ($TakeOwnershipTemporarily) {
+                            Write-Host "Taking temporary ownership (original owner: $($before.owner.displayName) [$originalOwnerId])" -ForegroundColor DarkYellow
+                            Set-FilterOwner -FilterId $filter.id -AccountId $script:MyAccountId
+                            $ownershipTaken = $true
+                        }
+                        else {
+                            Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                        }
+                    }
                     $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
                     if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
                     # Minimal body: ONLY name + jql. Permissions/subscriptions are never sent.
@@ -299,8 +327,22 @@ function Invoke-FilterProcessing {
                 }
                 catch {
                     $status = 'FAILED'
-                    $errors.Add("PUT failed: $(Get-JiraErrorDetail $_)")
+                    $errors.Add("PUT/ownership failed: $(Get-JiraErrorDetail $_)")
+                    if (-not $TakeOwnershipTemporarily) {
+                        $errors.Add("HINT: only the filter owner (or edit-permission grantees) may modify a filter — re-run with -TakeOwnershipTemporarily")
+                    }
                     $script:countFailed++
+                }
+                finally {
+                    if ($ownershipTaken) {
+                        try {
+                            Set-FilterOwner -FilterId $filter.id -AccountId $originalOwnerId
+                            Write-Host "Restored original owner [$originalOwnerId]" -ForegroundColor DarkYellow
+                        }
+                        catch {
+                            $errors.Add("CRITICAL: failed to restore original owner [$originalOwnerId]: $(Get-JiraErrorDetail $_) — restore manually via Jira admin filter management")
+                        }
+                    }
                 }
             }
 
@@ -313,6 +355,7 @@ function Invoke-FilterProcessing {
                     $errors.Add("VALIDATION: JQL after update differs from intended value")
                 }
                 $checks = @(
+                    @{ Label = 'Owner';         B = "$($before.owner.accountId)"; A = "$($after.owner.accountId)" },
                     @{ Label = 'Viewers';       B = (Format-Permissions  $before.sharePermissions); A = (Format-Permissions  $after.sharePermissions) },
                     @{ Label = 'Editors';       B = (Format-Permissions  $before.editPermissions);  A = (Format-Permissions  $after.editPermissions)  },
                     @{ Label = 'Subscriptions'; B = (Format-Subscriptions $before.subscriptions);   A = (Format-Subscriptions $after.subscriptions)   }
