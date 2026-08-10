@@ -41,19 +41,50 @@ import java.util.regex.Pattern
 final String DB_RESOURCE = 'ConfluenceDB'
 
 /*
- * One entry per migration to generate:
- *   [ exact EDM set name, migration id, source macro name, source type, sourceParam ]
- * source type is the MacroType member name: UserMacro or ScriptRunnerMacro.
- * Empty list = inventory of every set instead of generating config.
+ * One entry per migration to generate. Empty list = inventory every set instead.
+ *
+ *   id                  the migration id you want in the engine config
+ *   source.name         ac:name of the macro being replaced, as it appears in page storage
+ *   source.type         MacroType member name - see TYPE_NAMES below
+ *   source.sourceParam  the parameter on that macro holding the selected value
+ *   target.setName      EXACT EasyDropDown set name, as shown in the configure UI
+ *                       (this is the SET, not the macro - see target.name)
+ *   target.type         MacroType member name, normally EddStatusMacro
+ *   target.name         optional; ac:name of the replacement macro. Defaults to
+ *                       DEFAULT_TARGET_MACRO below, which is the same for every set -
+ *                       sets are distinguished by set-id, not by macro name.
  */
-final List<List<String>> WANTED = [
-//      ['artikel-status-ed',    'artikel-status',    'artikel-status',    'UserMacro',         'Status'],
-//      ['it-artikel-status-ed', 'it-artikel-status', 'it-artikel-status', 'UserMacro',         'Status'],
-//      ['artikel-progress-ed',  'artikel-progress',  'artikel-progress',  'ScriptRunnerMacro', 'Progress'],
+final List<Map<String, Object>> WANTED = [
+//    [
+//        id     : 'artikel-status',
+//        source : [name: 'artikel-status', type: 'UserMacro', sourceParam: 'Status'],
+//        target : [setName: 'artikel-status-ed', type: 'EddStatusMacro'],
+//    ],
+//    [
+//        id     : 'it-artikel-status',
+//        source : [name: 'it-artikel-status', type: 'UserMacro', sourceParam: 'Status'],
+//        target : [setName: 'it-artikel-status-ed', type: 'EddStatusMacro'],
+//    ],
+//    [
+//        id     : 'artikel-progress',
+//        source : [name: 'artikel-progress', type: 'ScriptRunnerMacro', sourceParam: 'Progress'],
+//        target : [setName: 'artikel-progress-ed', type: 'EddStatusMacro'],
+//    ],
 ]
 
-final String TARGET_MACRO      = 'easy-dropdown-menu-status'
-final String TARGET_SCHEMA_VER = '2'
+// The replacement macro is the same for every EasyDropDown set; the set-id
+// parameter is what distinguishes them. Override per entry with target.name.
+final String DEFAULT_TARGET_MACRO = 'easy-dropdown-menu-status'
+final String TARGET_SCHEMA_VER    = '2'
+
+/*
+ * These MUST match the MacroType enum in the v2 replacement engine exactly,
+ * character for character - the generated config emits MacroType.<name> and a
+ * mismatch is a compile error there rather than a validation failure here.
+ * Note the casing: EddStatusMacro, not EDDStatusMacro.
+ */
+final List<String> TYPE_NAMES = ['UserMacro', 'ScriptRunnerMacro', 'EddStatusMacro',
+                                 'AuraLinkButton', 'Static_QualificationTable']
 
 // Also require option ORDER to match the source enum order (engine default too).
 final boolean VALIDATE_OPTION_ORDER = true
@@ -170,12 +201,43 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
     StringBuilder detail = new StringBuilder()
     int emitted = 0, blocked = 0
 
-    for (List<String> want : WANTED) {
-        String setName  = want.get(0)
-        String migId    = want.get(1)
-        String srcMacro = want.get(2)
-        String srcType  = want.get(3)
-        String srcParam = want.get(4)
+    for (Map<String, Object> want : WANTED) {
+        Map<String, Object> srcCfg = (Map<String, Object>) want.get('source')
+        Map<String, Object> tgtCfg = (Map<String, Object>) want.get('target')
+        String migId    = (String) want.get('id')
+        String srcMacro = srcCfg == null ? null : (String) srcCfg.get('name')
+        String srcType  = srcCfg == null ? null : (String) srcCfg.get('type')
+        String srcParam = srcCfg == null ? null : (String) srcCfg.get('sourceParam')
+        String setName  = tgtCfg == null ? null : (String) tgtCfg.get('setName')
+        String tgtType  = tgtCfg == null ? null : (String) tgtCfg.get('type')
+        String tgtMacro = (tgtCfg != null && tgtCfg.get('name') != null)
+                ? (String) tgtCfg.get('name') : DEFAULT_TARGET_MACRO
+
+        // fail loudly on a malformed entry rather than generating a broken block
+        List<String> cfgErrors = new ArrayList<String>()
+        if (migId == null || migId.trim().isEmpty()) cfgErrors.add('id is missing')
+        if (srcCfg == null) cfgErrors.add('source block is missing')
+        if (tgtCfg == null) cfgErrors.add('target block is missing')
+        if (srcMacro == null) cfgErrors.add('source.name is missing')
+        if (srcParam == null) cfgErrors.add('source.sourceParam is missing')
+        if (setName == null) cfgErrors.add('target.setName is missing')
+        if (srcType != null && !TYPE_NAMES.contains(srcType)) {
+            cfgErrors.add('source.type "' + srcType + '" is not a MacroType member. Valid: ' + TYPE_NAMES)
+        }
+        if (tgtType != null && !TYPE_NAMES.contains(tgtType)) {
+            cfgErrors.add('target.type "' + tgtType + '" is not a MacroType member. Valid: ' + TYPE_NAMES)
+        }
+        if (srcType == null) cfgErrors.add('source.type is missing')
+        if (tgtType == null) cfgErrors.add('target.type is missing')
+        if (!cfgErrors.isEmpty()) {
+            detail.append('================================================================\n')
+            detail.append('ENTRY "').append(migId == null ? '(no id)' : migId).append('"\n')
+            detail.append('  BLOCKED - malformed WANTED entry:\n')
+            for (String ce : cfgErrors) detail.append('    - ').append(ce).append('\n')
+            detail.append('\n')
+            blocked++
+            continue
+        }
 
         // resolve the set in either family
         List<String> fam = null
@@ -296,8 +358,8 @@ DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
         cfg.append(pfx).append("        source : [name: '").append(srcMacro)
            .append("', type: MacroType.").append(srcType)
            .append(", sourceParam: '").append(srcParam).append("'],\n")
-        cfg.append(pfx).append("        target : [name: '").append(TARGET_MACRO)
-           .append("', type: MacroType.EddStatusMacro,\n")
+        cfg.append(pfx).append("        target : [name: '").append(tgtMacro)
+           .append("', type: MacroType.").append(tgtType).append(",\n")
         cfg.append(pfx).append("                  schemaVersion: '").append(TARGET_SCHEMA_VER).append("',\n")
         cfg.append(pfx).append("                  setId  : '").append(setGuid).append("',\n")
         cfg.append(pfx).append("                  setName: '").append(setName).append("',\n")
