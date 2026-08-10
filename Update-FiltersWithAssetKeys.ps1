@@ -174,6 +174,10 @@ $scalarEvaluator = {
 # then restored untouched. Keys found only inside them are reported as INFO.
 $textOpRegex = [regex]'(!~|~)\s*("[^"]*"|''[^'']*''|[^\s()"'']+)'
 
+# aqlFunction("...") arguments contain the rewritten keys BY DESIGN — they are
+# rewrite output, never leftovers. Handles escaped quotes from -QuoteAqlAttribute.
+$aqlFuncRegex = [regex]'(?i)aqlFunction\s*\(\s*"(?:[^"\\]|\\.)*"\s*\)'
+
 function Get-TextMaskedJql {
     # Returns @{ Masked = jql with text operands replaced by tokens; Store = token -> operand }
     param([string]$Jql)
@@ -262,8 +266,8 @@ function Get-FilterDetail {
 function Set-FilterOwner {
     param([string]$FilterId, [string]$AccountId)
     $uri  = "$JiraBaseUrl/rest/api/3/filter/${FilterId}/owner"
-    $body = @{ accountId = $AccountId } | ConvertTo-Json
-    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json' -Body $body | Out-Null
+    $body = [System.Text.Encoding]::UTF8.GetBytes((@{ accountId = $AccountId } | ConvertTo-Json))
+    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json; charset=utf-8' -Body $body | Out-Null
 }
 
 function Write-FilterState {
@@ -347,9 +351,17 @@ function Invoke-FilterProcessing {
         $changed      = ($newJql -ne $originalJql)
         # Leftover analysis: keys inside ~ / !~ text operands are informational only;
         # keys anywhere else after the rewrite genuinely need manual review.
-        $outsideText  = (Get-TextMaskedJql -Jql $newJql).Masked
-        $manualReview = $tokenRegex.IsMatch($outsideText)
-        $textOnly     = (-not $changed) -and (-not $manualReview) -and $tokenRegex.IsMatch($newJql)
+        # Leftover analysis. Keys inside aqlFunction("...") arguments are rewrite
+        # OUTPUT; keys inside ~ text operands are content matches. Only keys
+        # outside BOTH contexts are genuinely unhandled.
+        $mask       = Get-TextMaskedJql -Jql $newJql
+        $keysInText = $false
+        foreach ($v in $mask.Store.Values) {
+            if ($tokenRegex.IsMatch($v)) { $keysInText = $true; break }
+        }
+        $checkJql     = $aqlFuncRegex.Replace($mask.Masked, 'aqlFunction("#")')
+        $manualReview = $tokenRegex.IsMatch($checkJql)
+        $textOnly     = (-not $changed) -and (-not $manualReview) -and $keysInText
         if ($textOnly) {
             # Every key sits inside a ~ text-search operand — content match, nothing to replace.
             $errors.Add("Skipped: body content matching (~ text search) — not relevant for replace")
@@ -358,7 +370,7 @@ function Invoke-FilterProcessing {
             $errors.Add("WARN: key(s) left in unhandled JQL context — manual review needed")
             $script:countReview++
         }
-        elseif ($tokenRegex.IsMatch($newJql)) {
+        elseif ($keysInText) {
             $errors.Add("INFO: some asset key(s) also appear inside text-search (~) operands — content match, left untouched")
         }
 
@@ -374,30 +386,50 @@ function Invoke-FilterProcessing {
             else {
                 $ownershipTaken  = $false
                 $originalOwnerId = "$($before.owner.accountId)"
-                try {
-                    if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
-                        if ($TakeOwnershipTemporarily) {
+                $ownershipError  = $false
+                if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
+                    if ($TakeOwnershipTemporarily) {
+                        try {
                             Write-Host "Taking temporary ownership (original owner: $($before.owner.displayName) [$originalOwnerId])" -ForegroundColor DarkYellow
                             Set-FilterOwner -FilterId $filter.id -AccountId $script:MyAccountId
                             $ownershipTaken = $true
                         }
-                        else {
-                            Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                        catch {
+                            $ownershipError = $true
+                            $status = 'FAILED'
+                            $errors.Add("OWNERSHIP TAKE failed: $(Get-JiraErrorDetail $_)")
+                            $script:countFailed++
                         }
                     }
-                    $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
-                    if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                    # Minimal body: ONLY name + jql. Permissions/subscriptions are never sent.
-                    $body = @{ name = $before.name; jql = $newJql } | ConvertTo-Json
-                    Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
-                        -ContentType 'application/json' -Body $body | Out-Null
-                    $status = 'Updated'
-                    $script:countUpdated++
+                    else {
+                        Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                    }
+                }
+                try {
+                    if (-not $ownershipError) {
+                        $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
+                        if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
+                        # Minimal body: ONLY name + jql, sent as explicit UTF-8 bytes so
+                        # non-ASCII text (umlauts etc.) survives Windows PowerShell's
+                        # legacy request encoding. Permissions/subscriptions never sent.
+                        $bodyJson  = @{ name = $before.name; jql = $newJql } | ConvertTo-Json
+                        $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
+                        Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
+                            -ContentType 'application/json; charset=utf-8' -Body $bodyBytes | Out-Null
+                        $status = 'Updated'
+                        $script:countUpdated++
+                    }
                 }
                 catch {
                     $status = 'FAILED'
-                    $errors.Add("PUT/ownership failed: $(Get-JiraErrorDetail $_)")
-                    if (-not $TakeOwnershipTemporarily) {
+                    $detail = Get-JiraErrorDetail $_
+                    if ($detail -match 'does not exist') {
+                        $errors.Add("PUT rejected by Jira JQL validation — pre-existing problem in OTHER clauses (field/value missing after migration), not the asset-key rewrite: $detail")
+                    }
+                    else {
+                        $errors.Add("PUT failed: $detail")
+                    }
+                    if (-not $TakeOwnershipTemporarily -and $detail -match '(?i)owner|permission') {
                         $errors.Add("HINT: only the filter owner (or edit-permission grantees) may modify a filter — re-run with -TakeOwnershipTemporarily")
                     }
                     $script:countFailed++

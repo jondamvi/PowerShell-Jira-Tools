@@ -186,8 +186,8 @@ function Get-FilterDetail {
 function Set-FilterOwner {
     param([string]$FilterId, [string]$AccountId)
     $uri  = "$JiraBaseUrl/rest/api/3/filter/${FilterId}/owner"
-    $body = @{ accountId = $AccountId } | ConvertTo-Json
-    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json' -Body $body | Out-Null
+    $body = [System.Text.Encoding]::UTF8.GetBytes((@{ accountId = $AccountId } | ConvertTo-Json))
+    Invoke-RestMethod -Uri $uri -Headers $script:headers -Method Put -ContentType 'application/json; charset=utf-8' -Body $body | Out-Null
 }
 
 function Write-FilterState {
@@ -274,30 +274,50 @@ function Invoke-FilterProcessing {
         else {
             $ownershipTaken  = $false
             $originalOwnerId = "$($before.owner.accountId)"
-            try {
-                if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
-                    if ($TakeOwnershipTemporarily) {
+            $ownershipError  = $false
+            if ($originalOwnerId -and $originalOwnerId -ne $script:MyAccountId) {
+                if ($TakeOwnershipTemporarily) {
+                    try {
                         Write-Host "Taking temporary ownership (original owner: $($before.owner.displayName) [$originalOwnerId])" -ForegroundColor DarkYellow
                         Set-FilterOwner -FilterId $filter.id -AccountId $script:MyAccountId
                         $ownershipTaken = $true
                     }
-                    else {
-                        Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                    catch {
+                        $ownershipError = $true
+                        $status = 'Update Error'
+                        $errors.Add("OWNERSHIP TAKE failed: $(Get-JiraErrorDetail $_)")
+                        $script:countFailed++
                     }
                 }
-                $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
-                if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
-                # Minimal body: ONLY name + jql. Permissions/subscriptions are never sent.
-                $body = @{ name = $before.name; jql = $newJql } | ConvertTo-Json
-                Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
-                    -ContentType 'application/json' -Body $body | Out-Null
-                $status = 'Fixed'
-                $script:countFixed++
+                else {
+                    Write-Host "Filter is owned by $($before.owner.displayName) — Jira may refuse the update without -TakeOwnershipTemporarily" -ForegroundColor DarkYellow
+                }
+            }
+            try {
+                if (-not $ownershipError) {
+                    $putUri = "$JiraBaseUrl/rest/api/3/filter/$($filter.id)"
+                    if ($OverrideSharePermissions) { $putUri += "?overrideSharePermissions=true" }
+                    # Minimal body: ONLY name + jql, sent as explicit UTF-8 bytes so
+                    # non-ASCII text (umlauts etc.) survives Windows PowerShell's
+                    # legacy request encoding. Permissions/subscriptions never sent.
+                    $bodyJson  = @{ name = $before.name; jql = $newJql } | ConvertTo-Json
+                    $bodyBytes = [System.Text.Encoding]::UTF8.GetBytes($bodyJson)
+                    Invoke-RestMethod -Uri $putUri -Headers $script:headers -Method Put `
+                        -ContentType 'application/json; charset=utf-8' -Body $bodyBytes | Out-Null
+                    $status = 'Fixed'
+                    $script:countFixed++
+                }
             }
             catch {
                 $status = 'Update Error'
-                $errors.Add("PUT/ownership failed: $(Get-JiraErrorDetail $_)")
-                if (-not $TakeOwnershipTemporarily) {
+                $detail = Get-JiraErrorDetail $_
+                if ($detail -match 'does not exist') {
+                    $errors.Add("PUT rejected by Jira JQL validation — pre-existing problem in OTHER clauses, not the childIssuesOf rewrite: $detail")
+                }
+                else {
+                    $errors.Add("PUT failed: $detail")
+                }
+                if (-not $TakeOwnershipTemporarily -and $detail -match '(?i)owner|permission') {
                     $errors.Add("HINT: only the filter owner (or edit-permission grantees) may modify a filter — re-run with -TakeOwnershipTemporarily")
                 }
                 $script:countFailed++
