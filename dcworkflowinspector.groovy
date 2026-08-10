@@ -115,7 +115,7 @@ Closure<String> htmlTable = { String title, List<String> header, List<List<Strin
   sb.append('<tr>')
   header.each { String h ->
     sb.append('<th style="border:1px solid #888;background:#205081;color:#ffffff;')
-      .append('padding:4px 8px;text-align:left;white-space:nowrap">')
+      .append('padding:4px 8px;text-align:left">')
       .append(esc(h)).append('</th>')
   }
   sb.append('</tr>')
@@ -173,8 +173,28 @@ Closure<String> providerOf = { Map args, String type ->
   if (s.contains('jsu') || s.contains('beecom'))              return 'JSU'
   if (s.contains('jmwe') || s.contains('innovalog'))          return 'JMWE'
   if (s.contains('jwt') || s.contains('decadis'))             return 'JWT'
+  if (s.contains('com.atlassian.jira'))                       return 'BUILTIN'
   if (mk.length() > 0) return 'APP:' + mk.replaceFirst('^com\\.', '').take(35)
   return 'BUILTIN'
+}
+
+// enable/disable flag stored in the function config (app-specific; '-' = no flag = enabled)
+Closure<String> enabledStatus = { Map args ->
+  String verdict = '-'
+  args?.each { Object k, Object v ->
+    String ks = String.valueOf(k).toLowerCase()
+    String vs = String.valueOf(v).toLowerCase()
+    if (ks.contains('disabled')) {
+      verdict = (vs == 'true') ? 'DISABLED' : 'enabled'
+    } else if (ks.contains('enabled')) {
+      verdict = (vs == 'false') ? 'DISABLED' : 'enabled'
+    }
+  }
+  if (verdict == '-') {
+    String all = String.valueOf(args).toLowerCase()
+    if (all.contains('"disabled":true') || all.contains('"enabled":false')) verdict = 'DISABLED?'
+  }
+  return verdict
 }
 
 // extract SR script (inline code or file path) from args -> map with 'code'/'path'
@@ -288,6 +308,7 @@ Closure<String> shortCanned = { Map args ->
 Closure<String> suggestTarget = { String prov, String kind, String canned, String sev ->
   if (prov == 'JSU' || prov == 'JMWE' || prov == 'JWT')
     return 'Vendor cloud app or Automation'
+  if (prov == 'BUILTIN') return 'Native Jira function - JCMA migrates automatically (verify on cloud)'
   if (prov != 'SR') return 'Check app cloud availability'
   boolean isCustom = canned.toLowerCase().contains('customscript')
   if (kind == 'COND' || kind == 'VAL') {
@@ -315,7 +336,15 @@ Map<String, Integer> blankRiskCanned = [:]
 List<String> inactiveList = []
 List<String> draftList = []
 
-List<JiraWorkflow> workflows = new ArrayList<JiraWorkflow>(wfm.workflows)
+Map<String, Map<String, Object>> scriptGroups = [:]   // CodeHash -> occurrence info (table E)
+
+// exclude draft copies from the main list (drafts are reported via the Draft column)
+List<JiraWorkflow> workflows = []
+wfm.workflows.each { JiraWorkflow w ->
+  boolean isDraftCopy = false
+  try { isDraftCopy = w.isDraftWorkflow() } catch (Exception e) {}
+  if (!isDraftCopy) workflows << w
+}
 workflows.sort { JiraWorkflow w -> w.name.toLowerCase() }
 
 workflows.each { JiraWorkflow wf ->
@@ -324,9 +353,10 @@ workflows.each { JiraWorkflow wf ->
   try {
     WorkflowDescriptor wd = wf.descriptor
     Set<ActionDescriptor> acts = actionsOf(wd)
-    boolean isActive = activeNames.contains(wf.name)
+    boolean isActive = false
+    try { isActive = wf.isActive() } catch (Exception e) { isActive = activeNames.contains(wf.name) }
     boolean hasDraft = false
-    try { hasDraft = wfm.getDraftWorkflow(wf.name) != null } catch (Exception e) {}
+    try { hasDraft = wf.hasDraftWorkflow() } catch (Exception e) {}
     if (!isActive) inactiveList << wf.name
     if (hasDraft) draftList << wf.name
     Map<String, Integer> provCount = [:]
@@ -359,6 +389,12 @@ workflows.each { JiraWorkflow wf ->
         }
       } catch (Exception e) { return }
 
+      String transDisabled = ''
+      try {
+        Object md = a.metaAttributes?.get('jira.disabled')
+        if (String.valueOf(md) == 'true') transDisabled = 'TRANS-DISABLED'
+      } catch (Exception e) {}
+
       items.each { Map<String, Object> item ->
         String kind = String.valueOf(item.get('kind'))
         Map args    = item.get('args') as Map
@@ -366,6 +402,8 @@ workflows.each { JiraWorkflow wf ->
         String prov = providerOf(args, type)
         provCount.put(prov, (provCount.get(prov) ?: 0) + 1)
         if (prov == 'BUILTIN' && !SHOW_BUILTIN_IN_B) return
+        String enab = enabledStatus(args)
+        if (transDisabled.length() > 0) enab = transDisabled
 
         String canned = shortCanned(args)
         String source = '-'
@@ -446,7 +484,21 @@ workflows.each { JiraWorkflow wf ->
         String bRef = 'B' + String.format('%03d', bIdx)
         String target = suggestTarget(prov, kind, canned, sev)
         bRows << ([bRef, id, wf.name, String.valueOf(a.id), (a.name != null ? a.name : '?'),
-                   kind, prov, canned, source, path, lenS, hashS, sev, tokS, target, '', ''] as List<String>)
+                   kind, enab, prov, canned, source, path, lenS, hashS, sev, tokS,
+                   target, '', ''] as List<String>)
+
+        // group identical SR scripts by hash for table E
+        if (prov == 'SR' && hashS.length() > 0) {
+          Map<String, Object> g = scriptGroups.get(hashS)
+          if (g == null) {
+            g = [:] as Map<String, Object>
+            g.put('count', 0); g.put('refs', [] as List<String>)
+            g.put('len', lenS); g.put('sev', sev); g.put('tok', tokS); g.put('canned', canned)
+            scriptGroups.put(hashS, g)
+          }
+          g.put('count', (g.get('count') as int) + 1)
+          (g.get('refs') as List<String>) << bRef
+        }
       }
     }
 
@@ -459,7 +511,7 @@ workflows.each { JiraWorkflow wf ->
     provCount.each { String k, Integer v -> if (k.startsWith('APP:')) otherN += v }
     List<String> prjKeys = wfProjects.get(wf.name) ?: ([] as List<String>)
     aRows << ([id, wf.name, (isActive ? 'ACTIVE' : 'INACTIVE'), (hasDraft ? 'Y' : 'N'),
-               String.valueOf(prjKeys.size()), prjKeys.join(' '),
+               String.valueOf(prjKeys.size()), prjKeys.join(', '),
                String.valueOf(acts.size()), String.valueOf(srN), String.valueOf(jsuN),
                String.valueOf(jmweN), String.valueOf(jwtN), String.valueOf(otherN),
                String.valueOf(biN)] as List<String>)
@@ -479,18 +531,74 @@ out.append('<span style="background:#dcf0dc">&nbsp;EASY&nbsp;</span> ')
 out.append('<span style="background:#e8e8e8">&nbsp;INACTIVE&nbsp;</span>')
 out.append(' &mdash; select a table, copy, paste into Excel.</p>')
 
+// legend renderer: small two-column table
+Closure<String> legendFor = { String title, List<List<String>> defs ->
+  return htmlTable(title, ['Column', 'Meaning'] as List<String>, defs, -1)
+}
+
+// ---- Table A ----
+out.append(legendFor('Legend: Table A - Workflows', [
+  ['ID', 'Workflow reference id, used as "WF id" in Table B'],
+  ['Status', 'ACTIVE = assigned to a workflow scheme used by a project. INACTIVE = unused; JCMA will NOT migrate it'],
+  ['Draft', 'Y = an unpublished draft exists for this workflow (drafts are not migrated; publish or discard)'],
+  ['Proj Count / ProjectKeys', 'How many projects use this workflow, and their project keys'],
+  ['Trans', 'Number of transitions (workflow actions), incl. create and global transitions'],
+  ['SR', 'Count of ScriptRunner workflow functions in this workflow'],
+  ['JSU', 'Count of functions from the JSU Automation Suite app'],
+  ['JMWE', 'Count of functions from the Jira Misc Workflow Extensions app'],
+  ['JWT', 'Count of functions from the Jira Workflow Toolbox app'],
+  ['OtherApps', 'Functions from other third-party apps (cloud availability must be checked per app)'],
+  ['Builtin', 'Native Jira functions - JCMA migrates these automatically'],
+] as List<List<String>>))
 // Status is column index 2 in table A
 out.append(htmlTable('Table A - Workflows',
-    ['ID', 'Workflow', 'Status', 'Draft', 'Prj', 'ProjectKeys', 'Trans',
+    ['ID', 'Workflow', 'Status', 'Draft', 'Proj Count', 'ProjectKeys', 'Trans',
      'SR', 'JSU', 'JMWE', 'JWT', 'OtherApps', 'Builtin'] as List<String>,
     aRows, 2))
 
-// Severity is column index 12 in table B
+// ---- Table B ----
+out.append(legendFor('Legend: Table B - App workflow functions', [
+  ['Ref', 'Unique row reference (B001...) for discussing individual functions'],
+  ['WF id', 'Workflow reference - see ID in Table A'],
+  ['TransId / Transition', 'Internal transition id and transition name the function is attached to'],
+  ['Kind', 'PF = post function, VAL = validator, COND = condition'],
+  ['Enabled', 'Enable/disable flag stored in the function config, if the app supports one. "-" = no flag stored (function is effectively enabled). DISABLED = flagged off. TRANS-DISABLED = whole transition flagged'],
+  ['Provider', 'App providing the function: SR = ScriptRunner, JSU/JMWE/JWT = workflow apps, BUILTIN = native Jira, APP:... = other app'],
+  ['CannedScript', 'Function class. CustomScriptFunction/-Validator/-Condition = free Groovy; other names = SR built-in (canned) function'],
+  ['Source', 'inline = Groovy stored inside the workflow; file = script file on the server (resolved); file-NOT-FOUND = referenced file missing from script roots; nocode = SR canned function configured only via UI fields, no custom Groovy'],
+  ['CodeLen / CodeHash', 'Script size and fingerprint. Same hash = identical script reused on several transitions (rewrite once - see Table E)'],
+  ['Severity', 'Cloud rewrite effort: EASY = trivial, MED = rewrite against REST/HAPI, HARD = capability does not exist on cloud (redesign)'],
+  ['Tokens', 'DC-only API classes found in the code, with occurrence count'],
+  ['SuggestedTarget', 'Proposed cloud replacement; Decision/Notes are empty columns for your work in Excel'],
+] as List<List<String>>))
+// Severity is column index 13 in table B
 out.append(htmlTable('Table B - App workflow functions (working sheet)',
-    ['Ref', 'WfID', 'Workflow', 'TransId', 'Transition', 'Kind', 'Provider', 'CannedScript',
+    ['Ref', 'WF id', 'Workflow', 'TransId', 'Transition', 'Kind', 'Enabled', 'Provider', 'CannedScript',
      'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
      'SuggestedTarget', 'Decision', 'Notes'] as List<String>,
-    bRows, 12))
+    bRows, 13))
+
+// ---- Table E: distinct SR scripts ----
+out.append(legendFor('Legend: Table E - Distinct SR scripts', [
+  ['CodeHash', 'Script fingerprint - same value in Table B means the identical script'],
+  ['Uses', 'How many workflow functions use this exact script'],
+  ['Refs', 'Table B rows using it - one rewrite covers all of them'],
+] as List<List<String>>))
+List<List<String>> eRows = []
+List<Map.Entry<String, Map<String, Object>>> grpEntries =
+    new ArrayList<Map.Entry<String, Map<String, Object>>>(scriptGroups.entrySet())
+grpEntries.sort { Map.Entry<String, Map<String, Object>> en -> -(en.value.get('count') as int) }
+grpEntries.each { Map.Entry<String, Map<String, Object>> en ->
+  List<String> refs = en.value.get('refs') as List<String>
+  eRows << ([en.key, String.valueOf(en.value.get('count')), String.valueOf(en.value.get('canned')),
+             String.valueOf(en.value.get('len')), String.valueOf(en.value.get('sev')),
+             String.valueOf(en.value.get('tok')), refs.join(', ')] as List<String>)
+}
+if (eRows.isEmpty()) eRows << (['(no SR scripts with code found)', '', '', '', '', '', ''] as List<String>)
+// Severity is column index 4 in table E
+out.append(htmlTable('Table E - Distinct SR scripts (rewrite once, apply to all Refs)',
+    ['CodeHash', 'Uses', 'CannedScript', 'CodeLen', 'Severity', 'Tokens', 'Refs'] as List<String>,
+    eRows, 4))
 List<List<String>> cRows = []
 List<Map.Entry<String, Map<String, Object>>> tokenEntries =
     new ArrayList<Map.Entry<String, Map<String, Object>>>(tokenRollup.entrySet())
@@ -504,6 +612,13 @@ tokenEntries.each { Map.Entry<String, Map<String, Object>> en ->
              String.valueOf(en.value.get('sev')), String.valueOf(en.value.get('hint'))] as List<String>)
 }
 if (cRows.isEmpty()) cRows << (['(none found)', '', '', '', ''] as List<String>)
+out.append(legendFor('Legend: Table C - Cloud-blocker tokens', [
+  ['Token', 'DC-only API/class pattern found in SR script code'],
+  ['Hits', 'Total occurrences across all scripts'],
+  ['Scripts', 'Number of distinct workflow functions containing it'],
+  ['Severity', 'HARD = no cloud equivalent (redesign), MED = rewrite, EASY = trivial'],
+  ['CloudReplacementHint', 'How to replace it on cloud (SR Cloud HAPI, REST, Automation...)'],
+] as List<List<String>>))
 // Severity is column index 3 in table C
 out.append(htmlTable('Table C - Cloud-blocker tokens',
     ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>, cRows, 3))
@@ -530,6 +645,9 @@ dRows << (['SR canned COND/VAL (arrive BLANK on cloud - must recreate)',
            blankParts.isEmpty() ? '-' : blankParts.join(' | ')] as List<String>)
 dRows << (['Script roots checked',
            scriptRoots.isEmpty() ? 'none found' : scriptRoots.join(' | ')] as List<String>)
+out.append(legendFor('Legend: Table D - Summary', [
+  ['Metric / Value', 'Instance-wide totals: workflow counts, SR function counts by source and severity, canned conditions/validators that arrive blank on cloud, and the script roots searched for file-based scripts'],
+] as List<List<String>>))
 out.append(htmlTable('Table D - Summary', ['Metric', 'Value'] as List<String>, dRows, -1))
 out.append('</div>')
 
