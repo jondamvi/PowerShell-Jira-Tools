@@ -1,15 +1,16 @@
 /*
- * DC WORKFLOW INSPECTOR v4 (aligned table output)
- * -----------------------------------------------
+ * DC WORKFLOW INSPECTOR v5 (HTML table output)
+ * --------------------------------------------
  * Run in: ScriptRunner Script Console on the Jira DC TEST instance.
  * Read-only: makes no changes.
  *
- * Output: 4 formatted tables (A workflows, B functions, C tokens, D summary)
- * with space-aligned columns - readable in the console and copy/paste-able
- * into Excel.
+ * Output: 4 HTML tables rendered directly in the console result pane
+ * (A workflows, B functions, C tokens, D summary). Select a table and
+ * copy/paste into Excel - it splits into cells automatically.
  *
  * Table B is the working sheet: one row per app-provided workflow function,
  * with Severity, Tokens, SuggestedTarget and empty Decision/Notes columns.
+ * Row colors: red = HARD/ERROR, orange = MED, green = EASY, grey = INACTIVE.
  */
 
 import com.atlassian.jira.component.ComponentAccessor
@@ -30,7 +31,6 @@ import groovy.json.JsonSlurper
 // ---------------------------------------------------------------- config ---
 final boolean SHOW_BUILTIN_IN_B = false  // true = also list built-in Jira functions in table B
 final int MAX_TOKENS_PER_CELL = 8        // tokens listed in the Tokens column
-final String COL_GAP = '  '              // gap between columns
 
 // regex -> [tokenName, severity, cloud hint]
 // severity: HARD = no cloud equivalent / redesign; MED = rewrite (HAPI/REST); EASY = trivial
@@ -99,42 +99,45 @@ def wfm = ComponentAccessor.workflowManager
 def wsm = ComponentAccessor.workflowSchemeManager
 def pm  = ComponentAccessor.projectManager
 
-// sanitize a value for one table cell: no line breaks/tabs
-Closure<String> cell = { Object o ->
+// HTML-escape one cell value (also strips line breaks/tabs)
+Closure<String> esc = { Object o ->
   String s = o == null ? '' : String.valueOf(o)
-  return s.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim()
+  return s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+          .replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim()
 }
 
-// render header + rows as an aligned fixed-width table
-Closure<String> renderTable = { List<String> header, List<List<String>> rows ->
-  int n = header.size()
-  List<List<String>> all = []
-  List<String> h = []
-  header.each { String c -> h << cell(c) }
-  all << h
-  rows.each { List<String> r ->
-    List<String> clean = []
-    for (int i = 0; i < n; i++) clean << cell(i < r.size() ? r.get(i) : '')
-    all << clean
-  }
-  List<Integer> widths = []
-  for (int i = 0; i < n; i++) {
-    int w = 0
-    all.each { List<String> r -> if (r.get(i).length() > w) w = r.get(i).length() }
-    widths << w
-  }
+// render one HTML table; markCol = column index used for row coloring (-1 = none)
+Closure<String> htmlTable = { String title, List<String> header, List<List<String>> rows, int markCol ->
   StringBuilder sb = new StringBuilder()
-  all.eachWithIndex { List<String> r, int ri ->
-    List<String> padded = []
-    for (int i = 0; i < n; i++) padded << r.get(i).padRight(widths.get(i))
-    String line = padded.join(COL_GAP)
-    sb.append(line.replaceAll('\\s+$', '')).append('\n')
-    if (ri == 0) {
-      List<String> dashes = []
-      for (int i = 0; i < n; i++) dashes << ('-' * widths.get(i))
-      sb.append(dashes.join(COL_GAP)).append('\n')
-    }
+  sb.append('<h3 style="font-family:Arial,sans-serif;margin:18px 0 6px 0;color:#205081">')
+    .append(esc(title)).append('</h3>')
+  sb.append('<table style="border-collapse:collapse;font-family:Arial,sans-serif;font-size:12px">')
+  sb.append('<tr>')
+  header.each { String h ->
+    sb.append('<th style="border:1px solid #888;background:#205081;color:#ffffff;')
+      .append('padding:4px 8px;text-align:left;white-space:nowrap">')
+      .append(esc(h)).append('</th>')
   }
+  sb.append('</tr>')
+  int n = header.size()
+  rows.each { List<String> r ->
+    String bg = '#ffffff'
+    if (markCol >= 0 && markCol < r.size()) {
+      String mv = String.valueOf(r.get(markCol))
+      if (mv == 'HARD' || mv == 'ERROR')  bg = '#ffd6d6'
+      else if (mv == 'MED')               bg = '#ffe9c6'
+      else if (mv == 'EASY')              bg = '#dcf0dc'
+      else if (mv == 'INACTIVE')          bg = '#e8e8e8'
+    }
+    sb.append('<tr style="background:').append(bg).append('">')
+    for (int i = 0; i < n; i++) {
+      String v = i < r.size() ? String.valueOf(r.get(i)) : ''
+      sb.append('<td style="border:1px solid #bbb;padding:3px 8px;vertical-align:top">')
+        .append(esc(v)).append('</td>')
+    }
+    sb.append('</tr>')
+  }
+  sb.append('</table>')
   return sb.toString()
 }
 
@@ -461,27 +464,33 @@ workflows.each { JiraWorkflow wf ->
                String.valueOf(jmweN), String.valueOf(jwtN), String.valueOf(otherN),
                String.valueOf(biN)] as List<String>)
   } catch (Exception e) {
-    aRows << ([id, wf.name, 'ERROR', '', '', '', '', '', '', '', '', '', cell(e.message)] as List<String>)
+    aRows << ([id, wf.name, 'ERROR', '', '', '', '', '', '', '', '', '',
+               String.valueOf(e.message)] as List<String>)
   }
 }
 
 // ---------------------------------------------------------------- output ---
-out.append('==== DC WORKFLOW INSPECTOR v4 (read-only) ====\n')
+out.append('<div style="font-family:Arial,sans-serif">')
+out.append('<h2 style="margin:0 0 4px 0;color:#205081">DC Workflow Inspector (read-only)</h2>')
+out.append('<p style="font-size:12px;margin:0">Row colors: ')
+out.append('<span style="background:#ffd6d6">&nbsp;HARD/ERROR&nbsp;</span> ')
+out.append('<span style="background:#ffe9c6">&nbsp;MED&nbsp;</span> ')
+out.append('<span style="background:#dcf0dc">&nbsp;EASY&nbsp;</span> ')
+out.append('<span style="background:#e8e8e8">&nbsp;INACTIVE&nbsp;</span>')
+out.append(' &mdash; select a table, copy, paste into Excel.</p>')
 
-out.append('\n=== TABLE A - WORKFLOWS ===\n')
-out.append(renderTable(
+// Status is column index 2 in table A
+out.append(htmlTable('Table A - Workflows',
     ['ID', 'Workflow', 'Status', 'Draft', 'Prj', 'ProjectKeys', 'Trans',
      'SR', 'JSU', 'JMWE', 'JWT', 'OtherApps', 'Builtin'] as List<String>,
-    aRows))
+    aRows, 2))
 
-out.append('\n=== TABLE B - APP WORKFLOW FUNCTIONS (working sheet) ===\n')
-out.append(renderTable(
+// Severity is column index 12 in table B
+out.append(htmlTable('Table B - App workflow functions (working sheet)',
     ['Ref', 'WfID', 'Workflow', 'TransId', 'Transition', 'Kind', 'Provider', 'CannedScript',
      'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
      'SuggestedTarget', 'Decision', 'Notes'] as List<String>,
-    bRows))
-
-out.append('\n=== TABLE C - CLOUD-BLOCKER TOKENS ===\n')
+    bRows, 12))
 List<List<String>> cRows = []
 List<Map.Entry<String, Map<String, Object>>> tokenEntries =
     new ArrayList<Map.Entry<String, Map<String, Object>>>(tokenRollup.entrySet())
@@ -495,10 +504,10 @@ tokenEntries.each { Map.Entry<String, Map<String, Object>> en ->
              String.valueOf(en.value.get('sev')), String.valueOf(en.value.get('hint'))] as List<String>)
 }
 if (cRows.isEmpty()) cRows << (['(none found)', '', '', '', ''] as List<String>)
-out.append(renderTable(
-    ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>, cRows))
+// Severity is column index 3 in table C
+out.append(htmlTable('Table C - Cloud-blocker tokens',
+    ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>, cRows, 3))
 
-out.append('\n=== TABLE D - SUMMARY ===\n')
 List<List<String>> dRows = []
 dRows << (['Workflows total', String.valueOf(wfIdx)] as List<String>)
 dRows << (['Workflows active', String.valueOf(wfIdx - inactiveList.size())] as List<String>)
@@ -521,6 +530,7 @@ dRows << (['SR canned COND/VAL (arrive BLANK on cloud - must recreate)',
            blankParts.isEmpty() ? '-' : blankParts.join(' | ')] as List<String>)
 dRows << (['Script roots checked',
            scriptRoots.isEmpty() ? 'none found' : scriptRoots.join(' | ')] as List<String>)
-out.append(renderTable(['Metric', 'Value'] as List<String>, dRows))
+out.append(htmlTable('Table D - Summary', ['Metric', 'Value'] as List<String>, dRows, -1))
+out.append('</div>')
 
 return out.toString()
