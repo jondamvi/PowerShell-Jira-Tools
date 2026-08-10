@@ -1,17 +1,15 @@
 /*
- * DC WORKFLOW INSPECTOR v2 (static-type-checker friendly)
- * -------------------------------------------------------
+ * DC WORKFLOW INSPECTOR v4 (aligned table output)
+ * -----------------------------------------------
  * Run in: ScriptRunner Script Console on the Jira DC TEST instance.
- * Read-only: makes no changes. Output is compact/ASCII so it can be
- * re-typed or photographed.
+ * Read-only: makes no changes.
  *
- * Output sections:
- *   A  Workflow inventory (active/inactive, drafts, projects, function counts per app)
- *   B  One line per app-provided workflow function (SR/JSU/JMWE/JWT/other)
- *   C  Token rollup: cloud-unsupported classes/objects found in SR scripts
- *   D  Summary + migration risk lists
+ * Output: 4 formatted tables (A workflows, B functions, C tokens, D summary)
+ * with space-aligned columns - readable in the console and copy/paste-able
+ * into Excel.
  *
- * Retype priority if output is long: D first, then C, then B lines with sev=HARD.
+ * Table B is the working sheet: one row per app-provided workflow function,
+ * with Severity, Tokens, SuggestedTarget and empty Decision/Notes columns.
  */
 
 import com.atlassian.jira.component.ComponentAccessor
@@ -30,8 +28,9 @@ import com.opensymphony.workflow.loader.WorkflowDescriptor
 import groovy.json.JsonSlurper
 
 // ---------------------------------------------------------------- config ---
-final int MAX_TOKENS_PER_LINE = 6        // tokens shown per B line
-final boolean SHOW_BUILTIN_IN_B = false  // true = also list built-in Jira functions in B
+final boolean SHOW_BUILTIN_IN_B = false  // true = also list built-in Jira functions in table B
+final int MAX_TOKENS_PER_CELL = 8        // tokens listed in the Tokens column
+final String COL_GAP = '  '              // gap between columns
 
 // regex -> [tokenName, severity, cloud hint]
 // severity: HARD = no cloud equivalent / redesign; MED = rewrite (HAPI/REST); EASY = trivial
@@ -100,6 +99,45 @@ def wfm = ComponentAccessor.workflowManager
 def wsm = ComponentAccessor.workflowSchemeManager
 def pm  = ComponentAccessor.projectManager
 
+// sanitize a value for one table cell: no line breaks/tabs
+Closure<String> cell = { Object o ->
+  String s = o == null ? '' : String.valueOf(o)
+  return s.replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim()
+}
+
+// render header + rows as an aligned fixed-width table
+Closure<String> renderTable = { List<String> header, List<List<String>> rows ->
+  int n = header.size()
+  List<List<String>> all = []
+  List<String> h = []
+  header.each { String c -> h << cell(c) }
+  all << h
+  rows.each { List<String> r ->
+    List<String> clean = []
+    for (int i = 0; i < n; i++) clean << cell(i < r.size() ? r.get(i) : '')
+    all << clean
+  }
+  List<Integer> widths = []
+  for (int i = 0; i < n; i++) {
+    int w = 0
+    all.each { List<String> r -> if (r.get(i).length() > w) w = r.get(i).length() }
+    widths << w
+  }
+  StringBuilder sb = new StringBuilder()
+  all.eachWithIndex { List<String> r, int ri ->
+    List<String> padded = []
+    for (int i = 0; i < n; i++) padded << r.get(i).padRight(widths.get(i))
+    String line = padded.join(COL_GAP)
+    sb.append(line.replaceAll('\\s+$', '')).append('\n')
+    if (ri == 0) {
+      List<String> dashes = []
+      for (int i = 0; i < n; i++) dashes << ('-' * widths.get(i))
+      sb.append(dashes.join(COL_GAP)).append('\n')
+    }
+  }
+  return sb.toString()
+}
+
 // map workflowName -> project keys using it
 Map<String, List<String>> wfProjects = [:]
 try {
@@ -156,7 +194,6 @@ Closure<Map<String, String>> extractScript = { Map args ->
   Object rawPath   = args?.get('scriptPath')
   if (code == null && rawScript instanceof String && rawScript.trim().length() > 0) code = rawScript
   if (path == null && rawPath instanceof String && rawPath.trim().length() > 0)     path = rawPath
-  // scripted conditions store code in FIELD_CONDITION; extra scripts too
   ['FIELD_CONDITION', 'FIELD_ADDITIONAL_SCRIPT', 'FIELD_JQL_QUERY'].each { String k ->
     Object v = args?.get(k)
     if (v instanceof String && v.trim().length() > 0) code = (code != null ? code + '\n' + v : v)
@@ -244,17 +281,34 @@ Closure<String> shortCanned = { Map args ->
   return parts.isEmpty() ? '-' : parts.last()
 }
 
+// suggested cloud target for a function row
+Closure<String> suggestTarget = { String prov, String kind, String canned, String sev ->
+  if (prov == 'JSU' || prov == 'JMWE' || prov == 'JWT')
+    return 'Vendor cloud app or Automation'
+  if (prov != 'SR') return 'Check app cloud availability'
+  boolean isCustom = canned.toLowerCase().contains('customscript')
+  if (kind == 'COND' || kind == 'VAL') {
+    return isCustom ? 'Rewrite as Jira expression (SR Cloud)' :
+                      'RECREATE: canned cond/val arrives blank on cloud - Jira expression or native rule'
+  }
+  if (sev == 'HARD') return 'Redesign: Automation / external service (capability not on cloud)'
+  if (!isCustom)     return 'SR Cloud equivalent or Automation (canned function)'
+  if (sev == 'EASY') return 'Automation if simple, else SR Cloud Groovy (HAPI)'
+  return 'SR Cloud Groovy rewrite (HAPI/REST)'
+}
+
 // ------------------------------------------------------------------ main ---
-List<String> bLines = []
-List<String> aLines = []
+List<List<String>> aRows = []
+List<List<String>> bRows = []
 int wfIdx = 0
+int bIdx = 0
 int totalSR = 0
 int srInline = 0
 int srFile = 0
 int srFileMissing = 0
 Map<String, Integer> sevCount = [EASY: 0, MED: 0, HARD: 0] as Map<String, Integer>
 List<String> hardRefs = []
-Map<String, Integer> blankRiskCanned = [:]   // SR canned conds/vals -> blank on cloud
+Map<String, Integer> blankRiskCanned = [:]
 List<String> inactiveList = []
 List<String> draftList = []
 
@@ -275,7 +329,6 @@ workflows.each { JiraWorkflow wf ->
     Map<String, Integer> provCount = [:]
 
     acts.each { ActionDescriptor a ->
-      // gather function/validator/condition entries as maps: kind, args, type
       List<Map<String, Object>> items = []
       Closure addItem = { String kind, Map fargs, String ftype ->
         Map<String, Object> entry = [:]
@@ -312,32 +365,34 @@ workflows.each { JiraWorkflow wf ->
         if (prov == 'BUILTIN' && !SHOW_BUILTIN_IN_B) return
 
         String canned = shortCanned(args)
-        String detail = '-'
-        String lenInfo = ''
-        String hashInfo = ''
-        String sevInfo = ''
-        String tokStr = ''
+        String source = '-'
+        String path = ''
+        String lenS = ''
+        String hashS = ''
+        String sev = ''
+        String tokS = ''
 
         if (prov == 'SR') {
           totalSR++
           Map<String, String> ex = extractScript(args)
           String code = ex.get('code')
-          String path = ex.get('path')
-          if (path != null) {
-            String fileCode = readScriptFile(path)
+          String exPath = ex.get('path')
+          if (exPath != null) {
+            path = exPath
+            String fileCode = readScriptFile(exPath)
             if (fileCode != null) {
               code = ((code != null ? code + '\n' : '') + fileCode).trim()
               srFile++
-              detail = 'file:' + path
+              source = 'file'
             } else {
               srFileMissing++
-              detail = 'FILE?:' + path
+              source = 'file-NOT-FOUND'
             }
           } else if (code != null) {
-            detail = 'inline'
+            source = 'inline'
             srInline++
           } else {
-            detail = 'nocode'
+            source = 'nocode'
           }
 
           boolean isCustomScript = canned.toLowerCase().contains('customscript')
@@ -347,8 +402,8 @@ workflows.each { JiraWorkflow wf ->
           }
 
           if (code != null && code.length() > 0) {
-            lenInfo = 'len=' + code.length()
-            hashInfo = 'h=' + Integer.toHexString(code.trim().hashCode())
+            lenS = String.valueOf(code.length())
+            hashS = Integer.toHexString(code.trim().hashCode())
             List<Map<String, Object>> toks = scanTokens(code)
             String worst = 'EASY'
             toks.each { Map<String, Object> t ->
@@ -370,56 +425,64 @@ workflows.each { JiraWorkflow wf ->
               int rWorst = SEV_RANK.get(worst) ?: 0
               if (rNew > rWorst) worst = tSev
             }
-            // scripted conditions/validators always need a Jira-expression rewrite on cloud
             if ((kind == 'COND' || kind == 'VAL') && (SEV_RANK.get(worst) ?: 0) < 2) worst = 'MED'
-            sevInfo = 'sev=' + worst
+            sev = worst
             sevCount.put(worst, (sevCount.get(worst) ?: 0) + 1)
             List<Map<String, Object>> sortedToks = new ArrayList<Map<String, Object>>(toks)
             sortedToks.sort { Map<String, Object> t -> -(t.get('count') as int) }
             List<String> topToks = []
-            sortedToks.take(MAX_TOKENS_PER_LINE).each { Map<String, Object> t ->
-              topToks << String.valueOf(t.get('name'))
+            sortedToks.take(MAX_TOKENS_PER_CELL).each { Map<String, Object> t ->
+              topToks << (String.valueOf(t.get('name')) + '(' + String.valueOf(t.get('count')) + ')')
             }
-            tokStr = 'tok=' + (topToks.isEmpty() ? '-' : topToks.join(','))
-            if (worst == 'HARD') hardRefs << (id + ' t' + a.id + ' ' + kind + ' ' + canned)
+            tokS = topToks.join(' ')
+            if (worst == 'HARD') hardRefs << ('B' + String.format('%03d', bIdx + 1))
           }
         }
 
-        List<String> extras = []
-        [lenInfo, hashInfo, sevInfo, tokStr].each { String x -> if (x.length() > 0) extras << x }
-        bLines << ('B ' + id + ' t' + a.id + ' "' + (a.name != null ? a.name : '?') + '" ' + kind + ' ' +
-                   prov + ' ' + canned + ' ' + detail +
-                   (extras.isEmpty() ? '' : ' ' + extras.join(' ')))
+        bIdx++
+        String bRef = 'B' + String.format('%03d', bIdx)
+        String target = suggestTarget(prov, kind, canned, sev)
+        bRows << ([bRef, id, wf.name, String.valueOf(a.id), (a.name != null ? a.name : '?'),
+                   kind, prov, canned, source, path, lenS, hashS, sev, tokS, target, '', ''] as List<String>)
       }
     }
 
-    List<Map.Entry<String, Integer>> provEntries =
-        new ArrayList<Map.Entry<String, Integer>>(provCount.entrySet())
-    provEntries.sort { Map.Entry<String, Integer> en -> -en.value }
-    List<String> provParts = []
-    provEntries.each { Map.Entry<String, Integer> en -> provParts << (en.key + ':' + en.value) }
-    int prjCount = wfProjects.get(wf.name)?.size() ?: 0
-    aLines << (id + ' | ' + wf.name + ' | ' + (isActive ? 'ACTIVE' : 'INACTIVE') +
-               ' | draft=' + (hasDraft ? 'Y' : 'N') +
-               ' | prj=' + prjCount +
-               ' | trans=' + acts.size() + ' | ' +
-               (provParts.isEmpty() ? 'none' : provParts.join(' ')))
+    int srN   = provCount.get('SR') ?: 0
+    int jsuN  = provCount.get('JSU') ?: 0
+    int jmweN = provCount.get('JMWE') ?: 0
+    int jwtN  = provCount.get('JWT') ?: 0
+    int biN   = provCount.get('BUILTIN') ?: 0
+    int otherN = 0
+    provCount.each { String k, Integer v -> if (k.startsWith('APP:')) otherN += v }
+    List<String> prjKeys = wfProjects.get(wf.name) ?: ([] as List<String>)
+    aRows << ([id, wf.name, (isActive ? 'ACTIVE' : 'INACTIVE'), (hasDraft ? 'Y' : 'N'),
+               String.valueOf(prjKeys.size()), prjKeys.join(' '),
+               String.valueOf(acts.size()), String.valueOf(srN), String.valueOf(jsuN),
+               String.valueOf(jmweN), String.valueOf(jwtN), String.valueOf(otherN),
+               String.valueOf(biN)] as List<String>)
   } catch (Exception e) {
-    aLines << (id + ' | ' + wf.name + ' | ERROR: ' + e.message)
+    aRows << ([id, wf.name, 'ERROR', '', '', '', '', '', '', '', '', '', cell(e.message)] as List<String>)
   }
 }
 
 // ---------------------------------------------------------------- output ---
-out.append('==== DC WORKFLOW INSPECTOR (read-only) ====\n')
-out.append('Retype priority: D first, then C, then B lines with sev=HARD. Photos of all sections are ideal.\n\n')
+out.append('==== DC WORKFLOW INSPECTOR v4 (read-only) ====\n')
 
-out.append('=== A. WORKFLOWS (id | name | status | draft | #projects | #transitions | functions by provider) ===\n')
-aLines.each { String l -> out.append(l).append('\n') }
+out.append('\n=== TABLE A - WORKFLOWS ===\n')
+out.append(renderTable(
+    ['ID', 'Workflow', 'Status', 'Draft', 'Prj', 'ProjectKeys', 'Trans',
+     'SR', 'JSU', 'JMWE', 'JWT', 'OtherApps', 'Builtin'] as List<String>,
+    aRows))
 
-out.append('\n=== B. APP-PROVIDED WORKFLOW FUNCTIONS (B id transition kind provider canned source len hash sev tokens) ===\n')
-bLines.each { String l -> out.append(l).append('\n') }
+out.append('\n=== TABLE B - APP WORKFLOW FUNCTIONS (working sheet) ===\n')
+out.append(renderTable(
+    ['Ref', 'WfID', 'Workflow', 'TransId', 'Transition', 'Kind', 'Provider', 'CannedScript',
+     'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
+     'SuggestedTarget', 'Decision', 'Notes'] as List<String>,
+    bRows))
 
-out.append('\n=== C. CLOUD-BLOCKER TOKEN ROLLUP (token | total hits | #scripts | severity | cloud replacement hint) ===\n')
+out.append('\n=== TABLE C - CLOUD-BLOCKER TOKENS ===\n')
+List<List<String>> cRows = []
 List<Map.Entry<String, Map<String, Object>>> tokenEntries =
     new ArrayList<Map.Entry<String, Map<String, Object>>>(tokenRollup.entrySet())
 tokenEntries.sort { Map.Entry<String, Map<String, Object>> en ->
@@ -428,29 +491,36 @@ tokenEntries.sort { Map.Entry<String, Map<String, Object>> en ->
   return -(sevRank * 1000 + scripts)
 }
 tokenEntries.each { Map.Entry<String, Map<String, Object>> en ->
-  out.append('C ' + en.key.padRight(18) + ' | ' + en.value.get('hits') + ' | ' + en.value.get('scripts') +
-             ' | ' + en.value.get('sev') + ' | ' + en.value.get('hint') + '\n')
+  cRows << ([en.key, String.valueOf(en.value.get('hits')), String.valueOf(en.value.get('scripts')),
+             String.valueOf(en.value.get('sev')), String.valueOf(en.value.get('hint'))] as List<String>)
 }
-if (tokenEntries.isEmpty()) out.append('C (no DC-only tokens found in SR scripts)\n')
+if (cRows.isEmpty()) cRows << (['(none found)', '', '', '', ''] as List<String>)
+out.append(renderTable(
+    ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>, cRows))
 
-out.append('\n=== D. SUMMARY ===\n')
-out.append('D workflows=' + wfIdx + ' active=' + (wfIdx - inactiveList.size()) +
-           ' inactive=' + inactiveList.size() + '\n')
-out.append('D INACTIVE (JCMA will NOT migrate unless assigned to a migrated project scheme): ' +
-           (inactiveList.isEmpty() ? '-' : inactiveList.join('; ')) + '\n')
-out.append('D DRAFTS (not migrated; publish or discard before migration): ' +
-           (draftList.isEmpty() ? '-' : draftList.join('; ')) + '\n')
-out.append('D SR functions=' + totalSR + ' inline=' + srInline + ' file=' + srFile +
-           ' fileNotResolved=' + srFileMissing + '\n')
-out.append('D SR script severity: EASY=' + sevCount.get('EASY') + ' MED=' + sevCount.get('MED') +
-           ' HARD=' + sevCount.get('HARD') + '\n')
-out.append('D HARD (redesign needed, cannot be 1:1 rewritten): ' +
-           (hardRefs.isEmpty() ? '-' : hardRefs.join('; ')) + '\n')
+out.append('\n=== TABLE D - SUMMARY ===\n')
+List<List<String>> dRows = []
+dRows << (['Workflows total', String.valueOf(wfIdx)] as List<String>)
+dRows << (['Workflows active', String.valueOf(wfIdx - inactiveList.size())] as List<String>)
+dRows << (['Workflows inactive (JCMA will NOT migrate unless assigned to migrated scheme)',
+           String.valueOf(inactiveList.size())] as List<String>)
+dRows << (['Inactive names', inactiveList.isEmpty() ? '-' : inactiveList.join(' | ')] as List<String>)
+dRows << (['Drafts (not migrated - publish or discard)',
+           draftList.isEmpty() ? '-' : draftList.join(' | ')] as List<String>)
+dRows << (['SR functions total', String.valueOf(totalSR)] as List<String>)
+dRows << (['SR inline scripts', String.valueOf(srInline)] as List<String>)
+dRows << (['SR file scripts resolved', String.valueOf(srFile)] as List<String>)
+dRows << (['SR file scripts NOT resolved', String.valueOf(srFileMissing)] as List<String>)
+dRows << (['SR severity EASY', String.valueOf(sevCount.get('EASY'))] as List<String>)
+dRows << (['SR severity MED', String.valueOf(sevCount.get('MED'))] as List<String>)
+dRows << (['SR severity HARD (redesign needed)', String.valueOf(sevCount.get('HARD'))] as List<String>)
+dRows << (['HARD refs (see Table B)', hardRefs.isEmpty() ? '-' : hardRefs.join(' ')] as List<String>)
 List<String> blankParts = []
 blankRiskCanned.each { String k, Integer v -> blankParts << (k + ' x' + v) }
-out.append('D SR built-in (canned) CONDITIONS/VALIDATORS -> arrive as BLANK unsupported rules on cloud, must be recreated: ' +
-           (blankParts.isEmpty() ? '-' : blankParts.join(', ')) + '\n')
-out.append('D Script roots checked for file scripts: ' +
-           (scriptRoots.isEmpty() ? 'none found' : scriptRoots.join(' ; ')) + '\n')
+dRows << (['SR canned COND/VAL (arrive BLANK on cloud - must recreate)',
+           blankParts.isEmpty() ? '-' : blankParts.join(' | ')] as List<String>)
+dRows << (['Script roots checked',
+           scriptRoots.isEmpty() ? 'none found' : scriptRoots.join(' | ')] as List<String>)
+out.append(renderTable(['Metric', 'Value'] as List<String>, dRows))
 
 return out.toString()
