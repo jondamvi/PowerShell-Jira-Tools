@@ -56,7 +56,12 @@ final String DB_RESOURCE = 'ConfluenceDB'
  *   target.setName      EddStatusMacro targets only: exact set name from the
  *                       configure UI. Not used by other target types.
  */
-final List<Map<String, Object>> WANTED = [
+/*
+ * Raw List on purpose: a map literal with mixed value types is inferred as
+ * LinkedHashMap<String, Serializable>, which will not assign to
+ * List<Map<String, Object>> under static type checking. Cast at the use site.
+ */
+final List WANTED = [
 //    [
 //        id     : 'artikel-status',
 //        source : [name: 'artikel-status', type: 'UserMacro'],
@@ -267,7 +272,8 @@ try {
         StringBuilder detail = new StringBuilder()
         int ready = 0, blockedCount = 0
 
-        for (Map<String, Object> want : WANTED) {
+        for (Object wantObj : WANTED) {
+            Map<String, Object> want = (Map<String, Object>) wantObj
             Map<String, Object> srcCfg = (Map<String, Object>) want.get('source')
             Map<String, Object> tgtCfg = (Map<String, Object>) want.get('target')
             String migId    = (String) want.get('id')

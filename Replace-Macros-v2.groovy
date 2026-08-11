@@ -145,7 +145,13 @@ enum ReplacementStatus {
 //        paramMap       source param name -> target param name
 //        dropUnmapped   drop source params with no paramMap entry
 // =============================================================================
-@Field List<Map<String, Object>> MIGRATIONS = [
+/*
+ * Declared as a raw List on purpose. A map literal with mixed value types is
+ * inferred as LinkedHashMap<String, Serializable>, and because generics are
+ * invariant that will not assign to List<Map<String, Object>> under
+ * ScriptRunner's static type checking. Each entry is cast where it is used.
+ */
+@Field List MIGRATIONS = [
 
     [
         id     : 'qualification-table',
@@ -1153,7 +1159,8 @@ try {
     // ---- select migrations ------------------------------------------------
     List<MigrationDef> migrations = new ArrayList<MigrationDef>()
     List<String> knownIds = new ArrayList<String>()
-    for (Map<String, Object> cfg : MIGRATIONS) {
+    for (Object cfgObj : MIGRATIONS) {
+        Map<String, Object> cfg = (Map<String, Object>) cfgObj
         MigrationDef md = toMigration(cfg)
         knownIds.add(md.id)
         if (RUN.isEmpty() || RUN.contains(md.id)) migrations.add(md)
