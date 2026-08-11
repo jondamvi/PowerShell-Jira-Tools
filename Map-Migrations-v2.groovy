@@ -88,10 +88,14 @@ final boolean SHOW_PARAM_TABLES = true
 final List<String> TYPE_NAMES = ['UserMacro', 'ScriptRunnerMacro', 'EddStatusMacro',
                                  'AuraLinkButton', 'Static_QualificationTable']
 
-final List<List<String>> FAMILIES = [
-    ['AO_1313EC_LOZENGE_SET',     'AO_1313EC_LOZENGE_OPTION',     'LOZENGE_SET_ENTITY_ID'],
-    ['AO_1313EC_TEXT_SET_ENTITY', 'AO_1313EC_TEXT_OPTION_ENTITY', 'TEXT_SET_ENTITY_ID'],
-]
+/*
+ * EasyDropDown tables. One family, explicitly named - no guessing, no fallback.
+ * If a set lives in the text-dropdown tables instead, change these four values:
+ *   AO_1313EC_TEXT_SET_ENTITY / AO_1313EC_TEXT_OPTION_ENTITY / TEXT_SET_ENTITY_ID
+ */
+final String T_SET    = 'AO_1313EC_LOZENGE_SET'
+final String T_OPTION = 'AO_1313EC_LOZENGE_OPTION'
+final String C_OPT_FK = 'LOZENGE_SET_ENTITY_ID'
 // ================================================================
 
 @Field Pattern P_VELOCITY_PARAM = Pattern.compile('^\\s*##\\s*@param\\s+([^:\\s]+)\\s*:?(.*)$')
@@ -247,22 +251,15 @@ try {
 
         // ---------- inventory when nothing is requested ----------------------
         if (WANTED.isEmpty()) {
-            outp.append('ALL EASYDROPDOWN SETS (both families)\n')
+            outp.append('ALL EASYDROPDOWN SETS in ').append(T_SET).append('\n')
             outp.append('================================================================\n')
-            outp.append(String.format('  %-22s %-6s %-40s %-8s %s%n',
-                    'FAMILY', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
-            for (List<String> f : FAMILIES) {
-                try {
-                    sql.eachRow('SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
-                                '(SELECT count(*) FROM ' + qt(f.get(1)) + ' o WHERE o."' + f.get(2) +
-                                '" = s."ID") AS n FROM ' + qt(f.get(0)) + ' s ORDER BY s."SET_NAME"') { row ->
-                        outp.append(String.format('  %-22s %-6s %-40s %-8s %s%n',
-                                f.get(0).replace('AO_1313EC_', ''), row['pk'] as String,
-                                row['nm'] as String, row['n'] as String, row['guid'] as String))
-                    }
-                } catch (Exception e) {
-                    outp.append('  ').append(f.get(0)).append(' unreadable: ').append(e.getMessage()).append('\n')
-                }
+            outp.append(String.format('  %-6s %-40s %-8s %s%n', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
+            sql.eachRow('SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
+                        '(SELECT count(*) FROM ' + qt(T_OPTION) + ' o WHERE o."' + C_OPT_FK +
+                        '" = s."ID") AS n FROM ' + qt(T_SET) + ' s ORDER BY s."SET_NAME"') { row ->
+                outp.append(String.format('  %-6s %-40s %-8s %s%n',
+                        row['pk'] as String, row['nm'] as String,
+                        row['n'] as String, row['guid'] as String))
             }
             outp.append('\n  Add entries to WANTED and re-run to generate engine config.\n')
             return
@@ -343,31 +340,29 @@ try {
             if (tgtType == 'EddStatusMacro') {
                 if (srcParam == null) problems.add('sourceParam could not be decided: ' + picked.get(1))
 
-                List<String> fam = null
+                // Direct query against the declared tables. Exceptions are NOT
+                // swallowed: a failing query must not be reported as "set not found".
                 String setPk = null, setGuid = null
-                for (List<String> f : FAMILIES) {
-                    if (fam != null) break
-                    try {
-                        sql.eachRow('SELECT s."ID" AS pk, s."SET_ID" AS guid FROM ' + qt(f.get(0)) +
-                                    ' s WHERE s."SET_NAME" = :n', [n: setName]) { row ->
-                            fam = f; setPk = row['pk'] as String; setGuid = row['guid'] as String
-                        }
-                    } catch (Exception ignored) { }
+                sql.eachRow('SELECT s."ID" AS pk, s."SET_ID" AS guid FROM ' + qt(T_SET) +
+                            ' s WHERE s."SET_NAME" = :n', [n: setName]) { row ->
+                    setPk = row['pk'] as String
+                    setGuid = row['guid'] as String
                 }
 
                 List<List<String>> options = new ArrayList<List<String>>()
-                if (fam == null) {
-                    problems.add('no EasyDropDown set named "' + setName + '" in either family')
+                if (setPk == null) {
+                    problems.add('no set named "' + setName + '" in ' + T_SET +
+                                 ' (exact, case-sensitive match)')
                 } else {
-                    sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM ' + qt(fam.get(1)) +
-                                ' o WHERE o."' + fam.get(2) + '" = :pk ORDER BY o."ID"',
+                    sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM ' + qt(T_OPTION) +
+                                ' o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."ID"',
                                 [pk: Integer.parseInt(setPk)]) { row ->
                         if (row['gid'] != null) {
                             options.add([row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String])
                         }
                     }
-                    detail.append('  set "').append(setName).append('"  family=')
-                          .append(fam.get(0).replace('AO_1313EC_', '')).append('  set-id=').append(setGuid).append('\n')
+                    detail.append('  set "').append(setName).append('"  pk=').append(setPk)
+                          .append('  set-id=').append(setGuid).append('\n')
                 }
 
                 List<String> optNames = new ArrayList<String>()
