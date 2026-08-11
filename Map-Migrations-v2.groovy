@@ -40,7 +40,7 @@ import java.util.regex.Matcher
 import java.util.regex.Pattern
 
 // ============================ CONFIG ============================
-final String DB_RESOURCE = 'ConfluenceDB'
+@Field String DB_RESOURCE = 'ConfluenceDB'
 
 /*
  * One entry per migration. Empty list = inventory of every EasyDropDown set.
@@ -93,9 +93,9 @@ final List<String> TYPE_NAMES = ['UserMacro', 'ScriptRunnerMacro', 'EddStatusMac
  * If a set lives in the text-dropdown tables instead, change these four values:
  *   AO_1313EC_TEXT_SET_ENTITY / AO_1313EC_TEXT_OPTION_ENTITY / TEXT_SET_ENTITY_ID
  */
-final String T_SET    = 'AO_1313EC_LOZENGE_SET'
-final String T_OPTION = 'AO_1313EC_LOZENGE_OPTION'
-final String C_OPT_FK = 'LOZENGE_SET_ENTITY_ID'
+@Field String T_SET    = 'AO_1313EC_LOZENGE_SET'
+@Field String T_OPTION = 'AO_1313EC_LOZENGE_OPTION'
+@Field String C_OPT_FK = 'LOZENGE_SET_ENTITY_ID'
 // ================================================================
 
 @Field Pattern P_VELOCITY_PARAM = Pattern.compile('^\\s*##\\s*@param\\s+([^:\\s]+)\\s*:?(.*)$')
@@ -240,6 +240,74 @@ List<String> pickSourceParam(List<ParamInfo> params, String explicit) {
     return [null, 'no enum and no required parameter - set source.sourceParam explicitly']
 }
 
+/*
+ * DATABASE ACCESS
+ *
+ * Each helper opens its OWN short DatabaseUtil.withSql block and closes it
+ * before returning. The connection handed to that closure is only valid inside
+ * it, and calling Confluence components (macro introspection) from within one
+ * starts a separate transaction that returns the pooled connection - after
+ * which the next query fails with "Connection is closed". So database access
+ * and Confluence component access are kept strictly apart.
+ */
+
+/** [pk, setId] for an exact set name, or null when there is no such set. */
+List<String> lookupSet(String setName) {
+    try {
+        List<String> found = null
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            sql.eachRow('SELECT s."ID" AS pk, s."SET_ID" AS guid FROM public."' + T_SET +
+                        '" s WHERE s."SET_NAME" = :n', [n: setName]) { row ->
+                found = [row['pk'] as String, row['guid'] as String]
+            }
+        }
+        return found
+    } catch (Exception e) {
+        throw new RuntimeException('lookupSet("' + setName + '") failed: ' + e.getMessage(), e)
+    }
+}
+
+/** [[optionName, optionId], ...] in configured order. */
+List<List<String>> lookupOptions(String setPk) {
+    try {
+        List<List<String>> out = new ArrayList<List<String>>()
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM public."' + T_OPTION +
+                        '" o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."ID"',
+                        [pk: Integer.parseInt(setPk)]) { row ->
+                if (row['gid'] != null) {
+                    out.add([row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String])
+                }
+            }
+        }
+        return out
+    } catch (Exception e) {
+        throw new RuntimeException('lookupOptions(' + setPk + ') failed: ' + e.getMessage(), e)
+    }
+}
+
+/** Every set with its option count. */
+String inventoryText() {
+    try {
+        StringBuilder b = new StringBuilder()
+        b.append('ALL EASYDROPDOWN SETS in ').append(T_SET).append('\n')
+        b.append('================================================================\n')
+        b.append(String.format('  %-6s %-40s %-8s %s%n', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            sql.eachRow('SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
+                        '(SELECT count(*) FROM public."' + T_OPTION + '" o WHERE o."' + C_OPT_FK +
+                        '" = s."ID") AS n FROM public."' + T_SET + '" s ORDER BY s."SET_NAME"') { row ->
+                b.append(String.format('  %-6s %-40s %-8s %s%n', row['pk'] as String,
+                        row['nm'] as String, row['n'] as String, row['guid'] as String))
+            }
+        }
+        b.append('\n  Add entries to WANTED and re-run to generate engine config.\n')
+        return b.toString()
+    } catch (Exception e) {
+        throw new RuntimeException('inventoryText failed: ' + e.getMessage(), e)
+    }
+}
+
 // =============================================================================
 //  MAIN
 // =============================================================================
@@ -247,24 +315,10 @@ List<String> pickSourceParam(List<ParamInfo> params, String explicit) {
 StringBuilder outp = new StringBuilder()
 
 try {
-    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-
-        // ---------- inventory when nothing is requested ----------------------
-        if (WANTED.isEmpty()) {
-            outp.append('ALL EASYDROPDOWN SETS in ').append(T_SET).append('\n')
-            outp.append('================================================================\n')
-            outp.append(String.format('  %-6s %-40s %-8s %s%n', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
-            sql.eachRow('SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
-                        '(SELECT count(*) FROM ' + qt(T_OPTION) + ' o WHERE o."' + C_OPT_FK +
-                        '" = s."ID") AS n FROM ' + qt(T_SET) + ' s ORDER BY s."SET_NAME"') { row ->
-                outp.append(String.format('  %-6s %-40s %-8s %s%n',
-                        row['pk'] as String, row['nm'] as String,
-                        row['n'] as String, row['guid'] as String))
-            }
-            outp.append('\n  Add entries to WANTED and re-run to generate engine config.\n')
-            return
-        }
-
+    if (WANTED.isEmpty()) {
+        // ---------- inventory when nothing is requested ------------------
+        outp.append(inventoryText())
+    } else {
         StringBuilder cfg = new StringBuilder()
         StringBuilder detail = new StringBuilder()
         int ready = 0, blockedCount = 0
@@ -340,27 +394,18 @@ try {
             if (tgtType == 'EddStatusMacro') {
                 if (srcParam == null) problems.add('sourceParam could not be decided: ' + picked.get(1))
 
-                // Direct query against the declared tables. Exceptions are NOT
-                // swallowed: a failing query must not be reported as "set not found".
-                String setPk = null, setGuid = null
-                sql.eachRow('SELECT s."ID" AS pk, s."SET_ID" AS guid FROM ' + qt(T_SET) +
-                            ' s WHERE s."SET_NAME" = :n', [n: setName]) { row ->
-                    setPk = row['pk'] as String
-                    setGuid = row['guid'] as String
-                }
+                // Each helper opens and closes its own connection - exceptions
+                // propagate, so a failing query is never reported as "not found".
+                List<String> setRow = lookupSet(setName)
+                String setPk = setRow == null ? null : setRow.get(0)
+                String setGuid = setRow == null ? null : setRow.get(1)
 
                 List<List<String>> options = new ArrayList<List<String>>()
                 if (setPk == null) {
                     problems.add('no set named "' + setName + '" in ' + T_SET +
                                  ' (exact, case-sensitive match)')
                 } else {
-                    sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM ' + qt(T_OPTION) +
-                                ' o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."ID"',
-                                [pk: Integer.parseInt(setPk)]) { row ->
-                        if (row['gid'] != null) {
-                            options.add([row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String])
-                        }
-                    }
+                    options = lookupOptions(setPk)
                     detail.append('  set "').append(setName).append('"  pk=').append(setPk)
                           .append('  set-id=').append(setGuid).append('\n')
                 }
