@@ -254,10 +254,15 @@ List<String> pickSourceParam(List<ParamInfo> params, String explicit) {
 /** [pk, setId] for an exact set name, or null when there is no such set. */
 List<String> lookupSet(String setName) {
     try {
+        // Build the SQL BEFORE entering the closure. Inside a withSql closure,
+        // property resolution goes to the Sql delegate first, so reading a
+        // @Field there raises MissingPropertyException. Locals are captured fine.
+        String query = 'SELECT s."ID" AS pk, s."SET_ID" AS guid FROM public."' + T_SET +
+                       '" s WHERE s."SET_NAME" = :n'
+        String resource = DB_RESOURCE
         List<String> found = null
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            sql.eachRow('SELECT s."ID" AS pk, s."SET_ID" AS guid FROM public."' + T_SET +
-                        '" s WHERE s."SET_NAME" = :n', [n: setName]) { row ->
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(query, [n: setName]) { row ->
                 found = [row['pk'] as String, row['guid'] as String]
             }
         }
@@ -270,11 +275,13 @@ List<String> lookupSet(String setName) {
 /** [[optionName, optionId], ...] in configured order. */
 List<List<String>> lookupOptions(String setPk) {
     try {
+        String query = 'SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM public."' + T_OPTION +
+                       '" o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."ID"'
+        String resource = DB_RESOURCE
+        int pkValue = Integer.parseInt(setPk)
         List<List<String>> out = new ArrayList<List<String>>()
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM public."' + T_OPTION +
-                        '" o WHERE o."' + C_OPT_FK + '" = :pk ORDER BY o."ID"',
-                        [pk: Integer.parseInt(setPk)]) { row ->
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(query, [pk: pkValue]) { row ->
                 if (row['gid'] != null) {
                     out.add([row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String])
                 }
@@ -293,10 +300,12 @@ String inventoryText() {
         b.append('ALL EASYDROPDOWN SETS in ').append(T_SET).append('\n')
         b.append('================================================================\n')
         b.append(String.format('  %-6s %-40s %-8s %s%n', 'PK', 'SET_NAME', 'OPTIONS', 'SET_ID'))
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            sql.eachRow('SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
-                        '(SELECT count(*) FROM public."' + T_OPTION + '" o WHERE o."' + C_OPT_FK +
-                        '" = s."ID") AS n FROM public."' + T_SET + '" s ORDER BY s."SET_NAME"') { row ->
+        String query = 'SELECT s."ID" AS pk, s."SET_NAME" AS nm, s."SET_ID" AS guid, ' +
+                       '(SELECT count(*) FROM public."' + T_OPTION + '" o WHERE o."' + C_OPT_FK +
+                       '" = s."ID") AS n FROM public."' + T_SET + '" s ORDER BY s."SET_NAME"'
+        String resource = DB_RESOURCE
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(query) { row ->
                 b.append(String.format('  %-6s %-40s %-8s %s%n', row['pk'] as String,
                         row['nm'] as String, row['n'] as String, row['guid'] as String))
             }
