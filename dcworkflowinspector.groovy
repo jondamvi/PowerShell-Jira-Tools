@@ -164,6 +164,23 @@ try {
 Set<String> activeNames = [] as Set<String>
 wfm.activeWorkflows.each { JiraWorkflow w -> activeNames << w.name }
 
+// resolve the transition name as the UI displays it (German translation via
+// jira.i18n.title meta); internal XML name is appended in [brackets] if different
+def i18nHelper = ComponentAccessor.jiraAuthenticationContext.i18nHelper
+Closure<String> actionDisplayName = { ActionDescriptor ad ->
+  String nm = ad.name != null ? ad.name : '?'
+  try {
+    Object key = ad.metaAttributes?.get('jira.i18n.title')
+    if (key != null) {
+      String t = i18nHelper.getText(String.valueOf(key))
+      if (t != null && t.length() > 0 && t != String.valueOf(key) && t != nm) {
+        nm = t + ' [' + nm + ']'
+      }
+    }
+  } catch (Exception e) {}
+  return nm
+}
+
 // provider detection from descriptor args/type
 Closure<String> providerOf = { Map args, String type ->
   String mk = String.valueOf(args?.get('full.module.key') ?: '')
@@ -197,12 +214,32 @@ Closure<String> enabledStatus = { Map args ->
   return verdict
 }
 
+// Newer ScriptRunner versions store workflow-function args base64-encoded with
+// a `!` marker: raw arg "YCFg..." -> base64-decode -> "`!`<real content>". Decode those.
+Closure<String> decodeMaybe = { String v ->
+  if (v == null) return null
+  String t = v.trim()
+  if (t.length() < 8) return v
+  if (!(t ==~ '[A-Za-z0-9+/=\\r\\n]+')) return v
+  try {
+    byte[] b = Base64.decoder.decode(t.replaceAll('\\s', ''))
+    String d = new String(b, 'UTF-8')
+    if (d.startsWith('`!`')) {
+      d = d.substring(3)
+      if (d.endsWith('`!`')) d = d.substring(0, d.length() - 3)
+      return d
+    }
+  } catch (Exception e) {}
+  return v
+}
+
 // extract SR script (inline code or file path) from args -> map with 'code'/'path'
 Closure<Map<String, String>> extractScript = { Map args ->
   String code = null
   String path = null
-  Object fs = args?.get('FIELD_SCRIPT_FILE_OR_SCRIPT')
-  if (fs instanceof String && fs.trim().length() > 0) {
+  Object fs0 = args?.get('FIELD_SCRIPT_FILE_OR_SCRIPT')
+  if (fs0 instanceof String && fs0.trim().length() > 0) {
+    String fs = decodeMaybe(fs0)
     try {
       Object parsed = new JsonSlurper().parseText(fs)
       if (parsed instanceof Map) {
@@ -213,13 +250,20 @@ Closure<Map<String, String>> extractScript = { Map args ->
       }
     } catch (Exception e) { code = fs }
   }
+  Object inline0 = args?.get('FIELD_INLINE_SCRIPT')
+  if (code == null && inline0 instanceof String && inline0.trim().length() > 0) {
+    code = decodeMaybe(inline0)
+  }
   Object rawScript = args?.get('script')
   Object rawPath   = args?.get('scriptPath')
-  if (code == null && rawScript instanceof String && rawScript.trim().length() > 0) code = rawScript
-  if (path == null && rawPath instanceof String && rawPath.trim().length() > 0)     path = rawPath
+  if (code == null && rawScript instanceof String && rawScript.trim().length() > 0) code = decodeMaybe(rawScript)
+  if (path == null && rawPath instanceof String && rawPath.trim().length() > 0)     path = decodeMaybe(rawPath)
   ['FIELD_CONDITION', 'FIELD_ADDITIONAL_SCRIPT', 'FIELD_JQL_QUERY'].each { String k ->
     Object v = args?.get(k)
-    if (v instanceof String && v.trim().length() > 0) code = (code != null ? code + '\n' + v : v)
+    if (v instanceof String && v.trim().length() > 0) {
+      String dv = decodeMaybe(v)
+      code = (code != null ? code + '\n' + dv : dv)
+    }
   }
   Map<String, String> res = [:]
   if (code != null) res.put('code', code)
@@ -353,6 +397,30 @@ workflows.each { JiraWorkflow wf ->
   try {
     WorkflowDescriptor wd = wf.descriptor
     Set<ActionDescriptor> acts = actionsOf(wd)
+
+    // map action id -> where it hangs in THIS workflow (create/global/step names)
+    Map<Integer, List<String>> actionOrigin = [:]
+    Closure addOrigin = { int aid, String label ->
+      List<String> l = actionOrigin.get(aid)
+      if (l == null) { l = []; actionOrigin.put(aid, l) }
+      if (!l.contains(label)) l << label
+    }
+    try {
+      wd.initialActions?.each { Object o -> if (o instanceof ActionDescriptor) addOrigin(o.id, 'CREATE') }
+    } catch (Exception e) {}
+    try {
+      wd.globalActions?.each { Object o -> if (o instanceof ActionDescriptor) addOrigin(o.id, 'GLOBAL') }
+    } catch (Exception e) {}
+    try {
+      wd.steps?.each { Object stO ->
+        if (stO instanceof StepDescriptor) {
+          StepDescriptor st = (StepDescriptor) stO
+          st.actions?.each { Object o ->
+            if (o instanceof ActionDescriptor) addOrigin(o.id, 'Step: ' + String.valueOf(st.name))
+          }
+        }
+      }
+    } catch (Exception e) {}
     boolean isActive = false
     try { isActive = wf.isActive() } catch (Exception e) { isActive = activeNames.contains(wf.name) }
     boolean hasDraft = false
@@ -483,7 +551,9 @@ workflows.each { JiraWorkflow wf ->
         bIdx++
         String bRef = 'B' + String.format('%03d', bIdx)
         String target = suggestTarget(prov, kind, canned, sev)
-        bRows << ([bRef, id, wf.name, String.valueOf(a.id), (a.name != null ? a.name : '?'),
+        List<String> originList = actionOrigin.get(a.id)
+        String fromStep = originList == null ? '?' : originList.join(', ')
+        bRows << ([bRef, id, wf.name, String.valueOf(a.id), actionDisplayName(a), fromStep,
                    kind, enab, prov, canned, source, path, lenS, hashS, sev, tokS,
                    target, '', ''] as List<String>)
 
@@ -560,7 +630,8 @@ out.append(htmlTable('Table A - Workflows',
 out.append(legendFor('Legend: Table B - App workflow functions', [
   ['Ref', 'Unique row reference (B001...) for discussing individual functions'],
   ['WF id', 'Workflow reference - see ID in Table A'],
-  ['TransId / Transition', 'Internal transition id and transition name the function is attached to'],
+  ['TransId / Transition', 'Internal transition id and transition name as displayed in the UI (German translation where Jira uses i18n); the internal XML name follows in [brackets] when different'],
+  ['FromStep', 'Where the transition hangs: CREATE = initial (issue creation), GLOBAL = available from every status, Step: <name> = outgoing transition of that step. Compare this against the workflow Steps view'],
   ['Kind', 'PF = post function, VAL = validator, COND = condition'],
   ['Enabled', 'Enable/disable flag stored in the function config, if the app supports one. "-" = no flag stored (function is effectively enabled). DISABLED = flagged off. TRANS-DISABLED = whole transition flagged'],
   ['Provider', 'App providing the function: SR = ScriptRunner, JSU/JMWE/JWT = workflow apps, BUILTIN = native Jira, APP:... = other app'],
@@ -571,12 +642,12 @@ out.append(legendFor('Legend: Table B - App workflow functions', [
   ['Tokens', 'DC-only API classes found in the code, with occurrence count'],
   ['SuggestedTarget', 'Proposed cloud replacement; Decision/Notes are empty columns for your work in Excel'],
 ] as List<List<String>>))
-// Severity is column index 13 in table B
+// Severity is column index 14 in table B
 out.append(htmlTable('Table B - App workflow functions (working sheet)',
-    ['Ref', 'WF id', 'Workflow', 'TransId', 'Transition', 'Kind', 'Enabled', 'Provider', 'CannedScript',
-     'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
+    ['Ref', 'WF id', 'Workflow', 'TransId', 'Transition', 'FromStep', 'Kind', 'Enabled', 'Provider',
+     'CannedScript', 'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
      'SuggestedTarget', 'Decision', 'Notes'] as List<String>,
-    bRows, 13))
+    bRows, 14))
 
 // ---- Table E: distinct SR scripts ----
 out.append(legendFor('Legend: Table E - Distinct SR scripts', [
