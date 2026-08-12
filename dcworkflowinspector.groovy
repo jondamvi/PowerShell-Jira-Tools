@@ -1,5 +1,5 @@
 /*
- * DC WORKFLOW INSPECTOR v5 (HTML table output)
+ * DC WORKFLOW INSPECTOR v9 (HTML tables + decoded scripts + action XML)
  * --------------------------------------------
  * Run in: ScriptRunner Script Console on the Jira DC TEST instance.
  * Read-only: makes no changes.
@@ -106,8 +106,18 @@ Closure<String> esc = { Object o ->
           .replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim()
 }
 
-// render one HTML table; markCol = column index used for row coloring (-1 = none)
-Closure<String> htmlTable = { String title, List<String> header, List<List<String>> rows, int markCol ->
+// escape for code cells: keep line breaks (as <br>) so Excel gets in-cell newlines
+Closure<String> escCode = { Object o ->
+  String s = o == null ? '' : String.valueOf(o)
+  s = s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+  s = s.replace('\r\n', '\n').replace('\r', '\n').replace('\t', '  ')
+  return s.replace('\n', '<br>')
+}
+
+// render one HTML table; markCol = column index used for row coloring (-1 = none);
+// codeCols = column indexes rendered as monospace code with line breaks preserved
+Closure<String> htmlTable = { String title, List<String> header, List<List<String>> rows,
+                              int markCol, List<Integer> codeCols ->
   StringBuilder sb = new StringBuilder()
   sb.append('<h3 style="font-family:Arial,sans-serif;margin:18px 0 6px 0;color:#205081">')
     .append(esc(title)).append('</h3>')
@@ -132,8 +142,14 @@ Closure<String> htmlTable = { String title, List<String> header, List<List<Strin
     sb.append('<tr style="background:').append(bg).append('">')
     for (int i = 0; i < n; i++) {
       String v = i < r.size() ? String.valueOf(r.get(i)) : ''
-      sb.append('<td style="border:1px solid #bbb;padding:3px 8px;vertical-align:top">')
-        .append(esc(v)).append('</td>')
+      if (codeCols.contains(i)) {
+        sb.append('<td style="border:1px solid #bbb;padding:3px 8px;vertical-align:top;')
+          .append('font-family:monospace;font-size:11px;text-align:left">')
+          .append(escCode(v)).append('</td>')
+      } else {
+        sb.append('<td style="border:1px solid #bbb;padding:3px 8px;vertical-align:top">')
+          .append(esc(v)).append('</td>')
+      }
     }
     sb.append('</tr>')
   }
@@ -269,6 +285,33 @@ Closure<Map<String, String>> extractScript = { Map args ->
   if (code != null) res.put('code', code)
   if (path != null) res.put('path', path)
   return res
+}
+
+// full <action id=".." name=".."> ... </action> XML of a transition;
+// base64-encoded arg values are decoded inline and marked with [decoded]
+Closure<String> actionXmlOf = { ActionDescriptor ad ->
+  String xml = ''
+  try {
+    StringWriter sw = new StringWriter()
+    PrintWriter pw = new PrintWriter(sw)
+    ad.writeXML(pw, 0)
+    pw.flush()
+    xml = sw.toString()
+  } catch (Exception e) { return 'XML unavailable: ' + e.message }
+  try {
+    def m = (xml =~ '[A-Za-z0-9+/=]{24,}')
+    StringBuffer sb = new StringBuffer()
+    while (m.find()) {
+      String orig = m.group()
+      String d = decodeMaybe(orig)
+      String rep = (d == orig) ? orig :
+          ('[decoded] ' + d.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;'))
+      m.appendReplacement(sb, java.util.regex.Matcher.quoteReplacement(rep))
+    }
+    m.appendTail(sb)
+    xml = sb.toString()
+  } catch (Exception e) {}
+  return xml
 }
 
 // resolve file-based scripts from known script roots
@@ -462,6 +505,7 @@ workflows.each { JiraWorkflow wf ->
         Object md = a.metaAttributes?.get('jira.disabled')
         if (String.valueOf(md) == 'true') transDisabled = 'TRANS-DISABLED'
       } catch (Exception e) {}
+      String actionXmlText = actionXmlOf(a)
 
       items.each { Map<String, Object> item ->
         String kind = String.valueOf(item.get('kind'))
@@ -480,6 +524,8 @@ workflows.each { JiraWorkflow wf ->
         String hashS = ''
         String sev = ''
         String tokS = ''
+        String funcId = String.valueOf(args.get('FIELD_FUNCTION_ID') ?: '')
+        String codeFull = ''
 
         if (prov == 'SR') {
           totalSR++
@@ -503,6 +549,7 @@ workflows.each { JiraWorkflow wf ->
           } else {
             source = 'nocode'
           }
+          codeFull = (code != null ? code : '')
 
           boolean isCustomScript = canned.toLowerCase().contains('customscript')
           if (!isCustomScript && (kind == 'COND' || kind == 'VAL')) {
@@ -554,8 +601,8 @@ workflows.each { JiraWorkflow wf ->
         List<String> originList = actionOrigin.get(a.id)
         String fromStep = originList == null ? '?' : originList.join(', ')
         bRows << ([bRef, id, wf.name, String.valueOf(a.id), actionDisplayName(a), fromStep,
-                   kind, enab, prov, canned, source, path, lenS, hashS, sev, tokS,
-                   target, '', ''] as List<String>)
+                   kind, enab, prov, canned, source, path, lenS, hashS, funcId, sev, tokS,
+                   target, '', '', codeFull, actionXmlText] as List<String>)
 
         // group identical SR scripts by hash for table E
         if (prov == 'SR' && hashS.length() > 0) {
@@ -564,6 +611,7 @@ workflows.each { JiraWorkflow wf ->
             g = [:] as Map<String, Object>
             g.put('count', 0); g.put('refs', [] as List<String>)
             g.put('len', lenS); g.put('sev', sev); g.put('tok', tokS); g.put('canned', canned)
+            g.put('code', codeFull)
             scriptGroups.put(hashS, g)
           }
           g.put('count', (g.get('count') as int) + 1)
@@ -603,7 +651,7 @@ out.append(' &mdash; select a table, copy, paste into Excel.</p>')
 
 // legend renderer: small two-column table
 Closure<String> legendFor = { String title, List<List<String>> defs ->
-  return htmlTable(title, ['Column', 'Meaning'] as List<String>, defs, -1)
+  return htmlTable(title, ['Column', 'Meaning'] as List<String>, defs, -1, [] as List<Integer>)
 }
 
 // ---- Table A ----
@@ -624,7 +672,7 @@ out.append(legendFor('Legend: Table A - Workflows', [
 out.append(htmlTable('Table A - Workflows',
     ['ID', 'Workflow', 'Status', 'Draft', 'Proj Count', 'ProjectKeys', 'Trans',
      'SR', 'JSU', 'JMWE', 'JWT', 'OtherApps', 'Builtin'] as List<String>,
-    aRows, 2))
+    aRows, 2, [] as List<Integer>))
 
 // ---- Table B ----
 out.append(legendFor('Legend: Table B - App workflow functions', [
@@ -638,22 +686,26 @@ out.append(legendFor('Legend: Table B - App workflow functions', [
   ['CannedScript', 'Function class. CustomScriptFunction/-Validator/-Condition = free Groovy; other names = SR built-in (canned) function'],
   ['Source', 'inline = Groovy stored inside the workflow; file = script file on the server (resolved); file-NOT-FOUND = referenced file missing from script roots; nocode = SR canned function configured only via UI fields, no custom Groovy'],
   ['CodeLen / CodeHash', 'Script size and fingerprint. Same hash = identical script reused on several transitions (rewrite once - see Table E)'],
+  ['FunctionId', 'ScriptRunner internal function instance id (FIELD_FUNCTION_ID hex from the workflow XML) - stable unique identifier of this function'],
   ['Severity', 'Cloud rewrite effort: EASY = trivial, MED = rewrite against REST/HAPI, HARD = capability does not exist on cloud (redesign)'],
   ['Tokens', 'DC-only API classes found in the code, with occurrence count'],
   ['SuggestedTarget', 'Proposed cloud replacement; Decision/Notes are empty columns for your work in Excel'],
+  ['Script', 'Full decoded ScriptRunner Groovy code (base64 decoded). Enable text wrap in Excel; copy cell content into a script editor to inspect'],
+  ['ActionXML', 'Complete <action> XML of the transition with ALL its functions and configuration parameters; base64 arg values are decoded inline and marked [decoded]'],
 ] as List<List<String>>))
-// Severity is column index 14 in table B
+// Severity is column index 15 in table B; Script=20 and ActionXML=21 are code columns
 out.append(htmlTable('Table B - App workflow functions (working sheet)',
     ['Ref', 'WF id', 'Workflow', 'TransId', 'Transition', 'FromStep', 'Kind', 'Enabled', 'Provider',
-     'CannedScript', 'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'Severity', 'Tokens',
-     'SuggestedTarget', 'Decision', 'Notes'] as List<String>,
-    bRows, 14))
+     'CannedScript', 'Source', 'ScriptPath', 'CodeLen', 'CodeHash', 'FunctionId', 'Severity', 'Tokens',
+     'SuggestedTarget', 'Decision', 'Notes', 'Script', 'ActionXML'] as List<String>,
+    bRows, 15, [20, 21] as List<Integer>))
 
 // ---- Table E: distinct SR scripts ----
 out.append(legendFor('Legend: Table E - Distinct SR scripts', [
   ['CodeHash', 'Script fingerprint - same value in Table B means the identical script'],
   ['Uses', 'How many workflow functions use this exact script'],
   ['Refs', 'Table B rows using it - one rewrite covers all of them'],
+  ['Script', 'Full decoded Groovy code of this distinct script'],
 ] as List<List<String>>))
 List<List<String>> eRows = []
 List<Map.Entry<String, Map<String, Object>>> grpEntries =
@@ -663,13 +715,14 @@ grpEntries.each { Map.Entry<String, Map<String, Object>> en ->
   List<String> refs = en.value.get('refs') as List<String>
   eRows << ([en.key, String.valueOf(en.value.get('count')), String.valueOf(en.value.get('canned')),
              String.valueOf(en.value.get('len')), String.valueOf(en.value.get('sev')),
-             String.valueOf(en.value.get('tok')), refs.join(', ')] as List<String>)
+             String.valueOf(en.value.get('tok')), refs.join(', '),
+             String.valueOf(en.value.get('code') ?: '')] as List<String>)
 }
-if (eRows.isEmpty()) eRows << (['(no SR scripts with code found)', '', '', '', '', '', ''] as List<String>)
-// Severity is column index 4 in table E
+if (eRows.isEmpty()) eRows << (['(no SR scripts with code found)', '', '', '', '', '', '', ''] as List<String>)
+// Severity is column index 4 in table E; Script=7 is a code column
 out.append(htmlTable('Table E - Distinct SR scripts (rewrite once, apply to all Refs)',
-    ['CodeHash', 'Uses', 'CannedScript', 'CodeLen', 'Severity', 'Tokens', 'Refs'] as List<String>,
-    eRows, 4))
+    ['CodeHash', 'Uses', 'CannedScript', 'CodeLen', 'Severity', 'Tokens', 'Refs', 'Script'] as List<String>,
+    eRows, 4, [7] as List<Integer>))
 List<List<String>> cRows = []
 List<Map.Entry<String, Map<String, Object>>> tokenEntries =
     new ArrayList<Map.Entry<String, Map<String, Object>>>(tokenRollup.entrySet())
@@ -692,7 +745,8 @@ out.append(legendFor('Legend: Table C - Cloud-blocker tokens', [
 ] as List<List<String>>))
 // Severity is column index 3 in table C
 out.append(htmlTable('Table C - Cloud-blocker tokens',
-    ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>, cRows, 3))
+    ['Token', 'Hits', 'Scripts', 'Severity', 'CloudReplacementHint'] as List<String>,
+    cRows, 3, [] as List<Integer>))
 
 List<List<String>> dRows = []
 dRows << (['Workflows total', String.valueOf(wfIdx)] as List<String>)
@@ -719,7 +773,7 @@ dRows << (['Script roots checked',
 out.append(legendFor('Legend: Table D - Summary', [
   ['Metric / Value', 'Instance-wide totals: workflow counts, SR function counts by source and severity, canned conditions/validators that arrive blank on cloud, and the script roots searched for file-based scripts'],
 ] as List<List<String>>))
-out.append(htmlTable('Table D - Summary', ['Metric', 'Value'] as List<String>, dRows, -1))
+out.append(htmlTable('Table D - Summary', ['Metric', 'Value'] as List<String>, dRows, -1, [] as List<Integer>))
 out.append('</div>')
 
 return out.toString()
