@@ -96,9 +96,24 @@ enum ReplacementStatus {
 
 @Field boolean UPDATE_HISTORICAL_VERSIONS = true
 
-// true  -> current version saved with saveNewVersion(): page history gives you
-//          an undo, version count grows by one
-// false -> saved in place, no new version
+/*
+ * true  -> current version saved with saveNewVersion(): page history gives you
+ *          an undo, version count grows by one
+ * false -> saved in place, no new version
+ *
+ * INTERACTION WITH UPDATE_HISTORICAL_VERSIONS - four combinations:
+ *   false / true   every version rewritten in place. Version count unchanged.
+ *                  No rollback except this script's printed copies.
+ *   false / false  only the current version, in place. History untouched.
+ *   true  / false  current version replaced by a NEW version; the pre-change
+ *                  body is preserved as history and still contains the macro.
+ *                  This is the audit-trail mode.
+ *   true  / true   NEEDS TWO PASSES. saveNewVersion copies the pre-change body
+ *                  into a NEW historical row during Stage-3, after Stage-1 has
+ *                  already frozen the findings - so that row is never scanned
+ *                  and keeps its macro. Re-running cleans it (the current
+ *                  version then has no matches, so no further row is created).
+ */
 @Field boolean CURRENT_CREATES_NEW_VERSION = true
 
 // Historical rows are never indexed by Confluence, so events are suppressed.
@@ -1262,6 +1277,14 @@ try {
         outp.append('WARNING: PAGE_IDS_OVERRIDE set - database discovery is bypassed for every migration; ')
             .append(PAGE_IDS_OVERRIDE.size()).append(' page(s) will be examined\n')
     }
+    if (CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
+        outp.append('WARNING: CURRENT_CREATES_NEW_VERSION and UPDATE_HISTORICAL_VERSIONS are BOTH true.\n')
+            .append('         saveNewVersion copies each pre-change body into a new historical row\n')
+            .append('         during Stage-3, after Stage-1 froze the findings - so that row keeps\n')
+            .append('         its macro and is not cleaned by this run. Either set\n')
+            .append('         CURRENT_CREATES_NEW_VERSION=false to rewrite every version in place,\n')
+            .append('         or run this script a SECOND time to clean the rows it creates.\n')
+    }
     if (!SPACE_KEYS.isEmpty()) outp.append('Spaces: ').append(SPACE_KEYS.join(', ')).append('\n')
     outp.append('History: ').append(UPDATE_HISTORICAL_VERSIONS ? 'included' : 'skipped')
         .append('   Batch: ').append(FLUSH_AFTER_BATCH ? BATCH_MAX_PAGES + ' pages' : 'no flushing').append('\n')
@@ -1503,6 +1526,22 @@ try {
         outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', md.id,
                 md.occFound as String, md.occReplaced as String,
                 md.occSkipped as String, md.occFailed as String))
+    }
+
+    if (apply && CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
+        int newRows = 0
+        for (PageFinding pf : findings) {
+            for (VersionFinding vf : pf.versions) {
+                if (vf.isCurrent && vf.status == ReplacementStatus.Success) newRows++
+            }
+        }
+        if (newRows > 0) {
+            outp.append('\n  SECOND PASS REQUIRED: ').append(newRows)
+                .append(' page(s) had their current version rewritten with saveNewVersion,\n')
+                .append('  which created ').append(newRows)
+                .append(' new historical row(s) still containing the source macro.\n')
+                .append('  Re-run this script with the same settings to clean them.\n')
+        }
     }
 
     List<String> failedVersions = new ArrayList<String>()
