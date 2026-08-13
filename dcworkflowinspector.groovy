@@ -106,12 +106,13 @@ Closure<String> esc = { Object o ->
           .replace('\r', ' ').replace('\n', ' ').replace('\t', ' ').trim()
 }
 
-// escape for code cells: keep line breaks (as <br>) so Excel gets in-cell newlines
+// escape for code cells: line breaks become <br> with mso-data-placement:same-cell,
+// which makes Excel keep the whole script inside ONE cell (in-cell Alt+Enter breaks)
 Closure<String> escCode = { Object o ->
   String s = o == null ? '' : String.valueOf(o)
   s = s.replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
   s = s.replace('\r\n', '\n').replace('\r', '\n').replace('\t', '  ')
-  return s.replace('\n', '<br>')
+  return s.replace('\n', '<br style="mso-data-placement:same-cell;">')
 }
 
 // render one HTML table; markCol = column index used for row coloring (-1 = none);
