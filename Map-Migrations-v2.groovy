@@ -72,10 +72,39 @@ final List WANTED = [
 //        source : [name: 'last-modified',    type: 'UserMacro'],
 //        target : [name: 'last-modified-sr', type: 'ScriptRunnerMacro'],
 //    ],
+//    [
+//        id     : 'link-button',
+//        source : [name: 'link-button', type: 'ScriptRunnerMacro'],
+//        target : [name: 'aura-button', type: 'AuraLinkButton'],
+//        // hrefFrom / labelFrom are inferred from the source parameter names;
+//        // set them on the target block if inference reports an ambiguity.
+//    ],
 ]
 
 final String DEFAULT_EDD_MACRO = 'easy-dropdown-menu-status'
 final String EDD_SCHEMA_VER    = '2'
+
+/*
+ * Standard look applied to every replaced aura-button. Emitted into the
+ * generated config as staticParams, so it can be adjusted there before a run.
+ * href and label are per-instance and come from the source macro instead.
+ */
+final Map<String, String> AURA_STYLE = [
+        'elevation'   : 'flat',
+        'outlined'    : 'regular',
+        'borderRadius': '28',
+        'color'       : '#000000',
+        'size'        : 'medium',
+        'background'  : '#b0e572',
+        'iconPosition': 'left',
+        'hrefTarget'  : '_blank',
+        'alignment'   : 'left',
+]
+
+// Source parameter names recognised as the URL and the button text, tried in
+// order. Override per entry with target.hrefFrom / target.labelFrom.
+final List<String> AURA_HREF_CANDIDATES  = ['url', 'href', 'link']
+final List<String> AURA_LABEL_CANDIDATES = ['buttontext', 'label', 'text', 'title']
 
 final boolean VALIDATE_OPTION_ORDER = true
 final boolean SHOW_PARAM_TABLES = true
@@ -381,7 +410,11 @@ try {
                              ' - wrong type, or the macro is not installed')
             }
 
-            List<String> picked = pickSourceParam(srcParams, srcParamExplicit)
+            // AuraLinkButton needs two source parameters, not one, so the single
+            // sourceParam pick does not apply to it.
+            List<String> picked = (tgtType == 'AuraLinkButton')
+                    ? [srcParamExplicit, 'not used for AuraLinkButton targets']
+                    : pickSourceParam(srcParams, srcParamExplicit)
             String srcParam = picked.get(0)
             detail.append('  sourceParam: ').append(srcParam == null ? '(undecided)' : srcParam)
                   .append('   [').append(picked.get(1)).append(']\n')
@@ -489,7 +522,103 @@ try {
             }
 
             // =========================================================
-            //  MACRO -> MACRO TARGET  (ScriptRunner, UserMacro, Aura)
+            //  AURA LINK BUTTON TARGET
+            //  No database and no target-metadata lookup: aura-button is a
+            //  global macro whose parameters are supplied wholesale from
+            //  AURA_STYLE, with only href and label taken per instance.
+            // =========================================================
+            if (tgtType == 'AuraLinkButton') {
+                String hrefFrom  = (String) tgtCfg.get('hrefFrom')
+                String labelFrom = (String) tgtCfg.get('labelFrom')
+                List<String> srcNames = new ArrayList<String>()
+                if (srcParams != null) { for (ParamInfo p : srcParams) srcNames.add(p.name) }
+
+                if (hrefFrom == null) {
+                    for (String c : AURA_HREF_CANDIDATES) { if (hrefFrom == null && srcNames.contains(c)) hrefFrom = c }
+                }
+                if (labelFrom == null) {
+                    for (String c : AURA_LABEL_CANDIDATES) { if (labelFrom == null && srcNames.contains(c)) labelFrom = c }
+                }
+                if (hrefFrom == null) {
+                    problems.add('could not decide which source parameter holds the URL. ' +
+                                 'Declared: ' + srcNames + '. Set target.hrefFrom explicitly.')
+                }
+                if (labelFrom == null) {
+                    problems.add('could not decide which source parameter holds the button text. ' +
+                                 'Declared: ' + srcNames + '. Set target.labelFrom explicitly.')
+                }
+
+                // defaults carried across, so a parameter left at its default -
+                // and therefore absent from page storage - still resolves
+                Map<String, String> defs = new LinkedHashMap<String, String>()
+                if (srcParams != null) {
+                    for (ParamInfo p : srcParams) {
+                        if (!p.defaultValue.isEmpty()) defs.put(p.name, p.defaultValue)
+                    }
+                }
+                for (String need : [hrefFrom, labelFrom]) {
+                    if (need == null) continue
+                    boolean hasDefault = defs.containsKey(need)
+                    boolean isRequired = false
+                    for (ParamInfo p : srcParams == null ? new ArrayList<ParamInfo>() : srcParams) {
+                        if (p.name == need && p.required) isRequired = true
+                    }
+                    if (!hasDefault && !isRequired) {
+                        detail.append('  NOTE: "').append(need).append('" is neither required nor ')
+                              .append('defaulted - occurrences omitting it will fail at replacement time\n')
+                    }
+                }
+
+                detail.append('  href  <- ').append(hrefFrom == null ? '(undecided)' : hrefFrom).append('\n')
+                detail.append('  label <- ').append(labelFrom == null ? '(undecided)' : labelFrom).append('\n')
+
+                boolean okA = problems.isEmpty()
+                String pfxA = okA ? '' : '//  '
+                if (okA) { ready++; detail.append('\n  validation: OK\n\n') }
+                else {
+                    blockedCount++
+                    detail.append('\n  validation: ').append(problems.size()).append(' problem(s)\n')
+                    for (String pr : problems) detail.append('    - ').append(pr).append('\n')
+                    detail.append('\n')
+                    cfg.append('//  ').append(migId).append(' - COMMENTED OUT, Stage-0 would reject it:\n')
+                    for (String pr : problems) cfg.append('//      ').append(pr).append('\n')
+                }
+
+                cfg.append(pfxA).append('    [\n')
+                cfg.append(pfxA).append("        id     : '").append(migId).append("',\n")
+                cfg.append(pfxA).append("        source : [name: '").append(srcMacro)
+                   .append("', type: MacroType.").append(srcType)
+                if (!defs.isEmpty()) {
+                    List<String> dparts = new ArrayList<String>()
+                    for (Map.Entry<String, String> de : defs.entrySet()) {
+                        dparts.add("'" + de.getKey() + "': '" + de.getValue().replace("'", "\\'") + "'")
+                    }
+                    cfg.append(',\n').append(pfxA).append('                  paramDefaults: [')
+                       .append(dparts.join(', ')).append(']')
+                }
+                cfg.append('],\n')
+                cfg.append(pfxA).append("        target : [name: '").append(tgtMacro)
+                   .append("', type: MacroType.AuraLinkButton,\n")
+                cfg.append(pfxA).append("                  schemaVersion: '1',\n")
+                cfg.append(pfxA).append('                  paramMap: [')
+                   .append("'").append(hrefFrom == null ? 'UNRESOLVED' : hrefFrom).append("': 'href', ")
+                   .append("'").append(labelFrom == null ? 'UNRESOLVED' : labelFrom).append("': 'label'],\n")
+                cfg.append(pfxA).append('                  staticParams: [\n')
+                int wA = 0
+                for (String k : AURA_STYLE.keySet()) { if (k.length() > wA) wA = k.length() }
+                for (Map.Entry<String, String> se : AURA_STYLE.entrySet()) {
+                    cfg.append(pfxA).append('                      ')
+                       .append(String.format('%-' + (wA + 2) + 's', "'" + se.getKey() + "'"))
+                       .append(": '").append(se.getValue()).append("',\n")
+                }
+                cfg.append(pfxA).append('                  ],\n')
+                cfg.append(pfxA).append('                  dropUnmapped: true],\n')
+                cfg.append(pfxA).append('    ],\n')
+                continue
+            }
+
+            // =========================================================
+            //  MACRO -> MACRO TARGET  (ScriptRunner, UserMacro)
             // =========================================================
             List<ParamInfo> tgtParams = macroParams(tgtMacro, tgtType)
             if (SHOW_PARAM_TABLES) detail.append(paramTable('TARGET', tgtMacro, tgtParams))

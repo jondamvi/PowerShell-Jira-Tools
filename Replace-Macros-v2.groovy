@@ -83,6 +83,12 @@ enum ReplacementStatus {
 
 @Field String DB_RESOURCE = 'ConfluenceDB'
 
+// EasyDropDown tables, named explicitly. For a text-dropdown set instead:
+//   AO_1313EC_TEXT_SET_ENTITY / AO_1313EC_TEXT_OPTION_ENTITY / TEXT_SET_ENTITY_ID
+@Field String EDM_SET_TABLE    = 'AO_1313EC_LOZENGE_SET'
+@Field String EDM_OPTION_TABLE = 'AO_1313EC_LOZENGE_OPTION'
+@Field String EDM_OPTION_FK    = 'LOZENGE_SET_ENTITY_ID'
+
 // Scope. Empty SPACE_KEYS = every space. PAGE_IDS_OVERRIDE bypasses discovery.
 @Field List<String> SPACE_KEYS = []
 @Field List<Long> PAGE_IDS_OVERRIDE = []
@@ -172,16 +178,31 @@ enum ReplacementStatus {
                   ]],
     ],
 
-//  TODO - Aura button. Blocked: the sample source macro exposes only
-//  buttontext="google.de" while the target needs href and label, and neither
-//  is derivable from it. Send the full source storage and this can be filled in.
-//    [
-//        id     : 'link-button',
-//        source : [name: 'test-link-button', type: MacroType.UserMacro, sourceParam: 'buttontext'],
-//        target : [name: 'aura-button', type: MacroType.AuraLinkButton,
-//                  paramMap: ['buttontext': 'label'],
-//                  staticParams: ['elevation': 'elevated', 'hrefType': 'link']],
-//    ],
+    [
+        id     : 'link-button',
+        source : [name: 'link-button', type: MacroType.ScriptRunnerMacro,
+                  // link-button declares url with a real default, so an absent
+                  // url parameter still resolves. Listed explicitly so the run
+                  // does not depend on metadata discovery succeeding.
+                  paramDefaults: ['url': 'http://www.google.de']],
+        target : [name: 'aura-button', type: MacroType.AuraLinkButton,
+                  schemaVersion: '1',
+                  // per-instance values
+                  paramMap: ['url': 'href', 'buttontext': 'label'],
+                  // standard look applied to every replaced button - adjust here
+                  staticParams: [
+                      'elevation'   : 'flat',
+                      'outlined'    : 'regular',
+                      'borderRadius': '28',
+                      'color'       : '#000000',
+                      'size'        : 'medium',
+                      'background'  : '#b0e572',
+                      'iconPosition': 'left',
+                      'hrefTarget'  : '_blank',
+                      'alignment'   : 'left',
+                  ],
+                  dropUnmapped: true],
+    ],
 ]
 
 // =============================================================================
@@ -558,38 +579,40 @@ Map<String, String> declaredDefaults(String macroName, MacroType type) {
 // =============================================================================
 
 /** Ordered option name -> option-id for a set, read fresh from the database. */
+/**
+ * Ordered option name -> option-id for one EasyDropDown set, read live.
+ * Single explicitly named table pair - no family guessing, no swallowed
+ * exceptions: a failing query must never be reported as "set not found".
+ */
 Map<String, String> edmOptionsForSet(String setId, String setName) {
     try {
+        String resource = DB_RESOURCE
+        String tSet = EDM_SET_TABLE, tOpt = EDM_OPTION_TABLE, fk = EDM_OPTION_FK
+        boolean byGuid = (setId != null && !setId.trim().isEmpty() && !setId.startsWith('PUT-'))
+        String lookupValue = byGuid ? setId : setName
+        String setQuery = 'SELECT s."ID" AS pk FROM public."' + tSet + '" s WHERE s."' +
+                          (byGuid ? 'SET_ID' : 'SET_NAME') + '" = :v'
+
+        String pk = null
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(setQuery, [v: lookupValue]) { row -> pk = row['pk'] as String }
+        }
         Map<String, String> out = new LinkedHashMap<String, String>()
-        List<List<String>> families = [
-            ['AO_1313EC_LOZENGE_SET', 'AO_1313EC_LOZENGE_OPTION', 'LOZENGE_SET_ENTITY_ID'],
-            ['AO_1313EC_TEXT_SET_ENTITY', 'AO_1313EC_TEXT_OPTION_ENTITY', 'TEXT_SET_ENTITY_ID'],
-        ]
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            for (List<String> f : families) {
-                if (!out.isEmpty()) break
-                String pk = null
-                try {
-                    String where = (setId != null && !setId.trim().isEmpty() && !setId.startsWith('PUT-'))
-                            ? 's."SET_ID" = :v' : 's."SET_NAME" = :v'
-                    String val = (setId != null && !setId.trim().isEmpty() && !setId.startsWith('PUT-'))
-                            ? setId : setName
-                    sql.eachRow('SELECT s."ID" AS pk FROM public."' + f.get(0) + '" s WHERE ' + where,
-                                [v: val]) { row -> pk = row['pk'] as String }
-                } catch (Exception ignored) { }
-                if (pk == null) continue
-                try {
-                    sql.eachRow('SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM public."' +
-                                f.get(1) + '" o WHERE o."' + f.get(2) + '" = :pk ORDER BY o."ID"',
-                                [pk: Integer.parseInt(pk)]) { row ->
-                        out.put(row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String)
-                    }
-                } catch (Exception ignored2) { }
+        if (pk == null) return out
+
+        String optQuery = 'SELECT o."OPTION_NAME" AS nm, o."OPTION_ID" AS gid FROM public."' +
+                          tOpt + '" o WHERE o."' + fk + '" = :pk ORDER BY o."ID"'
+        int pkValue = Integer.parseInt(pk)
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(optQuery, [pk: pkValue]) { row ->
+                if (row['gid'] != null) {
+                    out.put(row['nm'] == null ? '' : row['nm'] as String, row['gid'] as String)
+                }
             }
         }
         return out
     } catch (Exception e) {
-        throw new RuntimeException('edmOptionsForSet failed: ' + e.getMessage(), e)
+        throw new RuntimeException('edmOptionsForSet("' + setName + '") failed: ' + e.getMessage(), e)
     }
 }
 
@@ -791,27 +814,44 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
 List<Long> resolveScope(Set<String> sourceNames) {
     try {
         if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
+        /*
+         * Everything the closure needs is built into LOCALS first. Inside a
+         * withSql closure, property resolution goes to the Sql delegate before
+         * the script, so reading a @Field there raises MissingPropertyException
+         * ("No such property: SPACE_KEYS"). Locals are captured normally.
+         */
+        List<String> spaceKeys = new ArrayList<String>(SPACE_KEYS)
+        List<String> statuses  = new ArrayList<String>(INCLUDE_STATUSES)
+        String resource = DB_RESOURCE
+
+        List<String> queries = new ArrayList<String>()
+        List<Map<String, Object>> queryParams = new ArrayList<Map<String, Object>>()
+        for (String name : sourceNames) {
+            Map<String, Object> params = new LinkedHashMap<String, Object>()
+            params.put('pattern', '%ac:name="' + name + '"%')
+            StringBuilder q = new StringBuilder()
+            q.append('SELECT c.contentid AS rowid, c.prevver AS prevver FROM content c ')
+             .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
+             .append('LEFT JOIN spaces s ON s.spaceid = c.spaceid ')
+             .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') AND bc.body LIKE :pattern ")
+            if (!spaceKeys.isEmpty()) {
+                List<String> ph = new ArrayList<String>()
+                for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
+                q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
+            }
+            if (!statuses.isEmpty()) {
+                List<String> ph = new ArrayList<String>()
+                for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
+                q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
+            }
+            queries.add(q.toString())
+            queryParams.add(params)
+        }
+
         Set<Long> ids = new LinkedHashSet<Long>()
-        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-            for (String name : sourceNames) {
-                Map<String, Object> params = new LinkedHashMap<String, Object>()
-                params.put('pattern', '%ac:name="' + name + '"%')
-                StringBuilder q = new StringBuilder()
-                q.append('SELECT c.contentid AS rowid, c.prevver AS prevver FROM content c ')
-                 .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
-                 .append('LEFT JOIN spaces s ON s.spaceid = c.spaceid ')
-                 .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') AND bc.body LIKE :pattern ")
-                if (!SPACE_KEYS.isEmpty()) {
-                    List<String> ph = new ArrayList<String>()
-                    for (int i = 0; i < SPACE_KEYS.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, SPACE_KEYS.get(i)) }
-                    q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
-                }
-                if (!INCLUDE_STATUSES.isEmpty()) {
-                    List<String> ph = new ArrayList<String>()
-                    for (int i = 0; i < INCLUDE_STATUSES.size(); i++) { ph.add(':st' + i); params.put('st' + i, INCLUDE_STATUSES.get(i)) }
-                    q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
-                }
-                sql.eachRow(q.toString(), params) { row ->
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            for (int i = 0; i < queries.size(); i++) {
+                sql.eachRow(queries.get(i), queryParams.get(i)) { row ->
                     Object prev = row['prevver']
                     ids.add(prev == null ? ((Number) row['rowid']).longValue() : ((Number) prev).longValue())
                 }
@@ -924,19 +964,67 @@ String replaceGenericMacro(MigrationDef mig, MatchedMacro mm, List<String> notes
     try {
         Map<String, String> out = new LinkedHashMap<String, String>()
         out.putAll(mig.staticParams)
+
+        // Mapped parameters go through default resolution, so a parameter the
+        // author left at its default - and which is therefore absent from page
+        // storage - still reaches the target instead of silently disappearing.
+        for (Map.Entry<String, String> e : mig.paramMap.entrySet()) {
+            String v = resolveValue(mig, mm.params, e.getKey())
+            if (v != null) out.put(e.getValue(), v)
+        }
         for (Map.Entry<String, String> e : mm.params.entrySet()) {
-            String tgtKey = mig.paramMap.get(e.getKey())
-            if (tgtKey == null) {
-                if (mig.dropUnmapped) continue
-                tgtKey = e.getKey()
-            }
-            out.put(tgtKey, e.getValue())
+            if (mig.paramMap.containsKey(e.getKey())) continue      // already handled
+            if (mig.dropUnmapped) continue
+            out.put(e.getKey(), e.getValue())
         }
         String macroId = UUID.randomUUID().toString()
         if (TRACE_MAPPING) notes.add('  ' + mm.sourceName + ' -> ' + mig.targetName + ' params=' + out)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (Exception e) {
         throw new RuntimeException('replaceGenericMacro failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * link-button -> aura-button.
+ *
+ * The style parameters come from the migration's staticParams, so every
+ * replaced button gets one standard look that can be adjusted in config before
+ * a run. Only href and label are per-instance, taken from the source macro -
+ * falling back to its declared defaults when the author left them untouched
+ * (link-button's "url" defaults to a real URL, so an absent parameter is
+ * meaningful rather than empty).
+ *
+ * Every paramMap entry is treated as required: a button written without an
+ * href or a label is broken output, so an unresolvable value fails the
+ * occurrence rather than producing one.
+ */
+String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) {
+    try {
+        Map<String, String> out = new LinkedHashMap<String, String>()
+        out.putAll(mig.staticParams)
+
+        List<String> missing = new ArrayList<String>()
+        for (Map.Entry<String, String> e : mig.paramMap.entrySet()) {
+            String v = resolveValue(mig, mm.params, e.getKey())
+            if (v == null || v.trim().isEmpty()) { missing.add(e.getKey()); continue }
+            out.put(e.getValue(), v)
+        }
+        if (!missing.isEmpty()) {
+            throw new IllegalStateException('parameter(s) ' + missing + ' could not be resolved ' +
+                    'from the page or from declared defaults; parsed from this macro: ' + mm.params)
+        }
+
+        String macroId = UUID.randomUUID().toString()
+        if (TRACE_MAPPING) {
+            notes.add('  aura-button href=' + out.get('href') + ' label=' + out.get('label') +
+                      ' macro-id=' + macroId)
+        }
+        return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
+    } catch (IllegalStateException ise) {
+        throw ise
+    } catch (Exception e) {
+        throw new RuntimeException('replaceAuraButton failed: ' + e.getMessage(), e)
     }
 }
 
@@ -992,9 +1080,9 @@ String replaceMacro(MigrationDef mig, MatchedMacro mm, List<String> notes) {
     try {
         if (mig.targetType == MacroType.EddStatusMacro)            return replaceEddStatus(mig, mm, notes)
         if (mig.targetType == MacroType.Static_QualificationTable) return replaceQualificationTable(mig, mm, notes)
+        if (mig.targetType == MacroType.AuraLinkButton)            return replaceAuraButton(mig, mm, notes)
         if (mig.targetType == MacroType.ScriptRunnerMacro ||
-            mig.targetType == MacroType.UserMacro ||
-            mig.targetType == MacroType.AuraLinkButton)            return replaceGenericMacro(mig, mm, notes)
+            mig.targetType == MacroType.UserMacro)                 return replaceGenericMacro(mig, mm, notes)
         throw new IllegalStateException('no replace implementation for target type ' + mig.targetType)
     } catch (IllegalStateException ise) {
         throw ise
