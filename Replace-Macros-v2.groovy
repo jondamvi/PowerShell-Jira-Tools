@@ -170,8 +170,9 @@ enum ReplacementStatus {
 @Field boolean EMIT_REPLACED_ON_SUCCESS = false     // usually not needed
 @Field int MAX_ROLLBACK_ENTRIES = 200
 
-// Per-occurrence mapping trace in the notes.
-@Field boolean TRACE_MAPPING = true
+// Per-occurrence mapping trace in the notes. The results table already carries
+// the same information per row, so this is off unless you are debugging.
+@Field boolean TRACE_MAPPING = false
 
 // =============================================================================
 //  MIGRATIONS
@@ -1563,11 +1564,20 @@ try {
 
     outp.append('MODE: ').append(MODE).append(apply ? '   *** WRITES ENABLED ***' : '   (read only)').append('\n')
     outp.append('Migrations (').append(migrations.size()).append('):\n')
+    int migIdW = 0
     for (MigrationDef d : migrations) {
-        outp.append('    ').append(d.sourceName).append('  ->  ')
-            .append(d.targetName == null ? '(static ' + d.targetType + ')' : d.targetName)
-            .append('   [id ').append(d.id).append(']\n')
+        int l = ('[' + d.id + ']').length()
+        if (l > migIdW) migIdW = l
     }
+    for (MigrationDef d : migrations) {
+        outp.append('    ')
+            .append(String.format('%-' + (migIdW + 2) + 's', '[' + d.id + ']'))
+            .append(d.sourceName).append(' (').append(shortType(d.sourceType)).append(')')
+            .append('  ->  ')
+            .append(d.targetName == null ? '(computed)' : d.targetName)
+            .append(' (').append(shortType(d.targetType)).append(')\n')
+    }
+    outp.append('\n')
     for (String r : RUN) { if (!knownIds.contains(r)) outp.append('WARNING: RUN id "').append(r).append('" is not defined\n') }
     if (!PAGE_IDS_OVERRIDE.isEmpty()) {
         outp.append('WARNING: PAGE_IDS_OVERRIDE set - database discovery is bypassed for every migration; ')
@@ -1696,26 +1706,7 @@ try {
      * which is the record of what was actually changed.
      */
     boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
-    if (RESULT_FORMAT == 'TABLE') {
-        results.append('<h3>').append(apply ? 'Result' : 'Detected')
-               .append(perMacro ? ' &mdash; one row per macro occurrence' : ' &mdash; one row per version')
-               .append('</h3>')
-        if (RESULT_SHOW_LEGEND && perMacro) results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
-        results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
-        if (perMacro) {
-            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page V.</th><th>Current</th>')
-                   .append('<th>Macro #</th>')
-            if (RESULT_SHOW_MIGRATION_COLUMN) results.append('<th>Migration</th>')
-            results.append('<th>Source</th><th>Source Type</th><th>Target</th><th>Target Type</th>')
-                   .append('<th>ac:macro-id</th><th>Status</th><th>Details</th>')
-                   .append('<th>Comments</th><th>URL</th></tr>')
-        } else {
-            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Page V.</th>')
-                   .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
-                   .append('<th>Failed</th><th>Status</th></tr>')
-        }
-        resultsTableOpen = true
-    } else if (RESULT_FORMAT == 'CSV') {
+    if (RESULT_FORMAT == 'CSV') {
         csvBody.append(perMacro
             ? 'page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
             : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
@@ -1840,7 +1831,14 @@ try {
                 vf.status = ReplacementStatus.Failed
                 vf.message = 'no space on this version (tolerated): ' + ve.getMessage()
                 RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' - ' + vf.message)
-            }
+            } finally {
+            /*
+             * finally, not straight-line code: the block above exits early with
+             * continue in several cases - notably INSPECT mode, which returns as
+             * soon as the new body is computed. Rows emitted after it were
+             * therefore never reached in a dry run. finally also runs while an
+             * exception is propagating, so the terminating version still appears.
+             */
 
             // ---- results rows for this version, emitted immediately ------
             if (RESULT_FORMAT == 'TABLE' || RESULT_FORMAT == 'CSV') {
@@ -1849,6 +1847,32 @@ try {
                     if (mm.status == ReplacementStatus.Success) rc++
                     else if (mm.status == ReplacementStatus.Skipped) skc++
                     else if (mm.status == ReplacementStatus.Failed) flc++
+                }
+                // header written lazily, with the first row - so an empty run
+                // produces no dangling table, and the header never appears
+                // before there is anything under it
+                if (RESULT_FORMAT == 'TABLE' && !resultsTableOpen && !vf.matchedMacros.isEmpty()) {
+                    results.append('<h3>').append(apply ? 'Result' : 'Detected')
+                           .append(perMacro ? ' &mdash; one row per macro occurrence'
+                                            : ' &mdash; one row per version').append('</h3>')
+                    if (RESULT_SHOW_LEGEND && perMacro) {
+                        results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
+                        results.append('<div style="height:16px"></div>')
+                    }
+                    results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
+                    if (perMacro) {
+                        results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page V.</th><th>Current</th>')
+                               .append('<th>Macro #</th>')
+                        if (RESULT_SHOW_MIGRATION_COLUMN) results.append('<th>Migration</th>')
+                        results.append('<th>Source</th><th>Source Type</th><th>Target</th><th>Target Type</th>')
+                               .append('<th>ac:macro-id</th><th>Status</th><th>Details</th>')
+                               .append('<th>Comments</th><th>URL</th></tr>')
+                    } else {
+                        results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Page V.</th>')
+                               .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
+                               .append('<th>Failed</th><th>Status</th></tr>')
+                    }
+                    resultsTableOpen = true
                 }
                 if (perMacro) {
                     for (MatchedMacro mm : vf.matchedMacros) {
@@ -1930,6 +1954,7 @@ try {
                 rollback.append('\n')
             }
             vf.bodyBefore = null; vf.bodyAfter = null      // do not accumulate bodies
+            }   // end finally
         }
         batchCount++
         if (FLUSH_AFTER_BATCH && batchCount >= BATCH_MAX_PAGES) { flushSession(); batchCount = 0 }
@@ -1951,7 +1976,7 @@ try {
     }
 
     // ---- SUMMARY ----------------------------------------------------------
-    outp.append('\n  RESULTS BY MIGRATION\n')
+    outp.append('  RESULTS BY MIGRATION\n')
     // width driven by the longest id actually present, not a fixed guess
     int idW = 'MIGRATION'.length()
     for (MigrationDef md : migrations) { if (md.id.length() > idW) idW = md.id.length() }
