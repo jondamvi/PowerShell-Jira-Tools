@@ -1031,14 +1031,34 @@ List<Long> versionContentIds(PageManager pageManager, Page page) {
 //  STAGE-2/3  TRANSFORMS - one per macro type
 // =============================================================================
 
+/*
+ * Returns null only when the parameter is ABSENT from the page and has no
+ * default. A parameter present but empty - Confluence folds a whitespace-only
+ * value into <ac:parameter ac:name="x"/> - is an explicit empty value, not a
+ * missing one, so it resolves to "" rather than falling through to a default.
+ */
 String resolveValue(MigrationDef mig, Map<String, String> onPage, String key) {
-    String v = onPage.get(key)
-    if (v != null && !v.trim().isEmpty()) return v.trim()
-    v = mig.paramDefaults.get(key)
+    if (onPage.containsKey(key)) {
+        String onPageVal = onPage.get(key)
+        if (onPageVal != null && !onPageVal.trim().isEmpty()) return onPageVal.trim()
+        return ''                       // explicitly empty on the page
+    }
+    String v = mig.paramDefaults.get(key)
     if (v != null && !v.trim().isEmpty()) return v.trim()
     v = mig.discoveredDefaults.get(key)
     if (v != null && !v.trim().isEmpty()) return v.trim()
     return null
+}
+
+/** Readable rendering of parsed parameters for error messages. */
+String describeParams(Map<String, String> params) {
+    if (params == null || params.isEmpty()) return '(none)'
+    List<String> parts = new ArrayList<String>()
+    for (Map.Entry<String, String> e : params.entrySet()) {
+        String v = e.getValue()
+        parts.add(e.getKey() + '=' + (v == null ? '(null)' : (v.isEmpty() ? '(empty)' : '"' + v + '"')))
+    }
+    return parts.join(', ')
 }
 
 String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
@@ -1046,12 +1066,13 @@ String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
         String srcVal = resolveValue(mig, mm.params, mig.sourceParam)
         if (srcVal == null) {
             throw new IllegalStateException('parameter "' + mig.sourceParam +
-                    '" not resolved; parsed from this macro: ' + mm.params)
+                    '" is absent from the page and has no declared default; parsed from this macro: ' +
+                    describeParams(mm.params))
         }
         String optionId = mig.options.get(srcVal)
         if (optionId == null) {
-            throw new IllegalStateException('value "' + srcVal + '" has no option-id in the migration ' +
-                    'options map. Known: ' + mig.options.keySet())
+            throw new IllegalStateException('value ' + (srcVal.isEmpty() ? '(empty)' : '"' + srcVal + '"') +
+                    ' has no option-id in set "' + mig.setName + '". Known values: ' + mig.options.keySet())
         }
         Map<String, String> out = new LinkedHashMap<String, String>()
         out.putAll(mig.staticParams)
@@ -1059,9 +1080,14 @@ String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
         out.put('current-option-value', srcVal)
         out.put('option-id', optionId)
         String macroId = UUID.randomUUID().toString()
-        mm.detail = mig.sourceParam + '="' + srcVal + '"' +
+        // the matched key IS the target option name, so showing it in braces
+        // makes a wrong or renamed mapping visible at a glance
+        String optionName = null
+        for (String k : mig.options.keySet()) { if (k == srcVal) optionName = k }
+        mm.detail = mig.sourceParam + '="' + srcVal + '" (' + (optionName == null ? '?' : optionName) + ')' +
                     (mm.params.containsKey(mig.sourceParam) ? '' : ' [default]') +
-                    ' -> option-id=' + optionId
+                    ' -> option-id=' + optionId + ' (' + (optionName == null ? '?' : optionName) + ')' +
+                    ' in set "' + mig.setName + '"'
         if (TRACE_MAPPING) notes.add('  ' + mm.detail + ' macro-id=' + macroId)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
@@ -1111,32 +1137,20 @@ String replaceGenericMacro(MigrationDef mig, MatchedMacro mm, List<String> notes
  * Only URLs on this instance are treated as internal; an external URL that
  * happens to contain /display/ stays a plain link.
  */
+/*
+ * ALWAYS ['link', <original url>].
+ *
+ * aura-button also supports hrefType=page/attachment with an id in href, and an
+ * earlier version derived those from the URL. That is deliberately NOT done:
+ * Atlassian's Cloud migration rewrites URLs to point at Cloud resources, but a
+ * stored page id or attachment id would keep pointing at the old DC resource
+ * and silently break after migration. Preserving the full URL keeps the link
+ * inside the machinery that fixes it.
+ */
 List<String> resolveAuraHref(String url, List<String> notes) {
     try {
-        if (url == null || url.trim().isEmpty()) return ['link', '']
-        String u = url.trim()
-
-        Matcher att = Pattern.compile('/download/attachments/(\\d+)/').matcher(u)
-        if (att.find()) return ['attachment', att.group(1)]
-
-        Matcher pid = Pattern.compile('[?&]pageId=(\\d+)').matcher(u)
-        if (pid.find()) return ['page', pid.group(1)]
-
-        boolean internal = (BASE_URL != null && !BASE_URL.isEmpty() && u.startsWith(BASE_URL)) ||
-                           u.startsWith('/')
-        if (internal) {
-            Matcher disp = Pattern.compile('/display/([^/?#]+)/([^?#]+)').matcher(u)
-            if (disp.find()) {
-                String spaceKey = URLDecoder.decode(disp.group(1), 'UTF-8')
-                String title = URLDecoder.decode(disp.group(2).replace('+', ' '), 'UTF-8')
-                if (title.endsWith('/')) title = title.substring(0, title.length() - 1)
-                Page found = ComponentLocator.getComponent(PageManager).getPage(spaceKey, title)
-                if (found != null) return ['page', found.getId() as String]
-                notes.add('  NOTE: "' + u + '" looks like a page link but "' + title +
-                          '" was not found in space ' + spaceKey + '; kept as a plain link')
-            }
-        }
-        return ['link', u]
+        if (url == null) return ['link', '']
+        return ['link', url.trim()]
     } catch (Exception e) {
         throw new RuntimeException('resolveAuraHref("' + url + '") failed: ' + e.getMessage(), e)
     }
@@ -1163,15 +1177,24 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
 
         List<String> missing = new ArrayList<String>()
         String rawHref = null
+        boolean emptyLabel = false
         for (Map.Entry<String, String> e : mig.paramMap.entrySet()) {
             String v = resolveValue(mig, mm.params, e.getKey())
-            if (v == null || v.trim().isEmpty()) { missing.add(e.getKey()); continue }
-            if (e.getValue() == 'href') rawHref = v
-            else out.put(e.getValue(), v)
+            if (v == null) { missing.add(e.getKey()); continue }
+            if (e.getValue() == 'href') {
+                // an empty href would produce a button that links nowhere
+                if (v.trim().isEmpty()) { missing.add(e.getKey()); continue }
+                rawHref = v
+            } else {
+                // an empty label is legitimate - a whitespace-only button text
+                // is stored as <ac:parameter ac:name="buttontext"/>
+                if (e.getValue() == 'label' && v.isEmpty()) emptyLabel = true
+                out.put(e.getValue(), v)
+            }
         }
         if (!missing.isEmpty()) {
-            throw new IllegalStateException('parameter(s) ' + missing + ' could not be resolved ' +
-                    'from the page or from declared defaults; parsed from this macro: ' + mm.params)
+            throw new IllegalStateException('parameter(s) ' + missing + ' are absent from the page ' +
+                    'and have no declared default; parsed from this macro: ' + describeParams(mm.params))
         }
 
         // hrefType is derived per instance and must NOT come from staticParams:
@@ -1183,7 +1206,7 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
 
         String macroId = UUID.randomUUID().toString()
         mm.detail = 'hrefType=' + resolved.get(0) + ' href=' + resolved.get(1) +
-                    ' label="' + out.get('label') + '"'
+                    ' label="' + out.get('label') + '"' + (emptyLabel ? ' (empty label preserved)' : '')
         if (TRACE_MAPPING) notes.add('  aura-button ' + mm.detail + ' macro-id=' + macroId)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
@@ -1408,6 +1431,21 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
         pm.saveContentEntity(hist, new DefaultSaveContext(true, false, HISTORICAL_SUPPRESS_EVENTS))
     } catch (Exception e) {
         throw new RuntimeException('writeHistoricalVersion failed: ' + e.getMessage(), e)
+    }
+}
+
+/** What to show in the Target column: the EDD set, or the target macro name. */
+String targetLabelFor(Map<String, MigrationDef> byId, MatchedMacro mm) {
+    try {
+        MigrationDef md = byId.get(mm.migrationId)
+        if (md != null && md.targetType == MacroType.EddStatusMacro &&
+            md.setName != null && !md.setName.trim().isEmpty()) {
+            return md.setName
+        }
+        if (mm.targetName == null || mm.targetName.trim().isEmpty()) return '(static)'
+        return mm.targetName
+    } catch (Exception e) {
+        throw new RuntimeException('targetLabelFor failed: ' + e.getMessage(), e)
     }
 }
 
@@ -1733,8 +1771,10 @@ try {
                    .append(apply ? '' : ' In INSPECT mode nothing is written; "Would replace" means it would be.')
                    .append('</p>')
             results.append('<tr><th>Page ID</th><th>Page Name</th><th>Version</th><th>Cur</th>')
-                   .append('<th>Macro #</th><th>Migration</th><th>Source macro</th><th>Target</th>')
-                   .append('<th>ac:macro-id</th><th>Status</th><th>Detail / reason</th><th>URL</th></tr>')
+                   .append('<th>Macro #</th><th>Migration</th><th>Source</th><th>SourceType</th>')
+                   .append('<th>Target</th><th>TargetType</th>')
+                   .append('<th>ac:macro-id</th><th>Status</th><th>Detail / reason</th>')
+                   .append('<th>Comments</th><th>URL</th></tr>')
             for (PageFinding pf : findings) {
                 for (VersionFinding vf : pf.versions) {
                     for (MatchedMacro mm : vf.matchedMacros) {
@@ -1749,13 +1789,18 @@ try {
                                .append('</td><td>').append(mm.macroIndex)
                                .append('</td><td>').append(htmlEsc(mm.migrationId))
                                .append('</td><td>').append(htmlEsc(mm.sourceName))
-                               .append('</td><td>').append(htmlEsc(mm.targetName == null ? '(static)' : mm.targetName))
+                               .append('</td><td>').append(mm.sourceType)
+                               // for EasyDropDown the macro name is the same for every
+                               // set, so the SET is what identifies the target
+                               .append('</td><td>').append(htmlEsc(targetLabelFor(byId, mm)))
+                               .append('</td><td>').append(mm.targetType)
                                .append('</td><td>').append(htmlEsc(mm.macroId))
                                .append('</td><td>').append(
                                        (!apply && mm.status == ReplacementStatus.Success)
                                                ? 'Would replace' : (mm.status as String))
                                .append('</td><td>').append(htmlEsc(why))
-                               .append('</td><td><a href="').append(pf.url).append('" target="_blank">open</a></td></tr>')
+                               .append('</td><td></td>')      // Comments - left empty for your notes
+                               .append('<td><a href="').append(pf.url).append('" target="_blank">open</a></td></tr>')
                     }
                 }
             }
@@ -1789,7 +1834,7 @@ try {
         Set<String> seenUrls = new LinkedHashSet<String>()
         if (RESULT_FORMAT == 'CSV') {
             t.append(perMacro
-                ? 'page_id,page_name,page_url,version,current,macro_index,migration,source_macro,target_macro,macro_id,status,detail\n'
+                ? 'page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
                 : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
         }
         for (PageFinding pf : findings) {
@@ -1801,8 +1846,9 @@ try {
                         List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
                                                vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
                                                mm.macroIndex as String, mm.migrationId, mm.sourceName,
-                                               mm.targetName == null ? '(static)' : mm.targetName,
-                                               mm.macroId, mm.status as String, why]
+                                               mm.sourceType as String, targetLabelFor(byId, mm),
+                                               mm.targetType as String,
+                                               mm.macroId, mm.status as String, why, '']
                         List<String> q = new ArrayList<String>()
                         for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
                         t.append(q.join(',')).append('\n')
