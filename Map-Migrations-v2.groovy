@@ -97,8 +97,11 @@ final Map<String, String> AURA_STYLE = [
         'size'        : 'medium',
         'background'  : '#b0e572',
         'iconPosition': 'left',
-        'hrefTarget'  : '_blank',
+        'hrefTarget'  : '_blank',   // _blank opens the link in a new tab
         'alignment'   : 'left',
+        // hrefType is deliberately absent: the engine derives it per instance
+        // as link / page / attachment from the source URL, and rewrites href
+        // to a page id or attachment id for the latter two.
 ]
 
 // Source parameter names recognised as the URL and the button text, tried in
@@ -647,7 +650,18 @@ try {
                     }
                 }
             }
-            if (!unmappable.isEmpty()) {
+            // A target with NO parameters cannot receive a mapping at all, so a
+            // paramMap scaffold there is not something to fill in - it would write
+            // a parameter literally named TARGET-PARAM-NAME. Emit none.
+            boolean targetTakesNoParams = (tgtParams != null && tgtParams.isEmpty())
+            if (targetTakesNoParams) {
+                unmappable.clear()
+                if (srcParams != null && !srcParams.isEmpty()) {
+                    detail.append('  target declares no parameters - the source parameters ')
+                          .append(srcParams.collect { ParamInfo pi -> pi.name })
+                          .append(' are dropped (dropUnmapped: true)\n')
+                }
+            } else if (!unmappable.isEmpty()) {
                 detail.append('  source parameters with no same-named target parameter: ')
                       .append(unmappable).append('\n')
                 detail.append('  -> they are DROPPED unless you add paramMap entries (dropUnmapped defaults to true)\n')
@@ -667,21 +681,24 @@ try {
 
             cfg.append(pfx2).append('    [\n')
             cfg.append(pfx2).append("        id     : '").append(migId).append("',\n")
+            // sourceParam is only read by EddStatusMacro and AuraLinkButton targets;
+            // for a plain macro-to-macro swap it is noise.
             cfg.append(pfx2).append("        source : [name: '").append(srcMacro)
-               .append("', type: MacroType.").append(srcType)
-            if (srcParam != null && srcParams != null && !srcParams.isEmpty()) {
-                cfg.append(", sourceParam: '").append(srcParam).append("'")
-            }
-            cfg.append('],\n')
+               .append("', type: MacroType.").append(srcType).append('],\n')
             cfg.append(pfx2).append("        target : [name: '").append(tgtMacro)
                .append("', type: MacroType.").append(tgtType)
             if (!unmappable.isEmpty()) {
-                cfg.append(",\n").append(pfx2).append('                  // parameters below have no same-named target parameter\n')
+                cfg.append(",\n").append(pfx2).append('                  // FILL IN: these source parameters have no same-named\n')
+                cfg.append(pfx2).append('                  // target parameter. Replace TARGET-PARAM-NAME, or delete the\n')
+                cfg.append(pfx2).append('                  // entry to drop that parameter.\n')
                 cfg.append(pfx2).append('                  paramMap: [')
                 List<String> parts = new ArrayList<String>()
                 for (String u : unmappable) parts.add("'" + u + "': 'TARGET-PARAM-NAME'")
                 cfg.append(parts.join(', ')).append('],\n')
                 cfg.append(pfx2).append('                  dropUnmapped: true')
+            } else if (targetTakesNoParams) {
+                cfg.append(",\n").append(pfx2)
+                   .append('                  dropUnmapped: true   // target takes no parameters')
             }
             cfg.append('],\n')
             cfg.append(pfx2).append('    ],\n')
