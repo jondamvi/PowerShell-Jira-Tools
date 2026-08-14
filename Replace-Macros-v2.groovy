@@ -95,29 +95,31 @@ enum ReplacementStatus {
 @Field List<Long> PAGE_IDS_OVERRIDE = []
 @Field List<String> INCLUDE_STATUSES = ['current']
 
-@Field boolean UPDATE_HISTORICAL_VERSIONS = true
-
 /*
- * true  -> current version saved with saveNewVersion(): page history gives you
- *          an undo, version count grows by one
- * false -> saved in place, no new version
+ * Supported configurations of page updates:
  *
- * INTERACTION WITH UPDATE_HISTORICAL_VERSIONS - four combinations:
- *   false / true   every version rewritten in place. Version count unchanged.
- *                  No rollback except this script's printed copies.
- *   false / false  only the current version, in place. History untouched.
- *   true  / false  current version replaced by a NEW version; the pre-change
- *                  body is preserved as history and still contains the macro.
- *                  This is the audit-trail mode.
- *   true  / true   NEEDS TWO PASSES. saveNewVersion copies the pre-change body
- *                  into a NEW historical row during Stage-3, after Stage-1 has
- *                  already frozen the findings - so that row is never scanned
- *                  and keeps its macro. Re-running cleans it (the current
- *                  version then has no matches, so no further row is created).
+ * 1. Create a new page version with updated content. Current version and
+ *    version history left intact.
+ *        UPDATE_HISTORICAL_VERSIONS  = false
+ *        CURRENT_CREATES_NEW_VERSION = true
+ *
+ * 2. In-place update of the current version. Version history left intact.
+ *    No new version created.
+ *        UPDATE_HISTORICAL_VERSIONS  = false
+ *        CURRENT_CREATES_NEW_VERSION = false
+ *
+ * 3. In-place update of the current version and every previous version.
+ *    No new version created.
+ *        UPDATE_HISTORICAL_VERSIONS  = true
+ *        CURRENT_CREATES_NEW_VERSION = false
+ *
+ * Both true is NOT supported and terminates the run: saveNewVersion copies each
+ * pre-change body into a new historical row during Stage-3, after Stage-1 has
+ * frozen the findings, so that row would keep its macro and never be cleaned.
  */
-@Field boolean CURRENT_CREATES_NEW_VERSION = true
+@Field boolean UPDATE_HISTORICAL_VERSIONS = true
+@Field boolean CURRENT_CREATES_NEW_VERSION = false
 
-// Historical rows are never indexed by Confluence, so events are suppressed.
 @Field boolean HISTORICAL_SUPPRESS_EVENTS = true
 
 @Field boolean VERIFY_AFTER_WRITE = true
@@ -150,6 +152,13 @@ enum ReplacementStatus {
  * VERSION - one row per page version. Compact, for very large runs.
  */
 @Field String RESULT_GRANULARITY = 'MACRO'
+
+// The Migration column duplicates the source macro name whenever migration ids
+// are named after their source macro, which is the usual case.
+@Field boolean RESULT_SHOW_MIGRATION_COLUMN = false
+
+// Legend table above the results, explaining columns and abbreviations.
+@Field boolean RESULT_SHOW_LEGEND = true
 
 // Rollback copies. Compressed output is deflate + Base64; Base64 is required
 // because the console returns a String and raw deflate bytes are not valid text.
@@ -1434,6 +1443,72 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
     }
 }
 
+/*
+ * The ONLY error class that does not terminate the run.
+ *
+ * Some page versions have no space row, and Confluence's own save path
+ * dereferences the space, so the NPE comes from inside the product rather than
+ * from this script. That version is recorded as failed and the run continues.
+ * Every other exception is unexpected and terminates immediately - discovering
+ * a systematic fault on the last iteration of a long run is worse than failing
+ * on the first.
+ */
+boolean isTolerableError(Throwable t) {
+    Throwable c = t
+    while (c != null) {
+        if (c instanceof NullPointerException) {
+            String m = c.getMessage() == null ? '' : c.getMessage()
+            if (m.contains('confluence.spaces.Space') || m.contains('getSpace()')) return true
+        }
+        c = c.getCause()
+    }
+    return false
+}
+
+/** Compact type label for the results table. */
+String shortType(MacroType t) {
+    if (t == null) return '-'
+    if (t == MacroType.ScriptRunnerMacro) return 'SR'
+    if (t == MacroType.UserMacro) return 'UM'
+    if (t == MacroType.EddStatusMacro) return 'EDD'
+    if (t == MacroType.AuraLinkButton) return 'AB'
+    if (t == MacroType.Static_QualificationTable) return 'Static'
+    return t as String
+}
+
+/** Column and abbreviation legend, printed once above the results. */
+String legendHtml(boolean showMigration, boolean apply) {
+    StringBuilder b = new StringBuilder()
+    b.append('<h3>Legend</h3>')
+    b.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
+    b.append('<tr><th>Column</th><th>Meaning</th></tr>')
+    b.append('<tr><td>Page ID</td><td>id of the current page; repeats across its versions and macros</td></tr>')
+    b.append('<tr><td>Page V.</td><td>version number of the page version this macro sits in</td></tr>')
+    b.append('<tr><td>Current</td><td>yes = this is the current version, - = a historical version</td></tr>')
+    b.append('<tr><td>Macro #</td><td>position of this macro among ALL macros in that version body, ')
+     .append('containers included, in document order - pins the occurrence even when several share ')
+     .append('an ac:macro-id</td></tr>')
+    if (showMigration) b.append('<tr><td>Migration</td><td>id of the migration entry that matched</td></tr>')
+    b.append('<tr><td>Source / Target</td><td>macro being replaced and what replaces it. For ')
+     .append('EasyDropDown the Target shows the SET name, since the macro name is the same for every set</td></tr>')
+    b.append('<tr><td>Details</td><td>what the replacement did, or why it was skipped or failed</td></tr>')
+    b.append('<tr><td>Comments</td><td>left empty for your own notes</td></tr>')
+    b.append('<tr><th>Type</th><th>Meaning</th></tr>')
+    b.append('<tr><td>UM</td><td>UserMacro</td></tr>')
+    b.append('<tr><td>SR</td><td>ScriptRunnerMacro</td></tr>')
+    b.append('<tr><td>EDD</td><td>EddStatusMacro</td></tr>')
+    b.append('<tr><td>AB</td><td>AuraLinkButton</td></tr>')
+    b.append('<tr><td>Static</td><td>Static_QualificationTable - computed storage, not a macro</td></tr>')
+    b.append('<tr><th>Status</th><th>Meaning</th></tr>')
+    b.append(apply
+            ? '<tr><td>Success</td><td>replaced and written</td></tr>'
+            : '<tr><td>Would replace</td><td>INSPECT mode - nothing was written</td></tr>')
+    b.append('<tr><td>Skipped</td><td>left untouched on purpose; Details gives the reason</td></tr>')
+    b.append('<tr><td>Failed</td><td>could not be replaced or the write did not persist</td></tr>')
+    b.append('</table>')
+    return b.toString()
+}
+
 /** What to show in the Target column: the EDD set, or the target macro name. */
 String targetLabelFor(Map<String, MigrationDef> byId, MatchedMacro mm) {
     try {
@@ -1457,6 +1532,11 @@ long runStart = System.currentTimeMillis()
 StringBuilder outp = new StringBuilder()
 StringBuilder rollback = new StringBuilder()
 StringBuilder results = new StringBuilder()
+// Declared out here so the fatal handler can close and emit whatever the run
+// produced before it stopped: partial results are the record of what completed.
+StringBuilder csvBody = new StringBuilder()
+boolean resultsTableOpen = false
+int resultRowCount = 0
 
 try {
     if (MODE != 'INSPECT' && MODE != 'APPLY') throw new IllegalStateException('MODE must be INSPECT or APPLY')
@@ -1494,12 +1574,12 @@ try {
             .append(PAGE_IDS_OVERRIDE.size()).append(' page(s) will be examined\n')
     }
     if (CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
-        outp.append('WARNING: CURRENT_CREATES_NEW_VERSION and UPDATE_HISTORICAL_VERSIONS are BOTH true.\n')
-            .append('         saveNewVersion copies each pre-change body into a new historical row\n')
-            .append('         during Stage-3, after Stage-1 froze the findings - so that row keeps\n')
-            .append('         its macro and is not cleaned by this run. Either set\n')
-            .append('         CURRENT_CREATES_NEW_VERSION=false to rewrite every version in place,\n')
-            .append('         or run this script a SECOND time to clean the rows it creates.\n')
+        throw new IllegalStateException(
+                'Unsupported configuration: CURRENT_CREATES_NEW_VERSION and ' +
+                'UPDATE_HISTORICAL_VERSIONS are both true. saveNewVersion copies each ' +
+                'pre-change body into a NEW historical row during Stage-3, after Stage-1 ' +
+                'froze the findings, so that row would keep its macro and never be cleaned. ' +
+                'Use one of the three supported combinations documented at the config block.')
     }
     if (!SPACE_KEYS.isEmpty()) {
         outp.append('Spaces (').append(SPACE_KEYS.size()).append('):\n')
@@ -1609,6 +1689,38 @@ try {
     outp.append('  planned: ').append(totalOcc).append(' occurrence(s)\n\n')
 
     // ---- STAGE 3 ----------------------------------------------------------
+    /*
+     * The results table is opened BEFORE Stage-3 and rows are appended as each
+     * version completes, rather than being built from findings afterwards. A
+     * run that terminates part way then still shows every version it finished,
+     * which is the record of what was actually changed.
+     */
+    boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
+    if (RESULT_FORMAT == 'TABLE') {
+        results.append('<h3>').append(apply ? 'Result' : 'Detected')
+               .append(perMacro ? ' &mdash; one row per macro occurrence' : ' &mdash; one row per version')
+               .append('</h3>')
+        if (RESULT_SHOW_LEGEND && perMacro) results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
+        results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
+        if (perMacro) {
+            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page V.</th><th>Current</th>')
+                   .append('<th>Macro #</th>')
+            if (RESULT_SHOW_MIGRATION_COLUMN) results.append('<th>Migration</th>')
+            results.append('<th>Source</th><th>Source Type</th><th>Target</th><th>Target Type</th>')
+                   .append('<th>ac:macro-id</th><th>Status</th><th>Details</th>')
+                   .append('<th>Comments</th><th>URL</th></tr>')
+        } else {
+            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Page V.</th>')
+                   .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
+                   .append('<th>Failed</th><th>Status</th></tr>')
+        }
+        resultsTableOpen = true
+    } else if (RESULT_FORMAT == 'CSV') {
+        csvBody.append(perMacro
+            ? 'page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
+            : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
+    }
+
     outp.append('STAGE-3  ').append(apply ? 'EXECUTE' : 'DRY RUN').append('\n')
     outp.append('----------------------------------------------------------------\n')
     List<String> notes = new ArrayList<String>()
@@ -1649,6 +1761,7 @@ try {
 
                 // ---- write, with retry on stale entity -------------------
                 String werr = null
+                Exception lastWriteEx = null
                 int attempt = 0
                 String bodyToWrite = after
                 while (true) {
@@ -1665,6 +1778,7 @@ try {
                         werr = null
                         break
                     } catch (Exception we) {
+                        lastWriteEx = we
                         String cn = we.getClass().getName()
                         String msg = we.getMessage() == null ? '' : we.getMessage()
                         boolean stale = cn.contains('OptimisticLocking') || cn.contains('StaleObject') ||
@@ -1680,6 +1794,11 @@ try {
                     }
                 }
 
+                if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
+                    throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
+                            ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retr(y/ies): ' +
+                            werr, lastWriteEx)
+                }
                 if (werr != null) {
                     vf.status = ReplacementStatus.Failed
                     vf.message = werr
@@ -1714,9 +1833,84 @@ try {
                 }
                 vf.bodyBefore = before; vf.bodyAfter = after
             } catch (Exception ve) {
+                if (!isTolerableError(ve)) {
+                    throw new RuntimeException('page ' + pf.pageId + ' (' + pf.url + ') v' +
+                            vf.versionNumber + ' contentid ' + vf.contentId + ': ' + ve.getMessage(), ve)
+                }
                 vf.status = ReplacementStatus.Failed
-                vf.message = ve.getClass().getSimpleName() + ': ' + ve.getMessage()
+                vf.message = 'no space on this version (tolerated): ' + ve.getMessage()
                 RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' - ' + vf.message)
+            }
+
+            // ---- results rows for this version, emitted immediately ------
+            if (RESULT_FORMAT == 'TABLE' || RESULT_FORMAT == 'CSV') {
+                int rc = 0, skc = 0, flc = 0
+                for (MatchedMacro mm : vf.matchedMacros) {
+                    if (mm.status == ReplacementStatus.Success) rc++
+                    else if (mm.status == ReplacementStatus.Skipped) skc++
+                    else if (mm.status == ReplacementStatus.Failed) flc++
+                }
+                if (perMacro) {
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
+                        String shownStatus = (!apply && mm.status == ReplacementStatus.Success)
+                                ? 'Would replace' : (mm.status as String)
+                        resultRowCount++
+                        if (RESULT_FORMAT == 'TABLE') {
+                            String colour = (mm.status == ReplacementStatus.Success) ? ''
+                                    : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
+                                                                              : ' style="background:#ffecec"')
+                            results.append('<tr').append(colour).append('><td>').append(pf.pageId)
+                                   .append('</td><td>').append(htmlEsc(pf.pageName))
+                                   .append('</td><td>').append(vf.versionNumber)
+                                   .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                                   .append('</td><td>').append(mm.macroIndex).append('</td>')
+                            if (RESULT_SHOW_MIGRATION_COLUMN) {
+                                results.append('<td>').append(htmlEsc(mm.migrationId)).append('</td>')
+                            }
+                            results.append('<td>').append(htmlEsc(mm.sourceName))
+                                   .append('</td><td>').append(shortType(mm.sourceType))
+                                   .append('</td><td>').append(htmlEsc(targetLabelFor(byId, mm)))
+                                   .append('</td><td>').append(shortType(mm.targetType))
+                                   .append('</td><td>').append(htmlEsc(mm.macroId))
+                                   .append('</td><td>').append(shownStatus)
+                                   .append('</td><td>').append(htmlEsc(why))
+                                   .append('</td><td></td>')
+                                   .append('<td><a href="').append(pf.url)
+                                   .append('" target="_blank">open</a></td></tr>')
+                        } else {
+                            List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                                                   vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
+                                                   mm.macroIndex as String, mm.migrationId, mm.sourceName,
+                                                   shortType(mm.sourceType), targetLabelFor(byId, mm),
+                                                   shortType(mm.targetType), mm.macroId, shownStatus, why, '']
+                            List<String> q = new ArrayList<String>()
+                            for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                            csvBody.append(q.join(',')).append('\n')
+                        }
+                    }
+                } else {
+                    resultRowCount++
+                    if (RESULT_FORMAT == 'TABLE') {
+                        results.append('<tr><td>').append(pf.pageId)
+                               .append('</td><td>').append(htmlEsc(pf.pageName))
+                               .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
+                               .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
+                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                               .append('</td><td>').append(vf.matchedMacros.size())
+                               .append('</td><td>').append(rc).append('</td><td>').append(skc)
+                               .append('</td><td>').append(flc)
+                               .append('</td><td>').append(vf.status).append('</td></tr>')
+                    } else {
+                        List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                                               vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
+                                               vf.matchedMacros.size() as String, rc as String,
+                                               skc as String, flc as String, vf.status as String]
+                        List<String> q = new ArrayList<String>()
+                        for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                        csvBody.append(q.join(',')).append('\n')
+                    }
+                }
             }
 
             // ---- rollback copies, emitted per version then dropped ------
@@ -1742,137 +1936,18 @@ try {
     }
     if (FLUSH_AFTER_BATCH && batchCount > 0) flushSession()
 
-    // ---- RESULTS LISTING ---------------------------------------------------
-    // Built HERE, immediately after Stage-3, not at the end: everything below
-    // (summary, trace, rollback copies) can fail or run to megabytes, and the
-    // table is the one thing that must always survive. The fatal handler emits
-    // whatever has been built by the time it fires.
-    /*
-     * Three levels, because one row per version answers nothing when a single
-     * version carries seventeen occurrences from twenty migrations:
-     *   1. per migration  - which macro, how many found / replaced / skipped
-     *   2. per occurrence - one row per macro instance, grouped by migration,
-     *                       carrying its macro-id, its parameters and, when it
-     *                       was not replaced, the reason
-     *   3. per version    - the aggregate that decides whether a write happened
-     */
-    boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
-
-    if (RESULT_FORMAT == 'TABLE') {
-        results.append('<h3>').append(apply ? 'Result' : 'Detected')
-               .append(perMacro ? ' &mdash; one row per macro occurrence' : ' &mdash; one row per version')
-               .append('</h3>')
-        results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
-        if (perMacro) {
-            results.append('<p style="font-size:90%">')
-                   .append('<b>Macro #</b> is the position of this macro among <i>all</i> macros in that ')
-                   .append('version body, containers included, counted in document order - it pins the ')
-                   .append('occurrence even when several share an ac:macro-id.')
-                   .append(apply ? '' : ' In INSPECT mode nothing is written; "Would replace" means it would be.')
-                   .append('</p>')
-            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Version</th><th>Cur</th>')
-                   .append('<th>Macro #</th><th>Migration</th><th>Source</th><th>SourceType</th>')
-                   .append('<th>Target</th><th>TargetType</th>')
-                   .append('<th>ac:macro-id</th><th>Status</th><th>Detail / reason</th>')
-                   .append('<th>Comments</th><th>URL</th></tr>')
-            for (PageFinding pf : findings) {
-                for (VersionFinding vf : pf.versions) {
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
-                        String colour = (mm.status == ReplacementStatus.Success) ? ''
-                                : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
-                                                                          : ' style="background:#ffecec"')
-                        results.append('<tr').append(colour).append('><td>').append(pf.pageId)
-                               .append('</td><td>').append(htmlEsc(pf.pageName))
-                               .append('</td><td>').append(vf.versionNumber)
-                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
-                               .append('</td><td>').append(mm.macroIndex)
-                               .append('</td><td>').append(htmlEsc(mm.migrationId))
-                               .append('</td><td>').append(htmlEsc(mm.sourceName))
-                               .append('</td><td>').append(mm.sourceType)
-                               // for EasyDropDown the macro name is the same for every
-                               // set, so the SET is what identifies the target
-                               .append('</td><td>').append(htmlEsc(targetLabelFor(byId, mm)))
-                               .append('</td><td>').append(mm.targetType)
-                               .append('</td><td>').append(htmlEsc(mm.macroId))
-                               .append('</td><td>').append(
-                                       (!apply && mm.status == ReplacementStatus.Success)
-                                               ? 'Would replace' : (mm.status as String))
-                               .append('</td><td>').append(htmlEsc(why))
-                               .append('</td><td></td>')      // Comments - left empty for your notes
-                               .append('<td><a href="').append(pf.url).append('" target="_blank">open</a></td></tr>')
-                    }
-                }
-            }
-        } else {
-            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Version</th><th>Current</th>')
-                   .append('<th>Occurrences</th><th>Replaced</th><th>Skipped</th><th>Failed</th><th>Status</th></tr>')
-            for (PageFinding pf : findings) {
-                for (VersionFinding vf : pf.versions) {
-                    int r = 0, sk = 0, fl = 0
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        if (mm.status == ReplacementStatus.Success) r++
-                        else if (mm.status == ReplacementStatus.Skipped) sk++
-                        else if (mm.status == ReplacementStatus.Failed) fl++
-                    }
-                    results.append('<tr><td>').append(pf.pageId)
-                           .append('</td><td>').append(htmlEsc(pf.pageName))
-                           .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
-                           .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
-                           .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
-                           .append('</td><td>').append(vf.matchedMacros.size())
-                           .append('</td><td>').append(r).append('</td><td>').append(sk)
-                           .append('</td><td>').append(fl)
-                           .append('</td><td>').append(vf.status).append('</td></tr>')
-                }
-            }
-        }
-        results.append('</table>')
-
-    } else if (RESULT_FORMAT == 'CSV' || RESULT_FORMAT == 'LIST') {
-        StringBuilder t = new StringBuilder()
+    // ---- close the results output -------------------------------------------
+    if (resultsTableOpen) { results.append('</table>'); resultsTableOpen = false }
+    if (RESULT_FORMAT == 'CSV') {
+        results.append('<h3>CSV (').append(resultRowCount).append(' rows)</h3><pre>')
+               .append(htmlEsc(csvBody.toString())).append('</pre>')
+    } else if (RESULT_FORMAT == 'LIST') {
+        StringBuilder urls = new StringBuilder()
         Set<String> seenUrls = new LinkedHashSet<String>()
-        if (RESULT_FORMAT == 'CSV') {
-            t.append(perMacro
-                ? 'page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
-                : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
-        }
-        for (PageFinding pf : findings) {
-            if (RESULT_FORMAT == 'LIST') { seenUrls.add(pf.url); continue }
-            for (VersionFinding vf : pf.versions) {
-                if (perMacro) {
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
-                        List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
-                                               vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
-                                               mm.macroIndex as String, mm.migrationId, mm.sourceName,
-                                               mm.sourceType as String, targetLabelFor(byId, mm),
-                                               mm.targetType as String,
-                                               mm.macroId, mm.status as String, why, '']
-                        List<String> q = new ArrayList<String>()
-                        for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-                        t.append(q.join(',')).append('\n')
-                    }
-                } else {
-                    int r = 0, sk = 0, fl = 0
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        if (mm.status == ReplacementStatus.Success) r++
-                        else if (mm.status == ReplacementStatus.Skipped) sk++
-                        else if (mm.status == ReplacementStatus.Failed) fl++
-                    }
-                    List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
-                                           vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
-                                           vf.matchedMacros.size() as String, r as String,
-                                           sk as String, fl as String, vf.status as String]
-                    List<String> q = new ArrayList<String>()
-                    for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-                    t.append(q.join(',')).append('\n')
-                }
-            }
-        }
-        for (String u : seenUrls) t.append(u).append('\n')
-        results.append('<h3>').append(RESULT_FORMAT).append('</h3><pre>')
-               .append(htmlEsc(t.toString())).append('</pre>')
+        for (PageFinding pf : findings) seenUrls.add(pf.url)
+        for (String u : seenUrls) urls.append(u).append('\n')
+        results.append('<h3>').append(seenUrls.size()).append(' page URLs</h3><pre>')
+               .append(htmlEsc(urls.toString())).append('</pre>')
     }
 
     // ---- SUMMARY ----------------------------------------------------------
@@ -1886,22 +1961,6 @@ try {
         outp.append(String.format(rowFmt, md.id,
                 md.occFound as String, md.occReplaced as String,
                 md.occSkipped as String, md.occFailed as String))
-    }
-
-    if (apply && CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
-        int newRows = 0
-        for (PageFinding pf : findings) {
-            for (VersionFinding vf : pf.versions) {
-                if (vf.isCurrent && vf.status == ReplacementStatus.Success) newRows++
-            }
-        }
-        if (newRows > 0) {
-            outp.append('\n  SECOND PASS REQUIRED: ').append(newRows)
-                .append(' page(s) had their current version rewritten with saveNewVersion,\n')
-                .append('  which created ').append(newRows)
-                .append(' new historical row(s) still containing the source macro.\n')
-                .append('  Re-run this script with the same settings to clean them.\n')
-        }
     }
 
     List<String> failedVersions = new ArrayList<String>()
@@ -1948,9 +2007,22 @@ try {
 
 } catch (Throwable fatal) {
     log.error('Macro engine v2 terminated', fatal)
+
+    // Close and label whatever the run produced before it stopped - those rows
+    // are the record of what actually completed, and are worth keeping.
+    if (resultsTableOpen) {
+        results.append('</table>')
+        results.append('<p><b>PARTIAL RESULTS</b> - the run terminated after ')
+               .append(resultRowCount).append(' row(s). Everything above completed; ')
+               .append('anything not listed was never reached.</p>')
+    }
+    if (RESULT_FORMAT == 'CSV' && csvBody.length() > 0) {
+        results.append('<h3>CSV - PARTIAL (').append(resultRowCount).append(' rows)</h3><pre>')
+               .append(csvBody.toString().replace('&', '&amp;').replace('<', '&lt;')).append('</pre>')
+    }
+
     StringBuilder err = new StringBuilder()
     err.append(outp)
-    // results, if any were built before the failure, are appended after this block
     err.append('\n================================================================\n')
     err.append('RUN TERMINATED\n')
     err.append(fatal.getClass().getName()).append(': ').append(fatal.getMessage()).append('\n')
