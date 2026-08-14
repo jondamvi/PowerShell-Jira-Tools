@@ -134,6 +134,10 @@ enum ReplacementStatus {
 // Stage-0: also require target option ORDER to match the source enum order.
 @Field boolean VALIDATE_OPTION_ORDER = true
 
+// false -> Stage-0 prints only validation ISSUES. true -> also prints the full
+// per-migration parameter and option tables, useful when building a config.
+@Field boolean VALIDATION_SHOW_DETAIL = false
+
 // Results listing: TABLE | CSV | LIST | NONE
 @Field String RESULT_FORMAT = 'TABLE'
 
@@ -1312,10 +1316,11 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
             MatchedMacro mm = queue.remove(0)
 
             String replacement
+            // Declared OUTSIDE the try: it is read again after the catch, and a
+            // variable declared inside a try block is not in scope after it.
+            MatchedMacro fresh = new MatchedMacro()
             try {
                 // parameters as they are NOW, not as scanned in Stage-1
-                MatchedMacro fresh = new MatchedMacro()
-                // scoped to this occurrence so its own parameter values are used
                 fresh.migrationId = mm.migrationId; fresh.sourceName = sp.name; fresh.macroId = sp.macroId
                 fresh.sourceType = mm.sourceType;   fresh.targetType = mm.targetType
                 fresh.targetName = mm.targetName
@@ -1439,7 +1444,12 @@ try {
     if (migrations.isEmpty()) throw new IllegalStateException('RUN matched no migration ids. Known: ' + knownIds)
 
     outp.append('MODE: ').append(MODE).append(apply ? '   *** WRITES ENABLED ***' : '   (read only)').append('\n')
-    outp.append('Migrations: ').append(migrations.collect { MigrationDef d -> d.id }.join(', ')).append('\n')
+    outp.append('Migrations (').append(migrations.size()).append('):\n')
+    for (MigrationDef d : migrations) {
+        outp.append('    ').append(d.sourceName).append('  ->  ')
+            .append(d.targetName == null ? '(static ' + d.targetType + ')' : d.targetName)
+            .append('   [id ').append(d.id).append(']\n')
+    }
     for (String r : RUN) { if (!knownIds.contains(r)) outp.append('WARNING: RUN id "').append(r).append('" is not defined\n') }
     if (!PAGE_IDS_OVERRIDE.isEmpty()) {
         outp.append('WARNING: PAGE_IDS_OVERRIDE set - database discovery is bypassed for every migration; ')
@@ -1453,7 +1463,10 @@ try {
             .append('         CURRENT_CREATES_NEW_VERSION=false to rewrite every version in place,\n')
             .append('         or run this script a SECOND time to clean the rows it creates.\n')
     }
-    if (!SPACE_KEYS.isEmpty()) outp.append('Spaces: ').append(SPACE_KEYS.join(', ')).append('\n')
+    if (!SPACE_KEYS.isEmpty()) {
+        outp.append('Spaces (').append(SPACE_KEYS.size()).append('):\n')
+        for (String sk : SPACE_KEYS) outp.append('    ').append(sk).append('\n')
+    }
     outp.append('History: ').append(UPDATE_HISTORICAL_VERSIONS ? 'included' : 'skipped')
         .append('   Batch: ').append(FLUSH_AFTER_BATCH ? BATCH_MAX_PAGES + ' pages' : 'no flushing').append('\n')
     outp.append('================================================================\n\n')
@@ -1465,7 +1478,7 @@ try {
     issues.addAll(validateScope(spaceManager, pageManager))
     for (MigrationDef md : migrations) issues.addAll(validateMigration(md, valDetail))
 
-    if (valDetail.length() > 0) outp.append(valDetail).append('\n')
+    if (VALIDATION_SHOW_DETAIL && valDetail.length() > 0) outp.append(valDetail).append('\n')
     if (!issues.isEmpty()) {
         outp.append(String.format('  %-22s %-34s %-34s %s%n', 'MIGRATION', 'SOURCE', 'TARGET', 'ISSUE'))
         for (ValidationIssue vi : issues) {
@@ -1475,7 +1488,11 @@ try {
         outp.append('\n  ').append(issues.size()).append(' validation issue(s). Nothing was read or written.\n')
         return '<pre>' + htmlEsc(outp.toString()) + '</pre>'
     }
-    outp.append('  passed\n\n')
+    outp.append('  passed (').append(migrations.size()).append(' migration(s) validated)\n')
+    if (!VALIDATION_SHOW_DETAIL) {
+        outp.append('  set VALIDATION_SHOW_DETAIL = true to see the parameter and option tables\n')
+    }
+    outp.append('\n')
 
     // ---- STAGE 1 ----------------------------------------------------------
     Map<String, MigrationDef> bySource = new LinkedHashMap<String, MigrationDef>()
@@ -1709,8 +1726,14 @@ try {
                .append('</h3>')
         results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
         if (perMacro) {
+            results.append('<p style="font-size:90%">')
+                   .append('<b>Macro #</b> is the position of this macro among <i>all</i> macros in that ')
+                   .append('version body, containers included, counted in document order - it pins the ')
+                   .append('occurrence even when several share an ac:macro-id.')
+                   .append(apply ? '' : ' In INSPECT mode nothing is written; "Would replace" means it would be.')
+                   .append('</p>')
             results.append('<tr><th>Page ID</th><th>Page Name</th><th>Version</th><th>Cur</th>')
-                   .append('<th>#</th><th>Migration</th><th>Source macro</th><th>Target</th>')
+                   .append('<th>Macro #</th><th>Migration</th><th>Source macro</th><th>Target</th>')
                    .append('<th>ac:macro-id</th><th>Status</th><th>Detail / reason</th><th>URL</th></tr>')
             for (PageFinding pf : findings) {
                 for (VersionFinding vf : pf.versions) {
@@ -1728,7 +1751,9 @@ try {
                                .append('</td><td>').append(htmlEsc(mm.sourceName))
                                .append('</td><td>').append(htmlEsc(mm.targetName == null ? '(static)' : mm.targetName))
                                .append('</td><td>').append(htmlEsc(mm.macroId))
-                               .append('</td><td>').append(mm.status)
+                               .append('</td><td>').append(
+                                       (!apply && mm.status == ReplacementStatus.Success)
+                                               ? 'Would replace' : (mm.status as String))
                                .append('</td><td>').append(htmlEsc(why))
                                .append('</td><td><a href="').append(pf.url).append('" target="_blank">open</a></td></tr>')
                     }
