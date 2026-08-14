@@ -1060,6 +1060,14 @@ String resolveValue(MigrationDef mig, Map<String, String> onPage, String key) {
     return null
 }
 
+/** "a=1, b=2" - used in the Details column. */
+String renderKeyValues(Map<String, String> m) {
+    if (m == null || m.isEmpty()) return ''
+    List<String> parts = new ArrayList<String>()
+    for (Map.Entry<String, String> e : m.entrySet()) parts.add(e.getKey() + '=' + e.getValue())
+    return parts.join(', ')
+}
+
 /** Readable rendering of parsed parameters for error messages. */
 String describeParams(Map<String, String> params) {
     if (params == null || params.isEmpty()) return '(none)'
@@ -1094,8 +1102,14 @@ String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
         // makes a wrong or renamed mapping visible at a glance
         String optionName = null
         for (String k : mig.options.keySet()) { if (k == srcVal) optionName = k }
-        mm.detail = mig.sourceParam + '="' + srcVal + '" (' + (optionName == null ? '?' : optionName) + ')' +
-                    (mm.params.containsKey(mig.sourceParam) ? '' : ' [default]') +
+        /*
+         * Source enum values are stored as their text, so the value needs no
+         * lookup to be readable. A required parameter ABSENT from page storage
+         * means the author left it at the macro default - marked, because the
+         * value shown then comes from the definition and not from the page.
+         */
+        mm.detail = mig.sourceParam + '="' + srcVal + '"' +
+                    (mm.params.containsKey(mig.sourceParam) ? '' : ' [macro default]') +
                     ' -> option-id=' + optionId + ' (' + (optionName == null ? '?' : optionName) + ')' +
                     ' in set "' + mig.setName + '"'
         if (TRACE_MAPPING) notes.add('  ' + mm.detail + ' macro-id=' + macroId)
@@ -1126,7 +1140,13 @@ String replaceGenericMacro(MigrationDef mig, MatchedMacro mm, List<String> notes
             out.put(e.getKey(), e.getValue())
         }
         String macroId = UUID.randomUUID().toString()
-        mm.detail = 'params=' + out
+        // "params=[:]" said nothing; name what happened, and list parameters
+        // only when there are any
+        // Source and target names, and their types, are already their own columns -
+        // repeating them here only crowds the cell. A parameterless replacement
+        // has nothing to report, so its Details cell stays empty.
+        mm.detail = out.isEmpty() ? ''
+                : 'Replaced with ' + mig.targetName + '. Parameters: ' + renderKeyValues(out) + '.'
         if (TRACE_MAPPING) notes.add('  ' + mm.sourceName + ' -> ' + mig.targetName + ' ' + mm.detail)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (Exception e) {
@@ -1215,8 +1235,9 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
         out.put('href', resolved.get(1))
 
         String macroId = UUID.randomUUID().toString()
-        mm.detail = 'hrefType=' + resolved.get(0) + ' href=' + resolved.get(1) +
-                    ' label="' + out.get('label') + '"' + (emptyLabel ? ' (empty label preserved)' : '')
+        mm.detail = 'Replaced with ' + mig.targetName + '. hrefType=' + resolved.get(0) +
+                    ', href=' + resolved.get(1) + ', label="' + out.get('label') + '"' +
+                    (emptyLabel ? ' (empty label preserved)' : '') + '.'
         if (TRACE_MAPPING) notes.add('  aura-button ' + mm.detail + ' macro-id=' + macroId)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
@@ -1235,9 +1256,11 @@ String replaceQualificationTable(MigrationDef mig, MatchedMacro mm, List<String>
         for (List<String> c : QM_COLUMNS) required.add(c.get(1))
         required.add('relevance')
 
+        List<String> defaulted = new ArrayList<String>()
         for (String key : required) {
             String v = resolveValue(mig, mm.params, key)
             if (v == null || !(v ==~ /\d+/)) { missing.add(key); continue }
+            if (!mm.params.containsKey(key)) defaulted.add(key)
             resolved.put(key, v)
         }
         if (!missing.isEmpty()) {
@@ -1273,7 +1296,15 @@ String replaceQualificationTable(MigrationDef mig, MatchedMacro mm, List<String>
         h.append('</tbody></table>')
         h.append('<p>&nbsp;</p>')
         h.append('<p>').append(pct).append('%</p>')
-        mm.detail = 'relevance=' + relevance + ' sumImpact=' + sum + ' -> ' + pct + '%'
+        // every parameter, including ones absent from page storage that were
+        // resolved from the macro definition's defaults - those carry *
+        List<String> shown = new ArrayList<String>()
+        for (String key : required) {
+            shown.add(key + '=' + resolved.get(key) + (defaulted.contains(key) ? '*' : ''))
+        }
+        mm.detail = 'Replaced with static table. Parameters: ' + shown.join(', ') +
+                    (defaulted.isEmpty() ? '' : ' (* = absent from page, taken from macro default)') +
+                    '. Qualifikationsfaktor: ' + pct + '%.'
         if (TRACE_MAPPING) notes.add('  ' + mm.detail)
         return h.toString()
     } catch (IllegalStateException ise) {
@@ -1477,35 +1508,66 @@ String shortType(MacroType t) {
     return t as String
 }
 
-/** Column and abbreviation legend, printed once above the results. */
+/** User-facing type name for the legend. */
+String longType(MacroType t) {
+    if (t == MacroType.ScriptRunnerMacro) return 'ScriptRunner Macro'
+    if (t == MacroType.UserMacro) return 'User Macro'
+    if (t == MacroType.EddStatusMacro) return 'EasyDropDown Status Macro'
+    if (t == MacroType.AuraLinkButton) return 'Aura Link Button'
+    if (t == MacroType.Static_QualificationTable) return 'Static Qualification Table (computed static data table object)'
+    return t as String
+}
+
+String typeList(List<MacroType> types) {
+    List<String> parts = new ArrayList<String>()
+    for (MacroType t : types) parts.add('<b>' + shortType(t) + '</b> - ' + longType(t))
+    return parts.join(', ')
+}
+
+/**
+ * Column legend, printed once above the results table. Rows follow the exact
+ * column order of that table, so the two can be read side by side.
+ */
 String legendHtml(boolean showMigration, boolean apply) {
+    // only the types this engine can actually replace FROM and TO
+    List<MacroType> sourceTypes = [MacroType.UserMacro, MacroType.ScriptRunnerMacro]
+    List<MacroType> targetTypes = [MacroType.ScriptRunnerMacro, MacroType.EddStatusMacro,
+                                   MacroType.AuraLinkButton, MacroType.Static_QualificationTable]
+
     StringBuilder b = new StringBuilder()
-    b.append('<h3>Legend</h3>')
+    b.append('<h3>Legend Table:</h3>')
     b.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
     b.append('<tr><th>Column</th><th>Meaning</th></tr>')
-    b.append('<tr><td>Page ID</td><td>id of the current page; repeats across its versions and macros</td></tr>')
-    b.append('<tr><td>Page V.</td><td>version number of the page version this macro sits in</td></tr>')
-    b.append('<tr><td>Current</td><td>yes = this is the current version, - = a historical version</td></tr>')
-    b.append('<tr><td>Macro #</td><td>position of this macro among ALL macros in that version body, ')
-     .append('containers included, in document order - pins the occurrence even when several share ')
-     .append('an ac:macro-id</td></tr>')
-    if (showMigration) b.append('<tr><td>Migration</td><td>id of the migration entry that matched</td></tr>')
-    b.append('<tr><td>Source / Target</td><td>macro being replaced and what replaces it. For ')
-     .append('EasyDropDown the Target shows the SET name, since the macro name is the same for every set</td></tr>')
-    b.append('<tr><td>Details</td><td>what the replacement did, or why it was skipped or failed</td></tr>')
-    b.append('<tr><td>Comments</td><td>left empty for your own notes</td></tr>')
-    b.append('<tr><th>Type</th><th>Meaning</th></tr>')
-    b.append('<tr><td>UM</td><td>UserMacro</td></tr>')
-    b.append('<tr><td>SR</td><td>ScriptRunnerMacro</td></tr>')
-    b.append('<tr><td>EDD</td><td>EddStatusMacro</td></tr>')
-    b.append('<tr><td>AB</td><td>AuraLinkButton</td></tr>')
-    b.append('<tr><td>Static</td><td>Static_QualificationTable - computed storage, not a macro</td></tr>')
-    b.append('<tr><th>Status</th><th>Meaning</th></tr>')
-    b.append(apply
-            ? '<tr><td>Success</td><td>replaced and written</td></tr>'
-            : '<tr><td>Would replace</td><td>INSPECT mode - nothing was written</td></tr>')
-    b.append('<tr><td>Skipped</td><td>left untouched on purpose; Details gives the reason</td></tr>')
-    b.append('<tr><td>Failed</td><td>could not be replaced or the write did not persist</td></tr>')
+    b.append('<tr><td>Page ID</td><td>Page id in scope of macro replacement where particular page ')
+     .append('versions contain macros planned for replacement.</td></tr>')
+    b.append('<tr><td>Page Name</td><td>Title of the page.</td></tr>')
+    b.append('<tr><td>Page V.</td><td>Page Version which contains macros planned for replacement.</td></tr>')
+    b.append('<tr><td>Current</td><td>Indicates whether particular page version is current (latest) ')
+     .append('version.</td></tr>')
+    b.append('<tr><td>Macro #</td><td>Position of macro occurrence within all macros on particular ')
+     .append('page version (including rich-text formatting macros and other macros not planned for ')
+     .append('migration).</td></tr>')
+    b.append('<tr><td>Migration</td><td>Id of the migration configuration entry that matched this ')
+     .append('occurrence. Optional column, shown when RESULT_SHOW_MIGRATION_COLUMN is set to true')
+     .append(showMigration ? '' : ' (currently disabled)').append('.</td></tr>')
+    b.append('<tr><td>Source</td><td>Macro being replaced.</td></tr>')
+    b.append('<tr><td>Source Type</td><td>Type of the macro being replaced. ')
+     .append(typeList(sourceTypes)).append('.</td></tr>')
+    b.append('<tr><td>Target</td><td>Replacement macro. For EasyDropDown the configured set name is ')
+     .append('shown, because the macro name is identical for every set.</td></tr>')
+    b.append('<tr><td>Target Type</td><td>Type of the replacement. ')
+     .append(typeList(targetTypes)).append('.</td></tr>')
+    b.append('<tr><td>ac:macro-id</td><td>Guid of the source macro occurrence as stored in the page ')
+     .append('source. Not unique across pages - copying a page duplicates it.</td></tr>')
+    b.append('<tr><td>Status</td><td>Macro occurrence replacement status. ')
+    if (apply) b.append('<b>Success</b> - replacement successful, ')
+    else b.append('<b>Would replace</b> - estimated successful replacement in INSPECT mode, ')
+    b.append('<b>Skipped</b> - untouched on purpose or unhandled configuration detected (reason in ')
+     .append('Details column), <b>Failed</b> - error during replacement attempts or write did not ')
+     .append('persist.</td></tr>')
+    b.append('<tr><td>Details</td><td>Replaced macro details or reason of skip or failure.</td></tr>')
+    b.append('<tr><td>Comments</td><td>Admin work notes.</td></tr>')
+    b.append('<tr><td>URL</td><td>Link to the page.</td></tr>')
     b.append('</table>')
     return b.toString()
 }
@@ -1852,13 +1914,11 @@ try {
                 // produces no dangling table, and the header never appears
                 // before there is anything under it
                 if (RESULT_FORMAT == 'TABLE' && !resultsTableOpen && !vf.matchedMacros.isEmpty()) {
-                    results.append('<h3>').append(apply ? 'Result' : 'Detected')
-                           .append(perMacro ? ' &mdash; one row per macro occurrence'
-                                            : ' &mdash; one row per version').append('</h3>')
                     if (RESULT_SHOW_LEGEND && perMacro) {
                         results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
                         results.append('<div style="height:16px"></div>')
                     }
+                    results.append('<h3>Results Table:</h3>')
                     results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
                     if (perMacro) {
                         results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page V.</th><th>Current</th>')
@@ -1887,7 +1947,7 @@ try {
                             results.append('<tr').append(colour).append('><td>').append(pf.pageId)
                                    .append('</td><td>').append(htmlEsc(pf.pageName))
                                    .append('</td><td>').append(vf.versionNumber)
-                                   .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                                   .append('</td><td>').append(vf.isCurrent ? 'yes' : '')
                                    .append('</td><td>').append(mm.macroIndex).append('</td>')
                             if (RESULT_SHOW_MIGRATION_COLUMN) {
                                 results.append('<td>').append(htmlEsc(mm.migrationId)).append('</td>')
@@ -1920,7 +1980,7 @@ try {
                                .append('</td><td>').append(htmlEsc(pf.pageName))
                                .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
                                .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
-                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '')
                                .append('</td><td>').append(vf.matchedMacros.size())
                                .append('</td><td>').append(rc).append('</td><td>').append(skc)
                                .append('</td><td>').append(flc)
