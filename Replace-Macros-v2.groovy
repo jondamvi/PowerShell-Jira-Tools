@@ -137,6 +137,16 @@ enum ReplacementStatus {
 // Results listing: TABLE | CSV | LIST | NONE
 @Field String RESULT_FORMAT = 'TABLE'
 
+/*
+ * MACRO   - one row per macro OCCURRENCE: which macro, on which page version,
+ *           what it became, and for anything not replaced, why. This is the
+ *           only view that answers "what was skipped and why" - a version-level
+ *           row reading "17 occurrences, 16 replaced, 1 skipped" identifies
+ *           neither the macro nor the reason.
+ * VERSION - one row per page version. Compact, for very large runs.
+ */
+@Field String RESULT_GRANULARITY = 'MACRO'
+
 // Rollback copies. Compressed output is deflate + Base64; Base64 is required
 // because the console returns a String and raw deflate bytes are not valid text.
 @Field boolean EMIT_ROLLBACK_COPIES = true
@@ -252,7 +262,8 @@ class MatchedMacro {
     int matchedIndex        // position among matched macros only
     Map<String, String> params = new LinkedHashMap<String, String>()
     ReplacementStatus status = ReplacementStatus.Unknown
-    String message = ''
+    String message = ''      // why it was skipped or failed
+    String detail = ''       // what the replacement actually did, when it succeeded
 }
 
 class VersionFinding {
@@ -1044,11 +1055,10 @@ String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
         out.put('current-option-value', srcVal)
         out.put('option-id', optionId)
         String macroId = UUID.randomUUID().toString()
-        if (TRACE_MAPPING) {
-            notes.add('  ' + mig.sourceParam + '="' + srcVal + '"' +
-                      (mm.params.containsKey(mig.sourceParam) ? ' [from page]' : ' [FROM DEFAULT]') +
-                      ' -> option-id=' + optionId + ' macro-id=' + macroId)
-        }
+        mm.detail = mig.sourceParam + '="' + srcVal + '"' +
+                    (mm.params.containsKey(mig.sourceParam) ? '' : ' [default]') +
+                    ' -> option-id=' + optionId
+        if (TRACE_MAPPING) notes.add('  ' + mm.detail + ' macro-id=' + macroId)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
         throw ise
@@ -1076,7 +1086,8 @@ String replaceGenericMacro(MigrationDef mig, MatchedMacro mm, List<String> notes
             out.put(e.getKey(), e.getValue())
         }
         String macroId = UUID.randomUUID().toString()
-        if (TRACE_MAPPING) notes.add('  ' + mm.sourceName + ' -> ' + mig.targetName + ' params=' + out)
+        mm.detail = 'params=' + out
+        if (TRACE_MAPPING) notes.add('  ' + mm.sourceName + ' -> ' + mig.targetName + ' ' + mm.detail)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (Exception e) {
         throw new RuntimeException('replaceGenericMacro failed: ' + e.getMessage(), e)
@@ -1167,10 +1178,9 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
         out.put('href', resolved.get(1))
 
         String macroId = UUID.randomUUID().toString()
-        if (TRACE_MAPPING) {
-            notes.add('  aura-button hrefType=' + resolved.get(0) + ' href=' + resolved.get(1) +
-                      ' label=' + out.get('label') + ' macro-id=' + macroId)
-        }
+        mm.detail = 'hrefType=' + resolved.get(0) + ' href=' + resolved.get(1) +
+                    ' label="' + out.get('label') + '"'
+        if (TRACE_MAPPING) notes.add('  aura-button ' + mm.detail + ' macro-id=' + macroId)
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
         throw ise
@@ -1226,7 +1236,8 @@ String replaceQualificationTable(MigrationDef mig, MatchedMacro mm, List<String>
         h.append('</tbody></table>')
         h.append('<p>&nbsp;</p>')
         h.append('<p>').append(pct).append('%</p>')
-        if (TRACE_MAPPING) notes.add('  relevance=' + relevance + ' sum=' + sum + ' -> ' + pct + '%')
+        mm.detail = 'relevance=' + relevance + ' sumImpact=' + sum + ' -> ' + pct + '%'
+        if (TRACE_MAPPING) notes.add('  ' + mm.detail)
         return h.toString()
     } catch (IllegalStateException ise) {
         throw ise
@@ -1304,6 +1315,7 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
             try {
                 // parameters as they are NOW, not as scanned in Stage-1
                 MatchedMacro fresh = new MatchedMacro()
+                // scoped to this occurrence so its own parameter values are used
                 fresh.migrationId = mm.migrationId; fresh.sourceName = sp.name; fresh.macroId = sp.macroId
                 fresh.sourceType = mm.sourceType;   fresh.targetType = mm.targetType
                 fresh.targetName = mm.targetName
@@ -1342,6 +1354,7 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
             outBody.append(pre).append(replacement)
             cursor = elemEnd
             skipUntil = sp.end
+            mm.detail = fresh.detail                    // what the transform did
             mm.status = ReplacementStatus.Success       // provisional until the write lands
             mig.occReplaced++
         }
@@ -1679,62 +1692,127 @@ try {
     // (summary, trace, rollback copies) can fail or run to megabytes, and the
     // table is the one thing that must always survive. The fatal handler emits
     // whatever has been built by the time it fires.
+    /*
+     * Three levels, because one row per version answers nothing when a single
+     * version carries seventeen occurrences from twenty migrations:
+     *   1. per migration  - which macro, how many found / replaced / skipped
+     *   2. per occurrence - one row per macro instance, grouped by migration,
+     *                       carrying its macro-id, its parameters and, when it
+     *                       was not replaced, the reason
+     *   3. per version    - the aggregate that decides whether a write happened
+     */
+    boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
+
     if (RESULT_FORMAT == 'TABLE') {
-        results.append('<h3>').append(apply ? 'Result' : 'Detected').append('</h3>')
-        results.append('<table border="1" cellpadding="4" cellspacing="0"><tr>')
-               .append('<th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Version</th><th>Current</th>')
-               .append('<th>Occurrences</th><th>Replaced</th><th>Skipped</th><th>Failed</th><th>Status</th></tr>')
-        for (PageFinding pf : findings) {
-            for (VersionFinding vf : pf.versions) {
-                int r = 0, s = 0, f = 0
-                for (MatchedMacro mm : vf.matchedMacros) {
-                    if (mm.status == ReplacementStatus.Success) r++
-                    else if (mm.status == ReplacementStatus.Skipped) s++
-                    else if (mm.status == ReplacementStatus.Failed) f++
+        results.append('<h3>').append(apply ? 'Result' : 'Detected')
+               .append(perMacro ? ' &mdash; one row per macro occurrence' : ' &mdash; one row per version')
+               .append('</h3>')
+        results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
+        if (perMacro) {
+            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Version</th><th>Cur</th>')
+                   .append('<th>#</th><th>Migration</th><th>Source macro</th><th>Target</th>')
+                   .append('<th>ac:macro-id</th><th>Status</th><th>Detail / reason</th><th>URL</th></tr>')
+            for (PageFinding pf : findings) {
+                for (VersionFinding vf : pf.versions) {
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
+                        String colour = (mm.status == ReplacementStatus.Success) ? ''
+                                : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
+                                                                          : ' style="background:#ffecec"')
+                        results.append('<tr').append(colour).append('><td>').append(pf.pageId)
+                               .append('</td><td>').append(htmlEsc(pf.pageName))
+                               .append('</td><td>').append(vf.versionNumber)
+                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                               .append('</td><td>').append(mm.macroIndex)
+                               .append('</td><td>').append(htmlEsc(mm.migrationId))
+                               .append('</td><td>').append(htmlEsc(mm.sourceName))
+                               .append('</td><td>').append(htmlEsc(mm.targetName == null ? '(static)' : mm.targetName))
+                               .append('</td><td>').append(htmlEsc(mm.macroId))
+                               .append('</td><td>').append(mm.status)
+                               .append('</td><td>').append(htmlEsc(why))
+                               .append('</td><td><a href="').append(pf.url).append('" target="_blank">open</a></td></tr>')
+                    }
                 }
-                results.append('<tr><td>').append(pf.pageId)
-                       .append('</td><td>').append(htmlEsc(pf.pageName))
-                       .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
-                       .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
-                       .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
-                       .append('</td><td>').append(vf.matchedMacros.size())
-                       .append('</td><td>').append(r).append('</td><td>').append(s)
-                       .append('</td><td>').append(f)
-                       .append('</td><td>').append(vf.status).append('</td></tr>')
+            }
+        } else {
+            results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Version</th><th>Current</th>')
+                   .append('<th>Occurrences</th><th>Replaced</th><th>Skipped</th><th>Failed</th><th>Status</th></tr>')
+            for (PageFinding pf : findings) {
+                for (VersionFinding vf : pf.versions) {
+                    int r = 0, sk = 0, fl = 0
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        if (mm.status == ReplacementStatus.Success) r++
+                        else if (mm.status == ReplacementStatus.Skipped) sk++
+                        else if (mm.status == ReplacementStatus.Failed) fl++
+                    }
+                    results.append('<tr><td>').append(pf.pageId)
+                           .append('</td><td>').append(htmlEsc(pf.pageName))
+                           .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
+                           .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
+                           .append('</td><td>').append(vf.isCurrent ? 'yes' : '-')
+                           .append('</td><td>').append(vf.matchedMacros.size())
+                           .append('</td><td>').append(r).append('</td><td>').append(sk)
+                           .append('</td><td>').append(fl)
+                           .append('</td><td>').append(vf.status).append('</td></tr>')
+                }
             }
         }
         results.append('</table>')
+
     } else if (RESULT_FORMAT == 'CSV' || RESULT_FORMAT == 'LIST') {
         StringBuilder t = new StringBuilder()
-        if (RESULT_FORMAT == 'CSV') t.append('page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
         Set<String> seenUrls = new LinkedHashSet<String>()
+        if (RESULT_FORMAT == 'CSV') {
+            t.append(perMacro
+                ? 'page_id,page_name,page_url,version,current,macro_index,migration,source_macro,target_macro,macro_id,status,detail\n'
+                : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
+        }
         for (PageFinding pf : findings) {
             if (RESULT_FORMAT == 'LIST') { seenUrls.add(pf.url); continue }
             for (VersionFinding vf : pf.versions) {
-                int r = 0, s = 0, f = 0
-                for (MatchedMacro mm : vf.matchedMacros) {
-                    if (mm.status == ReplacementStatus.Success) r++
-                    else if (mm.status == ReplacementStatus.Skipped) s++
-                    else if (mm.status == ReplacementStatus.Failed) f++
+                if (perMacro) {
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
+                        List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                                               vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
+                                               mm.macroIndex as String, mm.migrationId, mm.sourceName,
+                                               mm.targetName == null ? '(static)' : mm.targetName,
+                                               mm.macroId, mm.status as String, why]
+                        List<String> q = new ArrayList<String>()
+                        for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                        t.append(q.join(',')).append('\n')
+                    }
+                } else {
+                    int r = 0, sk = 0, fl = 0
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        if (mm.status == ReplacementStatus.Success) r++
+                        else if (mm.status == ReplacementStatus.Skipped) sk++
+                        else if (mm.status == ReplacementStatus.Failed) fl++
+                    }
+                    List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                                           vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
+                                           vf.matchedMacros.size() as String, r as String,
+                                           sk as String, fl as String, vf.status as String]
+                    List<String> q = new ArrayList<String>()
+                    for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                    t.append(q.join(',')).append('\n')
                 }
-                List<String> fields = [pf.pageId as String, pf.pageName, pf.url, vf.versionNumber as String,
-                                       vf.isCurrent ? 'yes' : 'no', vf.matchedMacros.size() as String,
-                                       r as String, s as String, f as String, vf.status as String]
-                List<String> q = new ArrayList<String>()
-                for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-                t.append(q.join(',')).append('\n')
             }
         }
         for (String u : seenUrls) t.append(u).append('\n')
-        results.append('<h3>').append(RESULT_FORMAT).append('</h3><pre>').append(htmlEsc(t.toString())).append('</pre>')
+        results.append('<h3>').append(RESULT_FORMAT).append('</h3><pre>')
+               .append(htmlEsc(t.toString())).append('</pre>')
     }
-
 
     // ---- SUMMARY ----------------------------------------------------------
     outp.append('\n  RESULTS BY MIGRATION\n')
-    outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', 'MIGRATION', 'FOUND', 'REPLACED', 'SKIPPED', 'FAILED'))
+    // width driven by the longest id actually present, not a fixed guess
+    int idW = 'MIGRATION'.length()
+    for (MigrationDef md : migrations) { if (md.id.length() > idW) idW = md.id.length() }
+    String rowFmt = '  %-' + (idW + 2) + 's %-9s %-10s %-9s %-8s%n'
+    outp.append(String.format(rowFmt, 'MIGRATION', 'FOUND', 'REPLACED', 'SKIPPED', 'FAILED'))
     for (MigrationDef md : migrations) {
-        outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', md.id,
+        outp.append(String.format(rowFmt, md.id,
                 md.occFound as String, md.occReplaced as String,
                 md.occSkipped as String, md.occFailed as String))
     }
