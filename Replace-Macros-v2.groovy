@@ -54,6 +54,7 @@ import groovy.transform.Field
 import java.lang.reflect.Method
 import java.util.regex.Matcher
 import java.util.regex.Pattern
+import java.net.URLDecoder
 import java.util.zip.Deflater
 
 // =============================================================================
@@ -213,8 +214,10 @@ enum ReplacementStatus {
                       'size'        : 'medium',
                       'background'  : '#b0e572',
                       'iconPosition': 'left',
-                      'hrefTarget'  : '_blank',
+                      'hrefTarget'  : '_blank',   // _blank opens in a new tab
                       'alignment'   : 'left',
+                      // hrefType is NOT set here - it is derived per instance
+                      // (link / page / attachment) from the source URL
                   ],
                   dropUnmapped: true],
     ],
@@ -279,18 +282,19 @@ class ValidationIssue {
 // =============================================================================
 
 /*
- * The macro body uses a TEMPERED expression rather than a lazy .*? :
- *     (?:(?!</ac:structured-macro>).)*
- * A lazy quantifier backtracks and will extend past the nearest closing tag if
- * that lets the rest of the pattern match - which merged two macros in one
- * paragraph into a single replacement in v1. The tempered form cannot cross a
- * closing tag, so every macro is always its own match. Correct here because
- * nested macros are out of scope.
+ * NESTING IS REAL. Container macros such as aura-panel wrap in-scope macros in
+ * an <ac:rich-text-body>, so a single regex for a whole element cannot work:
+ *   - a lazy .*? backtracks past the nearest closing tag and merges siblings
+ *   - a tempered body stops at the FIRST </ac:structured-macro>, which for a
+ *     container is the INNER macro's closing tag - the match then swallows the
+ *     inner macro and the scan resumes past it, so the inner macro is never
+ *     seen. That is why a qualification-table inside an aura-panel was missed.
+ *
+ * Instead the body is tokenised into open and close tags and walked with a
+ * depth stack, which yields every macro at every nesting level in document
+ * order, with exact element bounds.
  */
-@Field String MACRO_BODY = '(?:[^>]*/>|[^>]*>(?:(?!</ac:structured-macro>).)*</ac:structured-macro>)'
-
-/** Every structured macro, whatever its name, in document order. */
-@Field Pattern P_ANY_MACRO = Pattern.compile('(?s)<ac:structured-macro\\b' + MACRO_BODY)
+@Field Pattern P_MACRO_TOKEN = Pattern.compile('(?s)<ac:structured-macro\\b([^>]*)>|</ac:structured-macro>')
 
 @Field Pattern P_NAME     = Pattern.compile('ac:name="([^"]*)"')
 @Field Pattern P_MACRO_ID = Pattern.compile('ac:macro-id="([^"]*)"')
@@ -304,6 +308,20 @@ class ValidationIssue {
 
 @Field Pattern P_VELOCITY_PARAM = Pattern.compile('^\\s*##\\s*@param\\s+([^:\\s]+)\\s*:?(.*)$')
 
+/*
+ * Emit Confluence's own table classes on the flattened table, as the original
+ * macro did: class="confluenceTable" / confluenceTh / confluenceTd.
+ *
+ * Confluence's table borders and cell backgrounds - including the dark-theme
+ * variants - are attached to these classes, not to bare <table>/<td>. An
+ * unclassed table therefore picks up whatever the surrounding container
+ * supplies, which is why cells can lose their borders and their theme
+ * background inside a panel macro while the header row still looks right.
+ *
+ * Set false to emit a plain table and compare.
+ */
+@Field boolean QM_CONFLUENCE_TABLE_CLASSES = true
+
 // qualification-table column order: label -> parameter
 @Field List<List<String>> QM_COLUMNS = [
         ['KB'  , 'impactFinance'],   ['V'   , 'impactSales'],
@@ -314,6 +332,7 @@ class ValidationIssue {
 ]
 
 @Field List<String> RUN_LOG = new ArrayList<String>()
+@Field String BASE_URL = ''
 @Field boolean FLUSH_WORKED = false
 @Field String FLUSH_NOTE = 'not attempted'
 
@@ -402,6 +421,13 @@ void flushSession() {
     }
 }
 
+/** One <ac:structured-macro> element, located exactly, at any nesting depth. */
+class MacroSpan {
+    int start, openEnd, end, depth
+    String name = '', macroId = ''
+    boolean selfClosing
+}
+
 // =============================================================================
 //  STORAGE PARSING
 // =============================================================================
@@ -412,6 +438,66 @@ String attrOf(Pattern p, String xml) {
         return m.find() ? m.group(1) : ''
     } catch (Exception e) {
         throw new RuntimeException('attrOf failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * Every macro element in the body, any depth, in document order.
+ * Unbalanced markup is tolerated: an unmatched open tag is dropped rather than
+ * throwing, so one malformed page cannot abort a run.
+ */
+List<MacroSpan> findMacroSpans(String body) {
+    try {
+        List<MacroSpan> found = new ArrayList<MacroSpan>()
+        if (body == null) return found
+        List<MacroSpan> stack = new ArrayList<MacroSpan>()
+        Matcher m = P_MACRO_TOKEN.matcher(body)
+        while (m.find()) {
+            if (m.group(0).startsWith('</')) {
+                if (!stack.isEmpty()) {
+                    MacroSpan open = stack.remove(stack.size() - 1)
+                    open.end = m.end()
+                    found.add(open)
+                }
+                continue
+            }
+            String attrs = m.group(1) == null ? '' : m.group(1)
+            MacroSpan sp = new MacroSpan()
+            sp.start = m.start()
+            sp.openEnd = m.end()
+            sp.depth = stack.size()
+            sp.name = attrOf(P_NAME, attrs)
+            sp.macroId = attrOf(P_MACRO_ID, attrs)
+            sp.selfClosing = attrs.trim().endsWith('/')
+            if (sp.selfClosing) { sp.end = m.end(); found.add(sp) }
+            else stack.add(sp)
+        }
+        Collections.sort(found, new Comparator<MacroSpan>() {
+            @Override int compare(MacroSpan a, MacroSpan b) { return a.start <=> b.start }
+        })
+        return found
+    } catch (Exception e) {
+        throw new RuntimeException('findMacroSpans failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * Parameters belonging to this element only. Content is cut at the first nested
+ * <ac:structured-macro> so a container's own parameters can never absorb an
+ * inner macro's - in-scope source macros hold no nested macros, so this only
+ * ever guards against malformed input.
+ */
+Map<String, String> paramsOfSpan(String body, MacroSpan sp) {
+    try {
+        if (sp.selfClosing) return new LinkedHashMap<String, String>()
+        int contentEnd = sp.end - '</ac:structured-macro>'.length()
+        if (contentEnd <= sp.openEnd) return new LinkedHashMap<String, String>()
+        String inner = body.substring(sp.openEnd, contentEnd)
+        int nested = inner.indexOf('<ac:structured-macro')
+        if (nested >= 0) inner = inner.substring(0, nested)
+        return parseParams(inner)
+    } catch (Exception e) {
+        throw new RuntimeException('paramsOfSpan failed: ' + e.getMessage(), e)
     }
 }
 
@@ -886,25 +972,22 @@ List<MatchedMacro> scanBody(String body, Map<String, MigrationDef> bySource) {
     try {
         List<MatchedMacro> out = new ArrayList<MatchedMacro>()
         if (body == null) return out
-        Matcher m = P_ANY_MACRO.matcher(body)
         int macroIndex = 0, matchedIndex = 0
-        while (m.find()) {
-            macroIndex++
-            String xml = m.group(0)
-            String name = attrOf(P_NAME, xml)
-            MigrationDef mig = bySource.get(name)
+        for (MacroSpan sp : findMacroSpans(body)) {
+            macroIndex++                       // counts containers too, at every depth
+            MigrationDef mig = bySource.get(sp.name)
             if (mig == null) continue
             matchedIndex++
             MatchedMacro mm = new MatchedMacro()
             mm.migrationId = mig.id
-            mm.sourceName = name
+            mm.sourceName = sp.name
             mm.sourceType = mig.sourceType
             mm.targetName = mig.targetName
             mm.targetType = mig.targetType
-            mm.macroId = attrOf(P_MACRO_ID, xml)
+            mm.macroId = sp.macroId
             mm.macroIndex = macroIndex
             mm.matchedIndex = matchedIndex
-            mm.params.putAll(parseParams(xml))
+            mm.params.putAll(paramsOfSpan(body, sp))
             out.add(mm)
         }
         return out
@@ -1001,6 +1084,50 @@ String replaceGenericMacro(MigrationDef mig, MatchedMacro mm, List<String> notes
 }
 
 /**
+ * Works out aura-button's hrefType/href pair from a link-button URL.
+ * Returns [hrefType, href].
+ *
+ *   /download/attachments/<id>/...      -> ['attachment', <id>]
+ *   ...pageId=<id>                      -> ['page', <id>]
+ *   <base>/display/<SPACE>/<Title>      -> ['page', <resolved id>] when the page
+ *                                          resolves, otherwise ['link', url]
+ *   anything else                       -> ['link', url]
+ *
+ * Only URLs on this instance are treated as internal; an external URL that
+ * happens to contain /display/ stays a plain link.
+ */
+List<String> resolveAuraHref(String url, List<String> notes) {
+    try {
+        if (url == null || url.trim().isEmpty()) return ['link', '']
+        String u = url.trim()
+
+        Matcher att = Pattern.compile('/download/attachments/(\\d+)/').matcher(u)
+        if (att.find()) return ['attachment', att.group(1)]
+
+        Matcher pid = Pattern.compile('[?&]pageId=(\\d+)').matcher(u)
+        if (pid.find()) return ['page', pid.group(1)]
+
+        boolean internal = (BASE_URL != null && !BASE_URL.isEmpty() && u.startsWith(BASE_URL)) ||
+                           u.startsWith('/')
+        if (internal) {
+            Matcher disp = Pattern.compile('/display/([^/?#]+)/([^?#]+)').matcher(u)
+            if (disp.find()) {
+                String spaceKey = URLDecoder.decode(disp.group(1), 'UTF-8')
+                String title = URLDecoder.decode(disp.group(2).replace('+', ' '), 'UTF-8')
+                if (title.endsWith('/')) title = title.substring(0, title.length() - 1)
+                Page found = ComponentLocator.getComponent(PageManager).getPage(spaceKey, title)
+                if (found != null) return ['page', found.getId() as String]
+                notes.add('  NOTE: "' + u + '" looks like a page link but "' + title +
+                          '" was not found in space ' + spaceKey + '; kept as a plain link')
+            }
+        }
+        return ['link', u]
+    } catch (Exception e) {
+        throw new RuntimeException('resolveAuraHref("' + url + '") failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
  * link-button -> aura-button.
  *
  * The style parameters come from the migration's staticParams, so every
@@ -1020,20 +1147,29 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
         out.putAll(mig.staticParams)
 
         List<String> missing = new ArrayList<String>()
+        String rawHref = null
         for (Map.Entry<String, String> e : mig.paramMap.entrySet()) {
             String v = resolveValue(mig, mm.params, e.getKey())
             if (v == null || v.trim().isEmpty()) { missing.add(e.getKey()); continue }
-            out.put(e.getValue(), v)
+            if (e.getValue() == 'href') rawHref = v
+            else out.put(e.getValue(), v)
         }
         if (!missing.isEmpty()) {
             throw new IllegalStateException('parameter(s) ' + missing + ' could not be resolved ' +
                     'from the page or from declared defaults; parsed from this macro: ' + mm.params)
         }
 
+        // hrefType is derived per instance and must NOT come from staticParams:
+        // an external URL, a Confluence page and an attachment need different
+        // values, and href itself becomes an id for the latter two.
+        List<String> resolved = resolveAuraHref(rawHref, notes)
+        out.put('hrefType', resolved.get(0))
+        out.put('href', resolved.get(1))
+
         String macroId = UUID.randomUUID().toString()
         if (TRACE_MAPPING) {
-            notes.add('  aura-button href=' + out.get('href') + ' label=' + out.get('label') +
-                      ' macro-id=' + macroId)
+            notes.add('  aura-button hrefType=' + resolved.get(0) + ' href=' + resolved.get(1) +
+                      ' label=' + out.get('label') + ' macro-id=' + macroId)
         }
         return buildMacroElement(mig.targetName, mig.targetSchemaVersion, macroId, out)
     } catch (IllegalStateException ise) {
@@ -1067,17 +1203,26 @@ String replaceQualificationTable(MigrationDef mig, MatchedMacro mm, List<String>
         for (List<String> c : QM_COLUMNS) sum += Integer.parseInt(resolved.get(c.get(1)))
         int pct = ((100 * sum * relevance).intdiv(135)) as int
 
+        String tblAttr = QM_CONFLUENCE_TABLE_CLASSES ? ' class="confluenceTable"' : ''
+        String thAttr  = QM_CONFLUENCE_TABLE_CLASSES ? ' class="confluenceTh"' : ''
+        String tdAttr  = QM_CONFLUENCE_TABLE_CLASSES ? ' class="confluenceTd"' : ''
+
         StringBuilder headers = new StringBuilder(), values = new StringBuilder()
         for (List<String> c : QM_COLUMNS) {
-            headers.append('<th>').append(xmlText(c.get(0))).append('</th>')
-            values.append('<td>').append(xmlText(resolved.get(c.get(1)))).append('</td>')
+            headers.append('<th').append(thAttr).append('>').append(xmlText(c.get(0))).append('</th>')
+            values.append('<td').append(tdAttr).append('>').append(xmlText(resolved.get(c.get(1)))).append('</td>')
         }
         StringBuilder h = new StringBuilder()
         h.append('<p>Qualifikationsfaktor: ').append(pct).append('%</p>')
-        h.append('<table><tbody>')
-        h.append('<tr><th>Bedeutung</th><th colspan="9">Auswirkung</th></tr>')
-        h.append('<tr><th>&nbsp;</th>').append(headers).append('</tr>')
-        h.append('<tr><td>').append(relevance).append('</td>').append(values).append('</tr>')
+        h.append('<table').append(tblAttr).append('><tbody>')
+        h.append('<tr><th').append(thAttr).append('>Bedeutung</th>')
+         .append('<th').append(thAttr).append(' colspan="9">Auswirkung</th></tr>')
+        h.append('<tr><th').append(thAttr).append('>&nbsp;</th>').append(headers).append('</tr>')
+        // Row 3 first cell holds relevance, under the "Bedeutung" header - this
+        // matches the original macro's rendering. The EMPTY cell under Bedeutung
+        // is the one in the second header row above it.
+        h.append('<tr><td').append(tdAttr).append('>').append(relevance).append('</td>')
+         .append(values).append('</tr>')
         h.append('</tbody></table>')
         h.append('<p>&nbsp;</p>')
         h.append('<p>').append(pct).append('%</p>')
@@ -1141,53 +1286,62 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
         }
 
         StringBuilder outBody = new StringBuilder()
-        Matcher m = P_ANY_MACRO.matcher(body)
         int cursor = 0
+        int skipUntil = -1
 
-        while (m.find()) {
-            String xml = m.group(0)
-            String name = attrOf(P_NAME, xml)
-            MigrationDef mig = bySource.get(name)
-            if (mig == null) continue
+        for (MacroSpan sp : findMacroSpans(body)) {
+            // a macro nested inside one already replaced no longer exists
+            if (sp.start < skipUntil) continue
+            if (sp.start < cursor) continue
 
-            String mid = attrOf(P_MACRO_ID, xml)
-            List<MatchedMacro> queue = pending.get(mid)
-            if (queue == null || queue.isEmpty()) continue      // not planned
+            MigrationDef mig = bySource.get(sp.name)
+            if (mig == null) continue                       // container or unrelated macro
+            List<MatchedMacro> queue = pending.get(sp.macroId)
+            if (queue == null || queue.isEmpty()) continue   // not planned
             MatchedMacro mm = queue.remove(0)
 
             String replacement
             try {
-                // use the parameters as they are NOW, not as scanned
+                // parameters as they are NOW, not as scanned in Stage-1
                 MatchedMacro fresh = new MatchedMacro()
-                fresh.migrationId = mm.migrationId; fresh.sourceName = name; fresh.macroId = mid
+                fresh.migrationId = mm.migrationId; fresh.sourceName = sp.name; fresh.macroId = sp.macroId
                 fresh.sourceType = mm.sourceType;   fresh.targetType = mm.targetType
                 fresh.targetName = mm.targetName
-                fresh.params.putAll(parseParams(xml))
+                fresh.params.putAll(paramsOfSpan(body, sp))
                 replacement = replaceMacro(mig, fresh, notes)
             } catch (IllegalStateException ise) {
                 if (ON_MISSING == 'FAIL') throw ise
                 mm.status = ReplacementStatus.Skipped
                 mm.message = ise.getMessage()
                 mig.occSkipped++
-                notes.add('  SKIPPED macro-id=' + mid + ': ' + ise.getMessage())
-                continue                                        // leave untouched
+                notes.add('  SKIPPED macro-id=' + sp.macroId + ': ' + ise.getMessage())
+                continue                                     // leave untouched
             }
 
-            int start = m.start(), end = m.end()
-            String pre = body.substring(cursor, start)
+            int elemStart = sp.start, elemEnd = sp.end
+            String pre = body.substring(cursor, elemStart)
 
+            /*
+             * Paragraph unwrapping, needed when the replacement is a block
+             * element such as a <table>, which may not sit inside a <p>.
+             * Only consumed when the paragraph holds this macro and nothing
+             * else - so a macro sharing a paragraph with text, or with another
+             * macro, leaves the paragraph intact. Works at any nesting depth,
+             * including a <p> inside an <ac:rich-text-body>.
+             */
             if (mig.unwrapParagraph) {
                 String preTrimmed = pre.replaceAll('\\s+$', '')
                 boolean opensP = preTrimmed.endsWith('<p>')
-                Matcher closes = Pattern.compile('^\\s*</p>').matcher(body.substring(end))
+                Matcher closes = Pattern.compile('^\\s*</p>').matcher(body.substring(elemEnd))
                 if (opensP && closes.find()) {
                     pre = preTrimmed.substring(0, preTrimmed.length() - 3)
-                    end = end + closes.end()
+                    elemEnd = elemEnd + closes.end()
                 }
             }
 
             outBody.append(pre).append(replacement)
-            cursor = end
+            cursor = elemEnd
+            skipUntil = sp.end
             mm.status = ReplacementStatus.Success       // provisional until the write lands
             mig.occReplaced++
         }
@@ -1258,6 +1412,7 @@ try {
     String baseUrl = ''
     try { baseUrl = ComponentLocator.getComponent(SettingsManager).getGlobalSettings().getBaseUrl() }
     catch (Throwable t) { baseUrl = '' }
+    BASE_URL = baseUrl
 
     // ---- select migrations ------------------------------------------------
     List<MigrationDef> migrations = new ArrayList<MigrationDef>()
@@ -1519,54 +1674,11 @@ try {
     }
     if (FLUSH_AFTER_BATCH && batchCount > 0) flushSession()
 
-    // ---- SUMMARY ----------------------------------------------------------
-    outp.append('\n  RESULTS BY MIGRATION\n')
-    outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', 'MIGRATION', 'FOUND', 'REPLACED', 'SKIPPED', 'FAILED'))
-    for (MigrationDef md : migrations) {
-        outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', md.id,
-                md.occFound as String, md.occReplaced as String,
-                md.occSkipped as String, md.occFailed as String))
-    }
-
-    if (apply && CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
-        int newRows = 0
-        for (PageFinding pf : findings) {
-            for (VersionFinding vf : pf.versions) {
-                if (vf.isCurrent && vf.status == ReplacementStatus.Success) newRows++
-            }
-        }
-        if (newRows > 0) {
-            outp.append('\n  SECOND PASS REQUIRED: ').append(newRows)
-                .append(' page(s) had their current version rewritten with saveNewVersion,\n')
-                .append('  which created ').append(newRows)
-                .append(' new historical row(s) still containing the source macro.\n')
-                .append('  Re-run this script with the same settings to clean them.\n')
-        }
-    }
-
-    List<String> failedVersions = new ArrayList<String>()
-    for (PageFinding pf : findings) {
-        for (VersionFinding vf : pf.versions) {
-            if (vf.status == ReplacementStatus.Failed) {
-                failedVersions.add(pf.url + '  v' + vf.versionNumber + '  ' + vf.message)
-            }
-        }
-    }
-    if (!failedVersions.isEmpty()) {
-        outp.append('\n  FAILED VERSIONS\n')
-        for (String f : failedVersions) outp.append('    ').append(f).append('\n')
-    }
-    if (!RUN_LOG.isEmpty()) {
-        outp.append('\n  RUN LOG\n')
-        for (String l : RUN_LOG) outp.append('    ').append(l).append('\n')
-    }
-    if (TRACE_MAPPING && !notes.isEmpty()) {
-        outp.append('\n  TRACE\n')
-        for (String n : notes) outp.append('    ').append(n).append('\n')
-    }
-    outp.append('\nTOTAL ELAPSED: ').append(humanTime(System.currentTimeMillis() - runStart)).append('\n')
-
-    // ---- RESULTS LISTING --------------------------------------------------
+    // ---- RESULTS LISTING ---------------------------------------------------
+    // Built HERE, immediately after Stage-3, not at the end: everything below
+    // (summary, trace, rollback copies) can fail or run to megabytes, and the
+    // table is the one thing that must always survive. The fatal handler emits
+    // whatever has been built by the time it fires.
     if (RESULT_FORMAT == 'TABLE') {
         results.append('<h3>').append(apply ? 'Result' : 'Detected').append('</h3>')
         results.append('<table border="1" cellpadding="4" cellspacing="0"><tr>')
@@ -1617,20 +1729,79 @@ try {
         results.append('<h3>').append(RESULT_FORMAT).append('</h3><pre>').append(htmlEsc(t.toString())).append('</pre>')
     }
 
-    if (rollback.length() > 0) {
-        results.append('<h3>Rollback copies (').append(rollbackEmitted).append(')</h3>')
-               .append('<p>Console output is not a backup - take a database backup before bulk runs. ')
-               .append('These are for surgical single-version restores.</p>')
-               .append('<pre>').append(htmlEsc(rollback.toString())).append('</pre>')
+
+    // ---- SUMMARY ----------------------------------------------------------
+    outp.append('\n  RESULTS BY MIGRATION\n')
+    outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', 'MIGRATION', 'FOUND', 'REPLACED', 'SKIPPED', 'FAILED'))
+    for (MigrationDef md : migrations) {
+        outp.append(String.format('  %-24s %-9s %-10s %-9s %-8s%n', md.id,
+                md.occFound as String, md.occReplaced as String,
+                md.occSkipped as String, md.occFailed as String))
     }
 
+    if (apply && CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
+        int newRows = 0
+        for (PageFinding pf : findings) {
+            for (VersionFinding vf : pf.versions) {
+                if (vf.isCurrent && vf.status == ReplacementStatus.Success) newRows++
+            }
+        }
+        if (newRows > 0) {
+            outp.append('\n  SECOND PASS REQUIRED: ').append(newRows)
+                .append(' page(s) had their current version rewritten with saveNewVersion,\n')
+                .append('  which created ').append(newRows)
+                .append(' new historical row(s) still containing the source macro.\n')
+                .append('  Re-run this script with the same settings to clean them.\n')
+        }
+    }
+
+    List<String> failedVersions = new ArrayList<String>()
+    for (PageFinding pf : findings) {
+        for (VersionFinding vf : pf.versions) {
+            if (vf.status == ReplacementStatus.Failed) {
+                failedVersions.add(pf.url + '  v' + vf.versionNumber + '  ' + vf.message)
+            }
+        }
+    }
+    if (!failedVersions.isEmpty()) {
+        outp.append('\n  FAILED VERSIONS\n')
+        for (String f : failedVersions) outp.append('    ').append(f).append('\n')
+    }
+    if (!RUN_LOG.isEmpty()) {
+        outp.append('\n  RUN LOG\n')
+        for (String l : RUN_LOG) outp.append('    ').append(l).append('\n')
+    }
+    if (TRACE_MAPPING && !notes.isEmpty()) {
+        outp.append('\n  TRACE\n')
+        for (String n : notes) outp.append('    ').append(n).append('\n')
+    }
+    outp.append('\nTOTAL ELAPSED: ').append(humanTime(System.currentTimeMillis() - runStart)).append('\n')
+
+    // ---- ASSEMBLE OUTPUT ---------------------------------------------------
     log.warn("Macro engine v2: mode=${MODE}, pages=${findings.size()}, elapsed=${System.currentTimeMillis() - runStart} ms")
-    return '<pre>' + htmlEsc(outp.toString()) + '</pre>' + results.toString()
+
+    /*
+     * Order matters: the results table goes FIRST. The trace and the rollback
+     * copies can run to megabytes, and the console truncates long output - which
+     * is why the tables appeared to be missing entirely when they were simply
+     * past the cut. Bulk data goes last, where losing the tail costs nothing.
+     */
+    StringBuilder page = new StringBuilder()
+    page.append(results)
+    page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
+    if (rollback.length() > 0) {
+        page.append('<h3>Rollback copies (').append(rollbackEmitted).append(')</h3>')
+            .append('<p>Console output is not a backup - take a database backup before bulk runs. ')
+            .append('These are for surgical single-version restores.</p>')
+            .append('<pre>').append(htmlEsc(rollback.toString())).append('</pre>')
+    }
+    return page.toString()
 
 } catch (Throwable fatal) {
     log.error('Macro engine v2 terminated', fatal)
     StringBuilder err = new StringBuilder()
     err.append(outp)
+    // results, if any were built before the failure, are appended after this block
     err.append('\n================================================================\n')
     err.append('RUN TERMINATED\n')
     err.append(fatal.getClass().getName()).append(': ').append(fatal.getMessage()).append('\n')
@@ -1640,5 +1811,5 @@ try {
         cause = cause.getCause()
     }
     err.append('\nFull stack trace is in atlassian-confluence.log\n')
-    return '<pre>' + htmlEsc(err.toString()) + '</pre>'
+    return results.toString() + '<pre>' + htmlEsc(err.toString()) + '</pre>'
 }
