@@ -1577,6 +1577,8 @@ String legendHtml(boolean showMigration, boolean apply) {
     b.append('<h3>Legend Table:</h3>')
     b.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
     b.append('<tr><th>Column</th><th>Meaning</th></tr>')
+    b.append('<tr><td>Space Key</td><td>Key of the space the page belongs to. Read once from the ')
+     .append('current version - historical version rows do not carry a space.</td></tr>')
     b.append('<tr><td>Page ID</td><td>Page id in scope of macro replacement where particular page ')
      .append('versions contain macros planned for replacement.</td></tr>')
     b.append('<tr><td>Page Name</td><td>Title of the page.</td></tr>')
@@ -1809,8 +1811,8 @@ try {
     boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
     if (RESULT_FORMAT == 'CSV') {
         csvBody.append(perMacro
-            ? 'page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
-            : 'page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
+            ? 'space_key,page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
+            : 'space_key,page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
     }
 
     outp.append('STAGE-3  ').append(apply ? 'EXECUTE' : 'DRY RUN').append('\n')
@@ -1960,14 +1962,15 @@ try {
                     results.append('<h3>Results Table:</h3>')
                     results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
                     if (perMacro) {
-                        results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page V.</th><th>Current</th>')
-                               .append('<th>Macro #</th>')
+                        results.append('<tr><th>Space Key</th><th>Page ID</th><th>Page Name</th>')
+                               .append('<th>Page V.</th><th>Current</th><th>Macro #</th>')
                         if (RESULT_SHOW_MIGRATION_COLUMN) results.append('<th>Migration</th>')
                         results.append('<th>Source</th><th>Source Type</th><th>Target</th><th>Target Type</th>')
                                .append('<th>ac:macro-id</th><th>Status</th><th>Details</th>')
                                .append('<th>Comments</th><th>URL</th></tr>')
                     } else {
-                        results.append('<tr><th>Page ID</th><th>Page Name</th><th>Page URL</th><th>Page V.</th>')
+                        results.append('<tr><th>Space Key</th><th>Page ID</th><th>Page Name</th>')
+                               .append('<th>Page URL</th><th>Page V.</th>')
                                .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
                                .append('<th>Failed</th><th>Status</th></tr>')
                     }
@@ -1983,7 +1986,8 @@ try {
                             String colour = (mm.status == ReplacementStatus.Success) ? ''
                                     : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
                                                                               : ' style="background:#ffecec"')
-                            results.append('<tr').append(colour).append('><td>').append(pf.pageId)
+                            results.append('<tr').append(colour).append('><td>').append(htmlEsc(pf.spaceKey))
+                                   .append('</td><td>').append(pf.pageId)
                                    .append('</td><td>').append(htmlEsc(pf.pageName))
                                    .append('</td><td>').append(vf.versionNumber)
                                    .append('</td><td>').append(vf.isCurrent ? 'yes' : '')
@@ -2002,7 +2006,7 @@ try {
                                    .append('<td><a href="').append(pf.url)
                                    .append('" target="_blank">open</a></td></tr>')
                         } else {
-                            List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                            List<String> fields = [pf.spaceKey, pf.pageId as String, pf.pageName, pf.url,
                                                    vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
                                                    mm.macroIndex as String, mm.migrationId, mm.sourceName,
                                                    shortType(mm.sourceType), targetLabelFor(byId, mm),
@@ -2015,7 +2019,8 @@ try {
                 } else {
                     resultRowCount++
                     if (RESULT_FORMAT == 'TABLE') {
-                        results.append('<tr><td>').append(pf.pageId)
+                        results.append('<tr><td>').append(htmlEsc(pf.spaceKey))
+                               .append('</td><td>').append(pf.pageId)
                                .append('</td><td>').append(htmlEsc(pf.pageName))
                                .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
                                .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
@@ -2025,7 +2030,7 @@ try {
                                .append('</td><td>').append(flc)
                                .append('</td><td>').append(vf.status).append('</td></tr>')
                     } else {
-                        List<String> fields = [pf.pageId as String, pf.pageName, pf.url,
+                        List<String> fields = [pf.spaceKey, pf.pageId as String, pf.pageName, pf.url,
                                                vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
                                                vf.matchedMacros.size() as String, rc as String,
                                                skc as String, flc as String, vf.status as String]
