@@ -160,6 +160,53 @@ enum ReplacementStatus {
 // Legend table above the results, explaining columns and abbreviations.
 @Field boolean RESULT_SHOW_LEGEND = true
 
+/*
+ * Cap on rows appended to the results output. Rows are HTML in memory and then
+ * one page in a browser: at roughly 400 bytes per row, 100k rows is ~40 MB of
+ * markup in a single table, which the browser will struggle to render even
+ * though the script produced it happily. Beyond the cap rows are COUNTED but
+ * not appended, and the table says so - the run itself is unaffected.
+ * 0 = no cap.
+ */
+@Field int MAX_RESULT_ROWS = 0
+
+/*
+ * Above this many occurrences, an HTML results table is a bad idea: each row is
+ * ~15 cells, so 26,000 occurrences is ~390,000 DOM nodes in one table and the
+ * browser will fall over rendering it, however happily the script produced it.
+ * CSV carries exactly the same rows as a single block of text - complete, no
+ * truncation - and costs the browser almost nothing. This only warns; it never
+ * changes the format for you.
+ */
+@Field int RESULT_TABLE_WARN_ROWS = 5000
+
+/*
+ * Split the HTML results table into chunks of this many rows, each in a
+ * content-visibility:auto wrapper so the browser can skip layout and paint for
+ * chunks that are off screen. Helps a huge table render, but the chunks are
+ * separate tables - awkward to select and copy as one. 0 = one single table.
+ * For large runs prefer RESULT_FORMAT = 'CSV' below.
+ */
+@Field int RESULT_TABLE_CHUNK_ROWS = 0
+@Field int RESULT_ROW_HEIGHT_PX = 28
+
+/*
+ * With RESULT_FORMAT = 'CSV', put the rows in a <textarea> with a Copy button
+ * rather than a <pre>.
+ *
+ * A textarea is ONE DOM node however many rows it holds - the browser manages
+ * its content internally instead of laying out a node per cell - so 26,000 rows
+ * costs about what 26 rows costs. It also solves selecting the lot: click in it
+ * and Ctrl+A, or press the button.
+ *
+ * The button uses an inline onclick handler. Script blocks injected as HTML do
+ * not execute, but inline handlers on inserted elements usually do - "usually"
+ * because Confluence may sanitise them. If the button does nothing, the
+ * textarea still works with Ctrl+A / Ctrl+C, so nothing is lost either way.
+ */
+@Field boolean RESULT_CSV_TEXTAREA = true
+@Field int RESULT_TEXTAREA_ROWS = 24
+
 // Rollback copies. Compressed output is deflate + Base64; Base64 is required
 // because the console returns a String and raw deflate bytes are not valid text.
 @Field boolean EMIT_ROLLBACK_COPIES = true
@@ -1641,6 +1688,7 @@ StringBuilder results = new StringBuilder()
 StringBuilder csvBody = new StringBuilder()
 boolean resultsTableOpen = false
 int resultRowCount = 0
+int resultRowsTruncated = 0
 
 try {
     if (MODE != 'INSPECT' && MODE != 'APPLY') throw new IllegalStateException('MODE must be INSPECT or APPLY')
@@ -1784,7 +1832,15 @@ try {
     outp.append('  pages with matches: ').append(findings.size())
         .append('   versions with matches: ').append(totalVersions)
         .append('   occurrences: ').append(totalOcc).append('\n')
-    outp.append('  session flush: ').append(FLUSH_NOTE).append('\n\n')
+    outp.append('  session flush: ').append(FLUSH_NOTE).append('\n')
+    if (RESULT_FORMAT == 'TABLE' && RESULT_GRANULARITY == 'MACRO' &&
+        RESULT_TABLE_WARN_ROWS > 0 && totalOcc > RESULT_TABLE_WARN_ROWS) {
+        outp.append('\n  WARNING: ').append(plural(totalOcc, 'occurrence'))
+            .append(' will produce that many HTML table rows (~').append((int) (totalOcc * 15))
+            .append(' cells). Browsers struggle well below this. Set RESULT_FORMAT = \'CSV\'\n')
+            .append('           for the same rows as text, or narrow the scope to one space per run.\n')
+    }
+    outp.append('\n')
 
     // ---- STAGE 2 ----------------------------------------------------------
     outp.append('STAGE-2  PLAN\n----------------------------------------------------------------\n')
@@ -1955,11 +2011,20 @@ try {
                 // produces no dangling table, and the header never appears
                 // before there is anything under it
                 if (RESULT_FORMAT == 'TABLE' && !resultsTableOpen && !vf.matchedMacros.isEmpty()) {
-                    if (RESULT_SHOW_LEGEND && perMacro) {
-                        results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
-                        results.append('<div style="height:16px"></div>')
+                    if (!legendEmitted) {
+                        if (RESULT_SHOW_LEGEND && perMacro) {
+                            results.append(legendHtml(RESULT_SHOW_MIGRATION_COLUMN, apply))
+                            results.append('<div style="height:16px"></div>')
+                        }
+                        results.append('<h3>Results Table:</h3>')
+                        legendEmitted = true
                     }
-                    results.append('<h3>Results Table:</h3>')
+                    // Each chunk sits in a wrapper the browser can skip laying
+                    // out while it is off screen, and lay out on scroll.
+                    if (RESULT_TABLE_CHUNK_ROWS > 0) {
+                        results.append('<div style="content-visibility:auto;contain-intrinsic-size:auto ')
+                               .append(RESULT_TABLE_CHUNK_ROWS * RESULT_ROW_HEIGHT_PX).append('px">')
+                    }
                     results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
                     if (perMacro) {
                         results.append('<tr><th>Space Key</th><th>Page ID</th><th>Page Name</th>')
@@ -1975,6 +2040,7 @@ try {
                                .append('<th>Failed</th><th>Status</th></tr>')
                     }
                     resultsTableOpen = true
+                    rowsInChunk = 0
                 }
                 if (perMacro) {
                     for (MatchedMacro mm : vf.matchedMacros) {
@@ -1982,7 +2048,10 @@ try {
                         String shownStatus = (!apply && mm.status == ReplacementStatus.Success)
                                 ? 'Would replace' : (mm.status as String)
                         resultRowCount++
-                        if (RESULT_FORMAT == 'TABLE') {
+                        rowsInChunk++
+                        if (MAX_RESULT_ROWS > 0 && resultRowCount > MAX_RESULT_ROWS) {
+                            resultRowsTruncated++
+                        } else if (RESULT_FORMAT == 'TABLE') {
                             String colour = (mm.status == ReplacementStatus.Success) ? ''
                                     : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
                                                                               : ' style="background:#ffecec"')
@@ -2018,7 +2087,10 @@ try {
                     }
                 } else {
                     resultRowCount++
-                    if (RESULT_FORMAT == 'TABLE') {
+                    rowsInChunk++
+                    if (MAX_RESULT_ROWS > 0 && resultRowCount > MAX_RESULT_ROWS) {
+                        resultRowsTruncated++
+                    } else if (RESULT_FORMAT == 'TABLE') {
                         results.append('<tr><td>').append(htmlEsc(pf.spaceKey))
                                .append('</td><td>').append(pf.pageId)
                                .append('</td><td>').append(htmlEsc(pf.pageName))
@@ -2039,6 +2111,13 @@ try {
                         csvBody.append(q.join(',')).append('\n')
                     }
                 }
+            }
+
+            // ---- close a full chunk so the next rows start a new table ---
+            if (RESULT_FORMAT == 'TABLE' && resultsTableOpen && RESULT_TABLE_CHUNK_ROWS > 0 &&
+                rowsInChunk >= RESULT_TABLE_CHUNK_ROWS) {
+                results.append('</table></div>')
+                resultsTableOpen = false        // next row reopens with headers
             }
 
             // ---- rollback copies, emitted per version then dropped ------
@@ -2066,10 +2145,38 @@ try {
     if (FLUSH_AFTER_BATCH && batchCount > 0) flushSession()
 
     // ---- close the results output -------------------------------------------
-    if (resultsTableOpen) { results.append('</table>'); resultsTableOpen = false }
+    if (resultsTableOpen) {
+        results.append('</table>')
+        if (RESULT_TABLE_CHUNK_ROWS > 0) results.append('</div>')
+        if (resultRowsTruncated > 0) {
+            results.append('<p><b>').append(plural(resultRowsTruncated, 'further row'))
+                   .append(' not shown</b> - MAX_RESULT_ROWS is ').append(MAX_RESULT_ROWS)
+                   .append('. The run processed everything; only the listing is capped. ')
+                   .append('Use RESULT_FORMAT = \'CSV\' or RESULT_GRANULARITY = \'VERSION\' for large runs.</p>')
+        }
+        resultsTableOpen = false
+    }
     if (RESULT_FORMAT == 'CSV') {
-        results.append('<h3>CSV (').append(resultRowCount).append(' rows)</h3><pre>')
-               .append(htmlEsc(csvBody.toString())).append('</pre>')
+        results.append('<h3>Results CSV (').append(plural(resultRowCount, 'row')).append(')</h3>')
+        if (RESULT_CSV_TEXTAREA) {
+            String taId = 'macroResults' + System.currentTimeMillis()
+            results.append('<p><button type="button" onclick="')
+                   .append("var t=document.getElementById('").append(taId).append("');")
+                   .append('t.focus();t.select();')
+                   .append("try{document.execCommand('copy');this.textContent='Copied ")
+                   .append(resultRowCount).append(" rows';}")
+                   .append("catch(e){this.textContent='Copy failed - use Ctrl+A, Ctrl+C';}")
+                   .append('">Copy all rows to clipboard</button>')
+                   .append(' <span style="font-size:90%">&nbsp;or click inside the box and press ')
+                   .append('Ctrl+A, Ctrl+C</span></p>')
+            results.append('<textarea id="').append(taId).append('" readonly rows="')
+                   .append(RESULT_TEXTAREA_ROWS)
+                   .append('" style="width:100%;font-family:monospace;font-size:85%;white-space:pre">')
+                   .append(htmlEsc(csvBody.toString()))
+                   .append('</textarea>')
+        } else {
+            results.append('<pre>').append(htmlEsc(csvBody.toString())).append('</pre>')
+        }
     } else if (RESULT_FORMAT == 'LIST') {
         StringBuilder urls = new StringBuilder()
         Set<String> seenUrls = new LinkedHashSet<String>()
@@ -2141,6 +2248,7 @@ try {
     // are the record of what actually completed, and are worth keeping.
     if (resultsTableOpen) {
         results.append('</table>')
+        if (RESULT_TABLE_CHUNK_ROWS > 0) results.append('</div>')
         results.append('<p><b>PARTIAL RESULTS</b> - the run terminated after ')
                .append(plural(resultRowCount, 'row')).append('. Everything above completed; ')
                .append('anything not listed was never reached.</p>')
