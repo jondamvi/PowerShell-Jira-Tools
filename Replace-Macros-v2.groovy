@@ -182,6 +182,11 @@ enum ReplacementStatus {
 //  Per type, the fields that matter:
 //    UserMacro / ScriptRunnerMacro source
 //        sourceParam    parameter carrying the value (validated to exist)
+//        values         optional, explicit list of values the parameter can hold.
+//                       Use when the macro declares no enumValues because its
+//                       allowed values are constrained inside the macro body.
+//        valueRange     optional, [from, to] integers expanded to a list, e.g.
+//                       [0, 10]. Shorthand for values.
 //    EddStatusMacro target
 //        setId, setName, options: [ '<source enum value>': '<option-id>', ... ]
 //    Static_QualificationTable target
@@ -263,6 +268,9 @@ class MigrationDef {
     boolean unwrapParagraph, dropUnmapped = true
     // filled by Stage-0
     List<String> sourceEnumValues = new ArrayList<String>()
+    // set from config when the macro declares no enumValues because its allowed
+    // values are constrained inside the macro body rather than in @param
+    List<String> sourceValuesOverride = new ArrayList<String>()
     Map<String, String> discoveredDefaults = new LinkedHashMap<String, String>()
     // counters
     int occFound, occReplaced, occSkipped, occFailed
@@ -379,6 +387,15 @@ String xmlText(Object v) {
 String htmlEsc(Object v) {
     if (v == null) return ''
     return v.toString().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+}
+
+/** "1 problem" / "2 problems" - avoids the "(s)" that reads as unfinished. */
+String plural(int n, String one) {
+    return n as String + ' ' + (n == 1 ? one : one + 's')
+}
+
+String plural(int n, String one, String many) {
+    return n as String + ' ' + (n == 1 ? one : many)
 }
 
 String humanTime(long ms) {
@@ -768,6 +785,14 @@ MigrationDef toMigration(Map<String, Object> cfg) {
         if (tgt.get('paramMap') != null)     m.paramMap.putAll((Map<String, String>) tgt.get('paramMap'))
         if (tgt.get('staticParams') != null) m.staticParams.putAll((Map<String, String>) tgt.get('staticParams'))
         if (src.get('paramDefaults') != null) m.paramDefaults.putAll((Map<String, String>) src.get('paramDefaults'))
+        if (src.get('values') != null) {
+            for (Object v : (List) src.get('values')) m.sourceValuesOverride.add(v as String)
+        } else if (src.get('valueRange') != null) {
+            List r = (List) src.get('valueRange')
+            int from = (r.get(0) as Integer).intValue()
+            int to = (r.get(1) as Integer).intValue()
+            for (int i = from; i <= to; i++) m.sourceValuesOverride.add(i as String)
+        }
 
         m.unwrapParagraph = cfg.get('unwrapParagraph') == null ? false : (Boolean) cfg.get('unwrapParagraph')
         if (tgt.get('dropUnmapped') != null) m.dropUnmapped = (Boolean) tgt.get('dropUnmapped')
@@ -846,6 +871,14 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
             }
         }
 
+        // Explicit config wins: a parameter can be constrained inside the macro
+        // body rather than in its @param line, where introspection cannot see it.
+        if (!m.sourceValuesOverride.isEmpty()) {
+            m.sourceEnumValues = new ArrayList<String>(m.sourceValuesOverride)
+            detail.append('  ').append(m.id).append(': source values taken from config (')
+                  .append(m.sourceEnumValues.size()).append('), not from the macro definition\n')
+        }
+
         // --- target ------------------------------------------------------
         if (m.targetType == MacroType.Static_QualificationTable) {
             detail.append('  ').append(m.id).append(': target is computed static storage, no target macro to check\n')
@@ -872,6 +905,12 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
         }
 
         List<String> srcVals = m.sourceEnumValues
+        if (srcVals.isEmpty()) {
+            issues.add(issue(m.id, m.sourceName, m.targetName,
+                    'source parameter "' + m.sourceParam + '" declares no enum values. If its ' +
+                    'allowed values are constrained inside the macro body, declare them with ' +
+                    'values: [...] or valueRange: [from, to] on the source block.'))
+        }
         List<String> liveNames = new ArrayList<String>(live.keySet())
         List<String> cfgNames  = new ArrayList<String>(m.options.keySet())
 
@@ -1223,7 +1262,7 @@ String replaceAuraButton(MigrationDef mig, MatchedMacro mm, List<String> notes) 
             }
         }
         if (!missing.isEmpty()) {
-            throw new IllegalStateException('parameter(s) ' + missing + ' are absent from the page ' +
+            throw new IllegalStateException(plural(missing.size(), 'parameter') + ' ' + missing + ' absent from the page ' +
                     'and have no declared default; parsed from this macro: ' + describeParams(mm.params))
         }
 
@@ -1264,7 +1303,7 @@ String replaceQualificationTable(MigrationDef mig, MatchedMacro mm, List<String>
             resolved.put(key, v)
         }
         if (!missing.isEmpty()) {
-            throw new IllegalStateException('unresolved/non-numeric parameter(s) ' + missing +
+            throw new IllegalStateException('unresolved or non-numeric ' + plural(missing.size(), 'parameter') + ' ' + missing +
                     '; parsed from this macro: ' + mm.params)
         }
 
@@ -1643,7 +1682,7 @@ try {
     for (String r : RUN) { if (!knownIds.contains(r)) outp.append('WARNING: RUN id "').append(r).append('" is not defined\n') }
     if (!PAGE_IDS_OVERRIDE.isEmpty()) {
         outp.append('WARNING: PAGE_IDS_OVERRIDE set - database discovery is bypassed for every migration; ')
-            .append(PAGE_IDS_OVERRIDE.size()).append(' page(s) will be examined\n')
+            .append(plural(PAGE_IDS_OVERRIDE.size(), 'page')).append(' will be examined\n')
     }
     if (CURRENT_CREATES_NEW_VERSION && UPDATE_HISTORICAL_VERSIONS) {
         throw new IllegalStateException(
@@ -1675,10 +1714,10 @@ try {
             outp.append(String.format('  %-22s %-34s %-34s %s%n',
                     vi.migrationId, vi.sourceLabel, vi.targetLabel, vi.description))
         }
-        outp.append('\n  ').append(issues.size()).append(' validation issue(s). Nothing was read or written.\n')
+        outp.append('\n  ').append(plural(issues.size(), 'validation issue')).append('. Nothing was read or written.\n')
         return '<pre>' + htmlEsc(outp.toString()) + '</pre>'
     }
-    outp.append('  passed (').append(migrations.size()).append(' migration(s) validated)\n')
+    outp.append('  passed (').append(plural(migrations.size(), 'migration')).append(' validated)\n')
     if (!VALIDATION_SHOW_DETAIL) {
         outp.append('  set VALIDATION_SHOW_DETAIL = true to see the parameter and option tables\n')
     }
@@ -1758,7 +1797,7 @@ try {
             }
         }
     }
-    outp.append('  planned: ').append(totalOcc).append(' occurrence(s)\n\n')
+    outp.append('  planned: ').append(plural(totalOcc, 'occurrence')).append('\n\n')
 
     // ---- STAGE 3 ----------------------------------------------------------
     /*
@@ -1879,7 +1918,7 @@ try {
                     }
                     vf.status = (stillThere == 0) ? ReplacementStatus.Success : ReplacementStatus.Failed
                     vf.message = (stillThere == 0) ? 'written and verified'
-                                                   : stillThere + ' macro(s) still present after write'
+                                                   : plural(stillThere, 'macro') + ' still present after write'
                 } else {
                     vf.status = ReplacementStatus.Success
                     vf.message = 'written (not verified)'
@@ -2098,7 +2137,7 @@ try {
     if (resultsTableOpen) {
         results.append('</table>')
         results.append('<p><b>PARTIAL RESULTS</b> - the run terminated after ')
-               .append(resultRowCount).append(' row(s). Everything above completed; ')
+               .append(plural(resultRowCount, 'row')).append('. Everything above completed; ')
                .append('anything not listed was never reached.</p>')
     }
     if (RESULT_FORMAT == 'CSV' && csvBody.length() > 0) {

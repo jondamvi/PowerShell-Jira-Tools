@@ -49,6 +49,14 @@ import java.util.regex.Pattern
  *   source.name         ac:name of the macro being replaced
  *   source.type         MacroType member name (see TYPE_NAMES)
  *   source.sourceParam  OPTIONAL - omit to have it discovered
+ *   source.values       OPTIONAL - explicit list of values the parameter can
+ *                       hold, e.g. ['Offen','Geschlossen']. Use when the macro
+ *                       does not declare enumValues - a free-text or numeric
+ *                       parameter constrained inside the macro body rather than
+ *                       in its @param line. Overrides discovery.
+ *   source.valueRange   OPTIONAL - [from, to] integer bounds expanded to a list,
+ *                       e.g. [0, 10] for "Zahl zwischen 0 und 10". Shorthand for
+ *                       source.values.
  *   target.type         MacroType member name
  *   target.name         ac:name of the replacement macro. For EddStatusMacro it
  *                       defaults to DEFAULT_EDD_MACRO, since every set uses the
@@ -231,11 +239,60 @@ List<ParamInfo> macroParams(String macroName, String type) {
     }
 }
 
+/*
+ * Comments out an entire generated block, line by line.
+ *
+ * The block used to be prefixed at each append site, which silently missed the
+ * closers appended mid-line - so a commented-out entry could still emit a live
+ * "]," and break the MIGRATIONS list on paste. Building the block raw and
+ * prefixing it whole makes commenting all-or-nothing.
+ */
+String commentBlock(String text, boolean commentOut) {
+    if (!commentOut) return text
+    StringBuilder b = new StringBuilder()
+    for (String line : text.readLines()) {
+        b.append(line.trim().isEmpty() ? '' : '//  ' + line).append('\n')
+    }
+    return b.toString()
+}
+
+/**
+ * Values the source parameter can hold: an explicit list, an integer range, or
+ * whatever the macro declares as enumValues. Explicit config always wins - a
+ * parameter can be constrained inside the macro body rather than in its @param
+ * line, and no amount of introspection will find that.
+ */
+List<String> sourceValuesFor(Map<String, Object> srcCfg, List<String> discovered) {
+    if (srcCfg != null && srcCfg.get('values') != null) {
+        List<String> out = new ArrayList<String>()
+        for (Object v : (List) srcCfg.get('values')) out.add(v as String)
+        return out
+    }
+    if (srcCfg != null && srcCfg.get('valueRange') != null) {
+        List r = (List) srcCfg.get('valueRange')
+        int from = (r.get(0) as Integer).intValue()
+        int to = (r.get(1) as Integer).intValue()
+        List<String> out = new ArrayList<String>()
+        for (int i = from; i <= to; i++) out.add(i as String)
+        return out
+    }
+    return discovered
+}
+
+/** "1 problem" / "2 problems" - avoids the "(s)" that reads as unfinished. */
+String plural(int n, String one) {
+    return n as String + ' ' + (n == 1 ? one : one + 's')
+}
+
+String plural(int n, String one, String many) {
+    return n as String + ' ' + (n == 1 ? one : many)
+}
+
 String paramTable(String label, String macroName, List<ParamInfo> params) {
     StringBuilder b = new StringBuilder()
     b.append('  ').append(label).append(': ').append(macroName)
     if (params == null) { b.append('   NOT FOUND as this type\n'); return b.toString() }
-    b.append('   ').append(params.size()).append(' parameter(s)\n')
+    b.append('   ').append(plural(params.size(), 'parameter')).append('\n')
     if (params.isEmpty()) return b.toString()
     b.append('    ').append(String.format('%-24s %-10s %-9s %-14s %s',
             'PARAMETER', 'TYPE', 'REQUIRED', 'DEFAULT', 'ENUM VALUES')).append('\n')
@@ -458,12 +515,21 @@ try {
                 List<String> optNames = new ArrayList<String>()
                 for (List<String> o : options) optNames.add(o.get(0))
 
+                String valueSource = 'macro enumValues'
+                if (srcCfg.get('values') != null) valueSource = 'source.values in WANTED'
+                else if (srcCfg.get('valueRange') != null) valueSource = 'source.valueRange in WANTED'
+                srcEnum = sourceValuesFor(srcCfg, srcEnum)
+                detail.append('  source values (').append(valueSource).append('): ')
+                      .append(srcEnum.isEmpty() ? '(none)' : srcEnum.join(', ')).append('\n')
+
                 if (srcEnum.isEmpty() && srcParam != null) {
-                    problems.add('source parameter "' + srcParam + '" declares no enum values')
+                    problems.add('source parameter "' + srcParam + '" declares no enum values. ' +
+                                 'If its allowed values are constrained inside the macro body, ' +
+                                 'declare them with source.values or source.valueRange in WANTED.')
                 }
                 if (!srcEnum.isEmpty() && srcEnum.size() != optNames.size()) {
-                    problems.add('COUNT MISMATCH: ' + srcEnum.size() + ' source enum value(s) vs ' +
-                                 optNames.size() + ' target option(s)')
+                    problems.add('COUNT MISMATCH: ' + plural(srcEnum.size(), 'source value') +
+                                 ' vs ' + plural(optNames.size(), 'target option'))
                 }
                 for (String v : srcEnum) { if (!optNames.contains(v)) problems.add('source value "' + v + '" has no target option') }
                 for (String o : optNames) { if (!srcEnum.contains(o)) problems.add('target option "' + o + '" has no source value') }
@@ -489,11 +555,10 @@ try {
                 }
 
                 boolean ok = problems.isEmpty()
-                String pfx = ok ? '' : '//  '
                 if (ok) { ready++; detail.append('\n  validation: OK\n\n') }
                 else {
                     blockedCount++
-                    detail.append('\n  validation: ').append(problems.size()).append(' problem(s)\n')
+                    detail.append('\n  validation: ').append(plural(problems.size(), 'problem')).append('\n')
                     for (String p : problems) detail.append('    - ').append(p).append('\n')
                     detail.append('\n')
                     cfg.append('//  ').append(migId).append(' - COMMENTED OUT, Stage-0 would reject it:\n')
@@ -502,25 +567,28 @@ try {
 
                 int w = 0
                 for (List<String> o : options) { int l = o.get(0).length(); if (l > w) w = l }
-                cfg.append(pfx).append('    [\n')
-                cfg.append(pfx).append("        id     : '").append(migId).append("',\n")
-                cfg.append(pfx).append("        source : [name: '").append(srcMacro)
+                StringBuilder blk = new StringBuilder()
+                blk.append('    [\n')
+                blk.append("        id     : '").append(migId).append("',\n")
+                blk.append("        source : [name: '").append(srcMacro)
                    .append("', type: MacroType.").append(srcType)
                    .append(", sourceParam: '").append(srcParam == null ? 'UNRESOLVED' : srcParam).append("'],\n")
-                cfg.append(pfx).append("        target : [name: '").append(tgtMacro)
+                blk.append("        target : [name: '").append(tgtMacro)
                    .append("', type: MacroType.EddStatusMacro,\n")
-                cfg.append(pfx).append("                  schemaVersion: '").append(EDD_SCHEMA_VER).append("',\n")
-                cfg.append(pfx).append("                  setId  : '").append(setGuid == null ? 'UNRESOLVED' : setGuid).append("',\n")
-                cfg.append(pfx).append("                  setName: '").append(setName).append("',\n")
-                cfg.append(pfx).append('                  options: [\n')
+                blk.append("                  schemaVersion: '").append(EDD_SCHEMA_VER).append("',\n")
+                blk.append("                  setId  : '").append(setGuid == null ? 'UNRESOLVED' : setGuid).append("',\n")
+                blk.append("                  setName: '").append(setName).append("',\n")
+                blk.append('                  options: [\n')
                 for (List<String> o : options) {
                     String key = "'" + o.get(0).replace("'", "\\'") + "'"
-                    cfg.append(pfx).append('                      ')
+                    blk.append('                      ')
                        .append(String.format('%-' + (w + 2) + 's', key))
                        .append(": '").append(o.get(1)).append("',\n")
                 }
-                cfg.append(pfx).append('                  ]],\n')
-                cfg.append(pfx).append('    ],\n')
+                blk.append('                  ]],\n')
+                blk.append('    ],\n')
+                cfg.append(commentBlock(blk.toString(), !ok))
+
                 continue
             }
 
@@ -576,47 +644,49 @@ try {
                 detail.append('  label <- ').append(labelFrom == null ? '(undecided)' : labelFrom).append('\n')
 
                 boolean okA = problems.isEmpty()
-                String pfxA = okA ? '' : '//  '
                 if (okA) { ready++; detail.append('\n  validation: OK\n\n') }
                 else {
                     blockedCount++
-                    detail.append('\n  validation: ').append(problems.size()).append(' problem(s)\n')
+                    detail.append('\n  validation: ').append(plural(problems.size(), 'problem')).append('\n')
                     for (String pr : problems) detail.append('    - ').append(pr).append('\n')
                     detail.append('\n')
                     cfg.append('//  ').append(migId).append(' - COMMENTED OUT, Stage-0 would reject it:\n')
                     for (String pr : problems) cfg.append('//      ').append(pr).append('\n')
                 }
 
-                cfg.append(pfxA).append('    [\n')
-                cfg.append(pfxA).append("        id     : '").append(migId).append("',\n")
-                cfg.append(pfxA).append("        source : [name: '").append(srcMacro)
+                StringBuilder blk = new StringBuilder()
+                blk.append('    [\n')
+                blk.append("        id     : '").append(migId).append("',\n")
+                blk.append("        source : [name: '").append(srcMacro)
                    .append("', type: MacroType.").append(srcType)
                 if (!defs.isEmpty()) {
                     List<String> dparts = new ArrayList<String>()
                     for (Map.Entry<String, String> de : defs.entrySet()) {
                         dparts.add("'" + de.getKey() + "': '" + de.getValue().replace("'", "\\'") + "'")
                     }
-                    cfg.append(',\n').append(pfxA).append('                  paramDefaults: [')
+                    blk.append(',\n').append('                  paramDefaults: [')
                        .append(dparts.join(', ')).append(']')
                 }
-                cfg.append('],\n')
-                cfg.append(pfxA).append("        target : [name: '").append(tgtMacro)
+                blk.append('],\n')
+                blk.append("        target : [name: '").append(tgtMacro)
                    .append("', type: MacroType.AuraLinkButton,\n")
-                cfg.append(pfxA).append("                  schemaVersion: '1',\n")
-                cfg.append(pfxA).append('                  paramMap: [')
+                blk.append("                  schemaVersion: '1',\n")
+                blk.append('                  paramMap: [')
                    .append("'").append(hrefFrom == null ? 'UNRESOLVED' : hrefFrom).append("': 'href', ")
                    .append("'").append(labelFrom == null ? 'UNRESOLVED' : labelFrom).append("': 'label'],\n")
-                cfg.append(pfxA).append('                  staticParams: [\n')
+                blk.append('                  staticParams: [\n')
                 int wA = 0
                 for (String k : AURA_STYLE.keySet()) { if (k.length() > wA) wA = k.length() }
                 for (Map.Entry<String, String> se : AURA_STYLE.entrySet()) {
-                    cfg.append(pfxA).append('                      ')
+                    blk.append('                      ')
                        .append(String.format('%-' + (wA + 2) + 's', "'" + se.getKey() + "'"))
                        .append(": '").append(se.getValue()).append("',\n")
                 }
-                cfg.append(pfxA).append('                  ],\n')
-                cfg.append(pfxA).append('                  dropUnmapped: true],\n')
-                cfg.append(pfxA).append('    ],\n')
+                blk.append('                  ],\n')
+                blk.append('                  dropUnmapped: true],\n')
+                blk.append('    ],\n')
+                cfg.append(commentBlock(blk.toString(), !okA))
+
                 continue
             }
 
@@ -668,40 +738,46 @@ try {
             }
 
             boolean ok2 = problems.isEmpty()
-            String pfx2 = ok2 ? '' : '//  '
             if (ok2) { ready++; detail.append('\n  validation: OK\n\n') }
             else {
                 blockedCount++
-                detail.append('\n  validation: ').append(problems.size()).append(' problem(s)\n')
+                detail.append('\n  validation: ').append(plural(problems.size(), 'problem')).append('\n')
                 for (String p : problems) detail.append('    - ').append(p).append('\n')
                 detail.append('\n')
                 cfg.append('//  ').append(migId).append(' - COMMENTED OUT, Stage-0 would reject it:\n')
                 for (String p : problems) cfg.append('//      ').append(p).append('\n')
             }
 
-            cfg.append(pfx2).append('    [\n')
-            cfg.append(pfx2).append("        id     : '").append(migId).append("',\n")
+            StringBuilder blk = new StringBuilder()
+            blk.append('    [\n')
+            blk.append("        id     : '").append(migId).append("',\n")
             // sourceParam is only read by EddStatusMacro and AuraLinkButton targets;
             // for a plain macro-to-macro swap it is noise.
-            cfg.append(pfx2).append("        source : [name: '").append(srcMacro)
+            blk.append("        source : [name: '").append(srcMacro)
                .append("', type: MacroType.").append(srcType).append('],\n')
-            cfg.append(pfx2).append("        target : [name: '").append(tgtMacro)
+            blk.append("        target : [name: '").append(tgtMacro)
                .append("', type: MacroType.").append(tgtType)
             if (!unmappable.isEmpty()) {
-                cfg.append(",\n").append(pfx2).append('                  // FILL IN: these source parameters have no same-named\n')
-                cfg.append(pfx2).append('                  // target parameter. Replace TARGET-PARAM-NAME, or delete the\n')
-                cfg.append(pfx2).append('                  // entry to drop that parameter.\n')
-                cfg.append(pfx2).append('                  paramMap: [')
+                blk.append(",\n").append('                  // FILL IN: these source parameters have no same-named\n')
+                blk.append('                  // target parameter. Replace TARGET-PARAM-NAME, or delete the\n')
+                blk.append('                  // entry to drop that parameter.\n')
+                blk.append('                  paramMap: [')
                 List<String> parts = new ArrayList<String>()
                 for (String u : unmappable) parts.add("'" + u + "': 'TARGET-PARAM-NAME'")
-                cfg.append(parts.join(', ')).append('],\n')
-                cfg.append(pfx2).append('                  dropUnmapped: true')
+                blk.append(parts.join(', ')).append('],\n')
+                blk.append('                  dropUnmapped: true')
             } else if (targetTakesNoParams) {
-                cfg.append(",\n").append(pfx2)
-                   .append('                  dropUnmapped: true   // target takes no parameters')
+                /*
+                 * One line, and a BLOCK comment. A trailing // comment swallows
+                 * the "]," appended after it on the same line, which silently
+                 * broke the MIGRATIONS list on paste.
+                 */
+                blk.append(', dropUnmapped: true, /* target takes no parameters */ ')
             }
-            cfg.append('],\n')
-            cfg.append(pfx2).append('    ],\n')
+            blk.append('],\n')
+            blk.append('    ],\n')
+            cfg.append(commentBlock(blk.toString(), !ok2))
+
         }
 
         outp.append('DISCOVERY AND VALIDATION\n')
