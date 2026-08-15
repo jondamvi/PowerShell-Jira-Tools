@@ -516,8 +516,12 @@ try {
                 for (List<String> o : options) optNames.add(o.get(0))
 
                 String valueSource = 'macro enumValues'
-                if (srcCfg.get('values') != null) valueSource = 'source.values in WANTED'
-                else if (srcCfg.get('valueRange') != null) valueSource = 'source.valueRange in WANTED'
+                boolean valuesFromConfig = false
+                if (srcCfg.get('values') != null) {
+                    valueSource = 'source.values in WANTED'; valuesFromConfig = true
+                } else if (srcCfg.get('valueRange') != null) {
+                    valueSource = 'source.valueRange in WANTED'; valuesFromConfig = true
+                }
                 srcEnum = sourceValuesFor(srcCfg, srcEnum)
                 detail.append('  source values (').append(valueSource).append('): ')
                       .append(srcEnum.isEmpty() ? '(none)' : srcEnum.join(', ')).append('\n')
@@ -572,7 +576,19 @@ try {
                 blk.append("        id     : '").append(migId).append("',\n")
                 blk.append("        source : [name: '").append(srcMacro)
                    .append("', type: MacroType.").append(srcType)
-                   .append(", sourceParam: '").append(srcParam == null ? 'UNRESOLVED' : srcParam).append("'],\n")
+                   .append(", sourceParam: '").append(srcParam == null ? 'UNRESOLVED' : srcParam).append("'")
+                /*
+                 * Values declared in WANTED must be carried INTO the generated
+                 * config. The macro does not declare them, so without this the
+                 * engine's own Stage-0 rediscovers "declares no enum values" and
+                 * rejects a config this script had just validated.
+                 */
+                if (valuesFromConfig) {
+                    List<String> quoted = new ArrayList<String>()
+                    for (String v : srcEnum) quoted.add("'" + v.replace("'", "\\'") + "'")
+                    blk.append(',\n                  values: [').append(quoted.join(', ')).append(']')
+                }
+                blk.append('],\n')
                 blk.append("        target : [name: '").append(tgtMacro)
                    .append("', type: MacroType.EddStatusMacro,\n")
                 blk.append("                  schemaVersion: '").append(EDD_SCHEMA_VER).append("',\n")
