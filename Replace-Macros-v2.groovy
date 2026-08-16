@@ -1689,6 +1689,8 @@ StringBuilder csvBody = new StringBuilder()
 boolean resultsTableOpen = false
 int resultRowCount = 0
 int resultRowsTruncated = 0
+int rowsInChunk = 0
+boolean legendEmitted = false
 
 try {
     if (MODE != 'INSPECT' && MODE != 'APPLY') throw new IllegalStateException('MODE must be INSPECT or APPLY')
