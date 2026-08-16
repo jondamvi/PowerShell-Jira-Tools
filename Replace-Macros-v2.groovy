@@ -1462,7 +1462,8 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
         int cursor = 0
         int skipUntil = -1
 
-        for (MacroSpan sp : findMacroSpans(body)) {
+        List<MacroSpan> spans = findMacroSpans(body)
+        for (MacroSpan sp : spans) {
             // a macro nested inside one already replaced no longer exists
             if (sp.start < skipUntil) continue
             if (sp.start < cursor) continue
@@ -1897,7 +1898,10 @@ try {
         List<String> filterKeys = RESOLVED_SPACE_KEYS.isEmpty() ? SPACE_KEYS : RESOLVED_SPACE_KEYS
         if (!filterKeys.isEmpty() && !filterKeys.contains(pf.spaceKey)) continue
 
-        for (Long cid : versionContentIds(pageManager, page)) {
+        // typed local first: the checker cannot always infer the element type
+        // of a method call used directly as the loop source
+        List<Long> versionIds = versionContentIds(pageManager, page)
+        for (Long cid : versionIds) {
             ContentEntityObject ceo = pageManager.getPage(cid.longValue())
             if (ceo == null) continue
             VersionFinding vf = new VersionFinding()
