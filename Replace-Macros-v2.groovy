@@ -1131,6 +1131,60 @@ List<Long> resolveScope(Set<String> sourceNames) {
     }
 }
 
+/**
+ * Scans one body. Counts EVERY macro for macroIndex - containers and macros not
+ * being migrated included - and records only those whose ac:name matches a
+ * migration source. Returns plain-value findings that survive a session flush.
+ *
+ * One pass: findMacroSpans tokenises the body once and yields every macro at
+ * every nesting depth; there is no re-scan per migration.
+ */
+List<MatchedMacro> scanBody(String body, Map<String, MigrationDef> bySource) {
+    try {
+        List<MatchedMacro> out = new ArrayList<MatchedMacro>()
+        if (body == null) return out
+        int macroIndex = 0, matchedIndex = 0
+        List<MacroSpan> spans = findMacroSpans(body)
+        for (MacroSpan sp : spans) {
+            macroIndex++
+            MigrationDef mig = bySource.get(sp.name)
+            if (mig == null) continue
+            matchedIndex++
+            MatchedMacro mm = new MatchedMacro()
+            mm.migrationId = mig.id
+            mm.sourceName = sp.name
+            mm.sourceType = mig.sourceType
+            mm.targetName = mig.targetName
+            mm.targetType = mig.targetType
+            mm.macroId = sp.macroId
+            mm.macroIndex = macroIndex
+            mm.matchedIndex = matchedIndex
+            mm.params.putAll(paramsOfSpan(body, sp))
+            out.add(mm)
+        }
+        return out
+    } catch (Exception e) {
+        throw new RuntimeException('scanBody failed: ' + e.getMessage(), e)
+    }
+}
+
+/** Version content ids of a page: current first, then history when enabled. */
+List<Long> versionContentIds(PageManager pageManager, Page page) {
+    try {
+        List<Long> ids = new ArrayList<Long>()
+        ids.add(page.getId())
+        if (!UPDATE_HISTORICAL_VERSIONS) return ids
+        List<VersionHistorySummary> history = pageManager.getVersionHistorySummaries(page)
+        for (VersionHistorySummary vhs : history) {
+            long hid = vhs.getId()
+            if (hid != page.getId()) ids.add(hid)
+        }
+        return ids
+    } catch (Exception e) {
+        throw new RuntimeException('versionContentIds failed: ' + e.getMessage(), e)
+    }
+}
+
 // =============================================================================
 //  STAGE-2/3  TRANSFORMS - one per macro type
 // =============================================================================
