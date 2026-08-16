@@ -199,10 +199,9 @@ enum ReplacementStatus {
  * costs about what 26 rows costs. It also solves selecting the lot: click in it
  * and Ctrl+A, or press the button.
  *
- * The button uses an inline onclick handler. Script blocks injected as HTML do
- * not execute, but inline handlers on inserted elements usually do - "usually"
- * because Confluence may sanitise them. If the button does nothing, the
- * textarea still works with Ctrl+A / Ctrl+C, so nothing is lost either way.
+ * There is no copy button: Confluence sanitises inline event handlers, and
+ * injected <script> blocks never execute, so no JavaScript emitted here can
+ * reach the clipboard. Ctrl+A, Ctrl+C inside the box is the working route.
  */
 @Field boolean RESULT_CSV_TEXTAREA = true
 @Field int RESULT_TEXTAREA_ROWS = 24
@@ -1583,6 +1582,83 @@ boolean isTolerableError(Throwable t) {
     return false
 }
 
+/*
+ * COLUMNS ARE DEFINED ONCE, HERE.
+ *
+ * TABLE and CSV previously each carried their own hand-written column list, so
+ * every column change had to be made in four places and they drifted apart -
+ * different names, different order, missing columns. Both renderers now read
+ * these two functions, so the two outputs cannot disagree.
+ *
+ * The only presentation difference: in TABLE the Page URL cell renders as a
+ * link labelled "open"; CSV carries the full URL. Same column, same position.
+ */
+@Field int URL_COLUMN_INDEX = 3
+
+List<String> resultHeaders(boolean perMacro, boolean showMigration) {
+    List<String> h = new ArrayList<String>()
+    h.addAll(['Space Key', 'Page ID', 'Page Name', 'Page URL', 'Page V.', 'Current'])
+    if (perMacro) {
+        h.add('Macro #')
+        if (showMigration) h.add('Migration')
+        h.addAll(['Source', 'Source Type', 'Target', 'Target Type', 'ac:macro-id',
+                  'Status', 'Details', 'Comments'])
+    } else {
+        h.addAll(['Occurrences', 'Replaced', 'Skipped', 'Failed', 'Status'])
+    }
+    return h
+}
+
+/** One row, in the same order as resultHeaders. mm is null for VERSION rows. */
+List<String> resultRow(boolean perMacro, boolean showMigration, boolean apply,
+                       PageFinding pf, VersionFinding vf, MatchedMacro mm,
+                       int rc, int skc, int flc, Map<String, MigrationDef> byId) {
+    List<String> c = new ArrayList<String>()
+    c.add(pf.spaceKey)
+    c.add(pf.pageId as String)
+    c.add(pf.pageName)
+    c.add(pf.url)
+    c.add(vf.versionNumber as String)
+    c.add(vf.isCurrent ? 'yes' : '')          // blank, not "-", for historical
+    if (perMacro) {
+        c.add(mm.macroIndex as String)
+        if (showMigration) c.add(mm.migrationId)
+        c.add(mm.sourceName)
+        c.add(shortType(mm.sourceType))
+        c.add(targetLabelFor(byId, mm))
+        c.add(shortType(mm.targetType))
+        c.add(mm.macroId)
+        c.add((!apply && mm.status == ReplacementStatus.Success)
+                ? 'Would replace' : (mm.status as String))
+        c.add((mm.status == ReplacementStatus.Success) ? mm.detail : mm.message)
+        c.add('')                              // Comments - for your own notes
+    } else {
+        c.add(vf.matchedMacros.size() as String)
+        c.add(rc as String)
+        c.add(skc as String)
+        c.add(flc as String)
+        c.add(vf.status as String)
+    }
+    return c
+}
+
+String csvLine(List<String> cells) {
+    List<String> q = new ArrayList<String>()
+    for (String v : cells) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+    return q.join(',') + '\n'
+}
+
+/** CSV header derived from the SAME list the table uses - never hand-written. */
+String csvHeaderLine(List<String> headers) {
+    List<String> q = new ArrayList<String>()
+    for (String h : headers) {
+        String n = h.toLowerCase().replace('ac:macro-id', 'macro_id')
+        n = n.replace(' ', '_').replace('.', '').replace('#', 'index')
+        q.add(n)
+    }
+    return q.join(',') + '\n'
+}
+
 /** Compact type label for the results table. */
 String shortType(MacroType t) {
     if (t == null) return '-'
@@ -1629,6 +1705,8 @@ String legendHtml(boolean showMigration, boolean apply) {
     b.append('<tr><td>Page ID</td><td>Page id in scope of macro replacement where particular page ')
      .append('versions contain macros planned for replacement.</td></tr>')
     b.append('<tr><td>Page Name</td><td>Title of the page.</td></tr>')
+    b.append('<tr><td>Page URL</td><td>Link to the page. Shown as "open" in the table; CSV export ')
+     .append('carries the full URL.</td></tr>')
     b.append('<tr><td>Page V.</td><td>Page Version which contains macros planned for replacement.</td></tr>')
     b.append('<tr><td>Current</td><td>Indicates whether particular page version is current (latest) ')
      .append('version.</td></tr>')
@@ -1655,7 +1733,6 @@ String legendHtml(boolean showMigration, boolean apply) {
      .append('persist.</td></tr>')
     b.append('<tr><td>Details</td><td>Replaced macro details or reason of skip or failure.</td></tr>')
     b.append('<tr><td>Comments</td><td>Admin work notes.</td></tr>')
-    b.append('<tr><td>URL</td><td>Link to the page.</td></tr>')
     b.append('</table>')
     return b.toString()
 }
@@ -1867,11 +1944,6 @@ try {
      * which is the record of what was actually changed.
      */
     boolean perMacro = (RESULT_GRANULARITY == 'MACRO')
-    if (RESULT_FORMAT == 'CSV') {
-        csvBody.append(perMacro
-            ? 'space_key,page_id,page_name,page_url,version,current,macro_index,migration,source,source_type,target,target_type,macro_id,status,detail,comments\n'
-            : 'space_key,page_id,page_name,page_url,version,current,occurrences,replaced,skipped,failed,status\n')
-    }
 
     outp.append('STAGE-3  ').append(apply ? 'EXECUTE' : 'DRY RUN').append('\n')
     outp.append('----------------------------------------------------------------\n')
@@ -2009,9 +2081,10 @@ try {
                     else if (mm.status == ReplacementStatus.Skipped) skc++
                     else if (mm.status == ReplacementStatus.Failed) flc++
                 }
-                // header written lazily, with the first row - so an empty run
-                // produces no dangling table, and the header never appears
-                // before there is anything under it
+                List<String> headers = resultHeaders(perMacro, RESULT_SHOW_MIGRATION_COLUMN)
+
+                // header written lazily, with the first row, so an empty run
+                // leaves no dangling table and no header without rows under it
                 if (RESULT_FORMAT == 'TABLE' && !resultsTableOpen && !vf.matchedMacros.isEmpty()) {
                     if (!legendEmitted) {
                         if (RESULT_SHOW_LEGEND && perMacro) {
@@ -2021,97 +2094,55 @@ try {
                         results.append('<h3>Results Table:</h3>')
                         legendEmitted = true
                     }
-                    // Each chunk sits in a wrapper the browser can skip laying
-                    // out while it is off screen, and lay out on scroll.
                     if (RESULT_TABLE_CHUNK_ROWS > 0) {
                         results.append('<div style="content-visibility:auto;contain-intrinsic-size:auto ')
                                .append(RESULT_TABLE_CHUNK_ROWS * RESULT_ROW_HEIGHT_PX).append('px">')
                     }
-                    results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%">')
-                    if (perMacro) {
-                        results.append('<tr><th>Space Key</th><th>Page ID</th><th>Page Name</th>')
-                               .append('<th>Page V.</th><th>Current</th><th>Macro #</th>')
-                        if (RESULT_SHOW_MIGRATION_COLUMN) results.append('<th>Migration</th>')
-                        results.append('<th>Source</th><th>Source Type</th><th>Target</th><th>Target Type</th>')
-                               .append('<th>ac:macro-id</th><th>Status</th><th>Details</th>')
-                               .append('<th>Comments</th><th>URL</th></tr>')
-                    } else {
-                        results.append('<tr><th>Space Key</th><th>Page ID</th><th>Page Name</th>')
-                               .append('<th>Page URL</th><th>Page V.</th>')
-                               .append('<th>Current</th><th>Occurrences</th><th>Replaced</th><th>Skipped</th>')
-                               .append('<th>Failed</th><th>Status</th></tr>')
-                    }
+                    results.append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%"><tr>')
+                    for (String h : headers) results.append('<th>').append(htmlEsc(h)).append('</th>')
+                    results.append('</tr>')
                     resultsTableOpen = true
                     rowsInChunk = 0
                 }
+                if (RESULT_FORMAT == 'CSV' && !legendEmitted) {
+                    csvBody.append(csvHeaderLine(headers))
+                    legendEmitted = true
+                }
+
+                List<List<String>> rows = new ArrayList<List<String>>()
                 if (perMacro) {
                     for (MatchedMacro mm : vf.matchedMacros) {
-                        String why = (mm.status == ReplacementStatus.Success) ? mm.detail : mm.message
-                        String shownStatus = (!apply && mm.status == ReplacementStatus.Success)
-                                ? 'Would replace' : (mm.status as String)
-                        resultRowCount++
-                        rowsInChunk++
-                        if (MAX_RESULT_ROWS > 0 && resultRowCount > MAX_RESULT_ROWS) {
-                            resultRowsTruncated++
-                        } else if (RESULT_FORMAT == 'TABLE') {
-                            String colour = (mm.status == ReplacementStatus.Success) ? ''
-                                    : (mm.status == ReplacementStatus.Skipped ? ' style="background:#fff4e5"'
-                                                                              : ' style="background:#ffecec"')
-                            results.append('<tr').append(colour).append('><td>').append(htmlEsc(pf.spaceKey))
-                                   .append('</td><td>').append(pf.pageId)
-                                   .append('</td><td>').append(htmlEsc(pf.pageName))
-                                   .append('</td><td>').append(vf.versionNumber)
-                                   .append('</td><td>').append(vf.isCurrent ? 'yes' : '')
-                                   .append('</td><td>').append(mm.macroIndex).append('</td>')
-                            if (RESULT_SHOW_MIGRATION_COLUMN) {
-                                results.append('<td>').append(htmlEsc(mm.migrationId)).append('</td>')
-                            }
-                            results.append('<td>').append(htmlEsc(mm.sourceName))
-                                   .append('</td><td>').append(shortType(mm.sourceType))
-                                   .append('</td><td>').append(htmlEsc(targetLabelFor(byId, mm)))
-                                   .append('</td><td>').append(shortType(mm.targetType))
-                                   .append('</td><td>').append(htmlEsc(mm.macroId))
-                                   .append('</td><td>').append(shownStatus)
-                                   .append('</td><td>').append(htmlEsc(why))
-                                   .append('</td><td></td>')
-                                   .append('<td><a href="').append(pf.url)
-                                   .append('" target="_blank">open</a></td></tr>')
-                        } else {
-                            List<String> fields = [pf.spaceKey, pf.pageId as String, pf.pageName, pf.url,
-                                                   vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
-                                                   mm.macroIndex as String, mm.migrationId, mm.sourceName,
-                                                   shortType(mm.sourceType), targetLabelFor(byId, mm),
-                                                   shortType(mm.targetType), mm.macroId, shownStatus, why, '']
-                            List<String> q = new ArrayList<String>()
-                            for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-                            csvBody.append(q.join(',')).append('\n')
-                        }
+                        rows.add(resultRow(true, RESULT_SHOW_MIGRATION_COLUMN, apply,
+                                           pf, vf, mm, rc, skc, flc, byId))
                     }
                 } else {
+                    rows.add(resultRow(false, RESULT_SHOW_MIGRATION_COLUMN, apply,
+                                       pf, vf, null, rc, skc, flc, byId))
+                }
+
+                int statusIdx = headers.indexOf('Status')
+                for (List<String> cells : rows) {
                     resultRowCount++
                     rowsInChunk++
                     if (MAX_RESULT_ROWS > 0 && resultRowCount > MAX_RESULT_ROWS) {
                         resultRowsTruncated++
-                    } else if (RESULT_FORMAT == 'TABLE') {
-                        results.append('<tr><td>').append(htmlEsc(pf.spaceKey))
-                               .append('</td><td>').append(pf.pageId)
-                               .append('</td><td>').append(htmlEsc(pf.pageName))
-                               .append('</td><td><a href="').append(pf.url).append('" target="_blank">')
-                               .append(htmlEsc(pf.url)).append('</a></td><td>').append(vf.versionNumber)
-                               .append('</td><td>').append(vf.isCurrent ? 'yes' : '')
-                               .append('</td><td>').append(vf.matchedMacros.size())
-                               .append('</td><td>').append(rc).append('</td><td>').append(skc)
-                               .append('</td><td>').append(flc)
-                               .append('</td><td>').append(vf.status).append('</td></tr>')
-                    } else {
-                        List<String> fields = [pf.spaceKey, pf.pageId as String, pf.pageName, pf.url,
-                                               vf.versionNumber as String, vf.isCurrent ? 'yes' : 'no',
-                                               vf.matchedMacros.size() as String, rc as String,
-                                               skc as String, flc as String, vf.status as String]
-                        List<String> q = new ArrayList<String>()
-                        for (String v : fields) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-                        csvBody.append(q.join(',')).append('\n')
+                        continue
                     }
+                    if (RESULT_FORMAT == 'CSV') { csvBody.append(csvLine(cells)); continue }
+
+                    String st = statusIdx >= 0 ? cells.get(statusIdx) : ''
+                    String colour = (st == 'Skipped') ? ' style="background:#fff4e5"'
+                                  : ((st == 'Failed') ? ' style="background:#ffecec"' : '')
+                    results.append('<tr').append(colour).append('>')
+                    for (int i = 0; i < cells.size(); i++) {
+                        String v = cells.get(i)
+                        if (i == URL_COLUMN_INDEX) {
+                            results.append('<td><a href="').append(v).append('" target="_blank">open</a></td>')
+                        } else {
+                            results.append('<td>').append(htmlEsc(v)).append('</td>')
+                        }
+                    }
+                    results.append('</tr>')
                 }
             }
 
@@ -2161,18 +2192,16 @@ try {
     if (RESULT_FORMAT == 'CSV') {
         results.append('<h3>Results CSV (').append(plural(resultRowCount, 'row')).append(')</h3>')
         if (RESULT_CSV_TEXTAREA) {
-            String taId = 'macroResults' + System.currentTimeMillis()
-            results.append('<p><button type="button" onclick="')
-                   .append("var t=document.getElementById('").append(taId).append("');")
-                   .append('t.focus();t.select();')
-                   .append("try{document.execCommand('copy');this.textContent='Copied ")
-                   .append(resultRowCount).append(" rows';}")
-                   .append("catch(e){this.textContent='Copy failed - use Ctrl+A, Ctrl+C';}")
-                   .append('">Copy all rows to clipboard</button>')
-                   .append(' <span style="font-size:90%">&nbsp;or click inside the box and press ')
-                   .append('Ctrl+A, Ctrl+C</span></p>')
-            results.append('<textarea id="').append(taId).append('" readonly rows="')
-                   .append(RESULT_TEXTAREA_ROWS)
+            /*
+             * No copy button: Confluence sanitises inline event handlers and
+             * injected <script> blocks never execute, so no JavaScript we emit
+             * can reach the clipboard. A button that does nothing is worse than
+             * none - the textarea plus Ctrl+A, Ctrl+C is the working route.
+             */
+            results.append('<p style="font-size:90%">Click inside the box, then <b>Ctrl+A</b>, ')
+                   .append('<b>Ctrl+C</b> to copy all ').append(plural(resultRowCount, 'row'))
+                   .append('. Paste into a .csv file or straight into Excel.</p>')
+            results.append('<textarea readonly rows="').append(RESULT_TEXTAREA_ROWS)
                    .append('" style="width:100%;font-family:monospace;font-size:85%;white-space:pre">')
                    .append(htmlEsc(csvBody.toString()))
                    .append('</textarea>')
