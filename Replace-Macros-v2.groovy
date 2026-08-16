@@ -43,6 +43,7 @@ import com.atlassian.confluence.core.VersionHistorySummary
 import com.atlassian.confluence.pages.Page
 import com.atlassian.confluence.pages.PageManager
 import com.atlassian.confluence.setup.settings.SettingsManager
+import com.atlassian.confluence.spaces.Space
 import com.atlassian.confluence.spaces.SpaceManager
 import com.atlassian.sal.api.component.ComponentLocator
 import com.atlassian.spring.container.ContainerManager
@@ -424,6 +425,16 @@ class ValidationIssue {
 
 @Field List<String> RUN_LOG = new ArrayList<String>()
 @Field String BASE_URL = ''
+/*
+ * SPACE_KEYS as the API resolves them.
+ *
+ * SpaceManager.getSpace() accepts aliases - notably a personal space addressed
+ * as ~username - but the spaces table stores the real key, which for a personal
+ * space is often "~" + the user key rather than the username. Filtering SQL on
+ * what was typed then matches nothing while Stage-0 happily validates. Every
+ * space filter uses the resolved keys instead.
+ */
+@Field List<String> RESOLVED_SPACE_KEYS = new ArrayList<String>()
 @Field boolean FLUSH_WORKED = false
 @Field String FLUSH_NOTE = 'not attempted'
 
@@ -868,11 +879,14 @@ List<ValidationIssue> validateScope(SpaceManager spaceManager, PageManager pageM
     try {
         List<ValidationIssue> issues = new ArrayList<ValidationIssue>()
         for (String key : SPACE_KEYS) {
-            if (spaceManager.getSpace(key) == null) {
+            Space sp = spaceManager.getSpace(key)
+            if (sp == null) {
                 ValidationIssue i = new ValidationIssue()
                 i.migrationId = '(scope)'; i.sourceLabel = key; i.targetLabel = ''
                 i.description = 'SPACE_KEYS names a space that does not exist'
                 issues.add(i)
+            } else {
+                RESOLVED_SPACE_KEYS.add(sp.getKey())
             }
         }
         for (Long pid : PAGE_IDS_OVERRIDE) {
@@ -1043,7 +1057,9 @@ List<Long> resolveScope(Set<String> sourceNames) {
          * the script, so reading a @Field there raises MissingPropertyException
          * ("No such property: SPACE_KEYS"). Locals are captured normally.
          */
-        List<String> spaceKeys = new ArrayList<String>(SPACE_KEYS)
+        // resolved keys, never the typed ones - see RESOLVED_SPACE_KEYS
+        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
+                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
         List<String> statuses  = new ArrayList<String>(INCLUDE_STATUSES)
         String resource = DB_RESOURCE
 
@@ -1835,7 +1851,17 @@ try {
     }
     if (!SPACE_KEYS.isEmpty()) {
         outp.append('Spaces (').append(SPACE_KEYS.size()).append('):\n')
-        for (String sk : SPACE_KEYS) outp.append('    ').append(sk).append('\n')
+        for (int i = 0; i < SPACE_KEYS.size(); i++) {
+            String typed = SPACE_KEYS.get(i)
+            outp.append('    ').append(typed)
+            // personal spaces resolve to a different stored key - show both, or
+            // a nothing-will-match run looks identical to a nothing-found one
+            String resolved = (i < RESOLVED_SPACE_KEYS.size()) ? RESOLVED_SPACE_KEYS.get(i) : null
+            if (resolved != null && resolved != typed) {
+                outp.append('   -> stored key: ').append(resolved)
+            }
+            outp.append('\n')
+        }
     }
     outp.append('History: ').append(UPDATE_HISTORICAL_VERSIONS ? 'included' : 'skipped')
         .append('   Batch: ').append(FLUSH_AFTER_BATCH ? BATCH_MAX_PAGES + ' pages' : 'no flushing').append('\n')
@@ -1887,7 +1913,8 @@ try {
         pf.spaceKey = (page.getSpace() == null) ? '' : page.getSpace().getKey()
         pf.url = baseUrl + '/pages/viewpage.action?pageId=' + pf.pageId
 
-        if (!SPACE_KEYS.isEmpty() && !SPACE_KEYS.contains(pf.spaceKey)) continue
+        List<String> filterKeys = RESOLVED_SPACE_KEYS.isEmpty() ? SPACE_KEYS : RESOLVED_SPACE_KEYS
+        if (!filterKeys.isEmpty() && !filterKeys.contains(pf.spaceKey)) continue
 
         for (Long cid : versionContentIds(pageManager, page)) {
             ContentEntityObject ceo = pageManager.getPage(cid.longValue())
