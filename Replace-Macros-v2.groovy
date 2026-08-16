@@ -206,6 +206,18 @@ enum ReplacementStatus {
 @Field boolean RESULT_CSV_TEXTAREA = true
 @Field int RESULT_TEXTAREA_ROWS = 24
 
+/*
+ * Wrap the HTML results table in a fixed-height scroll box, so the summary and
+ * the rollback section stay reachable instead of sitting below thousands of
+ * rows. Matches how the CSV textarea behaves.
+ *
+ * Note this makes the page navigable, not the table cheap: the browser still
+ * lays out every cell, because table column widths depend on all rows. For
+ * genuinely large runs use RESULT_FORMAT = 'CSV'.
+ */
+@Field boolean RESULT_TABLE_SCROLLBOX = true
+@Field int RESULT_TABLE_MAX_HEIGHT_PX = 600
+
 // Rollback copies. Compressed output is deflate + Base64; Base64 is required
 // because the console returns a String and raw deflate bytes are not valid text.
 @Field boolean EMIT_ROLLBACK_COPIES = true
@@ -2092,6 +2104,11 @@ try {
                             results.append('<div style="height:16px"></div>')
                         }
                         results.append('<h3>Results Table:</h3>')
+                        if (RESULT_TABLE_SCROLLBOX) {
+                            results.append('<div style="max-height:')
+                                   .append(RESULT_TABLE_MAX_HEIGHT_PX)
+                                   .append('px;overflow:auto;border:1px solid #ccc;resize:vertical">')
+                        }
                         legendEmitted = true
                     }
                     if (RESULT_TABLE_CHUNK_ROWS > 0) {
@@ -2181,13 +2198,18 @@ try {
     if (resultsTableOpen) {
         results.append('</table>')
         if (RESULT_TABLE_CHUNK_ROWS > 0) results.append('</div>')
-        if (resultRowsTruncated > 0) {
-            results.append('<p><b>').append(plural(resultRowsTruncated, 'further row'))
-                   .append(' not shown</b> - MAX_RESULT_ROWS is ').append(MAX_RESULT_ROWS)
-                   .append('. The run processed everything; only the listing is capped. ')
-                   .append('Use RESULT_FORMAT = \'CSV\' or RESULT_GRANULARITY = \'VERSION\' for large runs.</p>')
-        }
         resultsTableOpen = false
+    }
+    // the scroll box wraps ALL chunks, so it closes once, after the last table
+    if (legendEmitted && RESULT_FORMAT == 'TABLE' && RESULT_TABLE_SCROLLBOX) {
+        results.append('</div>')
+    }
+    // outside the scroll box, so it stays visible without scrolling to the end
+    if (resultRowsTruncated > 0) {
+        results.append('<p><b>').append(plural(resultRowsTruncated, 'further row'))
+               .append(' not shown</b> - MAX_RESULT_ROWS is ').append(MAX_RESULT_ROWS)
+               .append('. The run processed everything; only the listing is capped. ')
+               .append('Use RESULT_FORMAT = \'CSV\' or RESULT_GRANULARITY = \'VERSION\' for large runs.</p>')
     }
     if (RESULT_FORMAT == 'CSV') {
         results.append('<h3>Results CSV (').append(plural(resultRowCount, 'row')).append(')</h3>')
@@ -2280,6 +2302,7 @@ try {
     if (resultsTableOpen) {
         results.append('</table>')
         if (RESULT_TABLE_CHUNK_ROWS > 0) results.append('</div>')
+        if (RESULT_TABLE_SCROLLBOX) results.append('</div>')
         results.append('<p><b>PARTIAL RESULTS</b> - the run terminated after ')
                .append(plural(resultRowCount, 'row')).append('. Everything above completed; ')
                .append('anything not listed was never reached.</p>')
