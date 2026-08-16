@@ -458,6 +458,19 @@ String htmlEsc(Object v) {
     return v.toString().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
 }
 
+/*
+ * Escapes LIKE wildcards in a literal.
+ *
+ * Values are bound as parameters, so injection is not the issue - but inside a
+ * LIKE pattern "_" still matches ANY single character and "%" any sequence, in
+ * the bound value as much as in literal SQL. A macro named "my_macro" would
+ * therefore also match "myXmacro". Paired with ESCAPE '\\' on the predicate.
+ */
+String likeEscape(String v) {
+    if (v == null) return ''
+    return v.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+}
+
 /** "1 problem" / "2 problems" - avoids the "(s)" that reads as unfinished. */
 String plural(int n, String one) {
     return n as String + ' ' + (n == 1 ? one : one + 's')
@@ -1052,101 +1065,69 @@ List<Long> resolveScope(Set<String> sourceNames) {
     try {
         if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
         /*
-         * Everything the closure needs is built into LOCALS first. Inside a
+         * ONE query for ALL source macros, not one per macro.
+         *
+         * bc.body LIKE cannot use an index - it is a sequential scan of
+         * bodycontent - so issuing it once per migration meant scanning the
+         * largest table in the instance N times. The name predicates are OR-ed
+         * into a single pass instead: 23 migrations now cost one scan, not 23.
+         *
+         * This query only IDENTIFIES candidate pages. It does not parse
+         * anything: the database has no business picking macros apart. Each
+         * body is then tokenised ONCE in memory by findMacroSpans, which yields
+         * every macro at every nesting depth with its name, id, parameters and
+         * position in a single pass - see scanBody.
+         *
+         * Everything the closure needs is built into LOCALS first: inside a
          * withSql closure, property resolution goes to the Sql delegate before
-         * the script, so reading a @Field there raises MissingPropertyException
-         * ("No such property: SPACE_KEYS"). Locals are captured normally.
+         * the script, so reading a @Field there raises MissingPropertyException.
          */
-        // resolved keys, never the typed ones - see RESOLVED_SPACE_KEYS
         List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
                 ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
         List<String> statuses  = new ArrayList<String>(INCLUDE_STATUSES)
         String resource = DB_RESOURCE
 
-        List<String> queries = new ArrayList<String>()
-        List<Map<String, Object>> queryParams = new ArrayList<Map<String, Object>>()
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        List<String> nameClauses = new ArrayList<String>()
+        int n = 0
         for (String name : sourceNames) {
-            Map<String, Object> params = new LinkedHashMap<String, Object>()
-            params.put('pattern', '%ac:name="' + name + '"%')
-            StringBuilder q = new StringBuilder()
-            q.append('SELECT c.contentid AS rowid, c.prevver AS prevver FROM content c ')
-             .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
-             .append('LEFT JOIN spaces s ON s.spaceid = c.spaceid ')
-             .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') AND bc.body LIKE :pattern ")
-            if (!spaceKeys.isEmpty()) {
-                List<String> ph = new ArrayList<String>()
-                for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
-                q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
-            }
-            if (!statuses.isEmpty()) {
-                List<String> ph = new ArrayList<String>()
-                for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-                q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
-            }
-            queries.add(q.toString())
-            queryParams.add(params)
+            String key = 'mp' + n
+            // the closing quote is part of the pattern, so "artikel-status"
+            // cannot match a page using "artikel-status-ed"
+            params.put(key, '%ac:name="' + likeEscape(name) + '"%')
+            nameClauses.add("bc.body LIKE :" + key + " ESCAPE '\\'")
+            n++
         }
+        if (nameClauses.isEmpty()) return new ArrayList<Long>()
+
+        StringBuilder q = new StringBuilder()
+        q.append('SELECT c.contentid AS rowid, c.prevver AS prevver FROM content c ')
+         .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
+         .append('LEFT JOIN spaces s ON s.spaceid = c.spaceid ')
+         .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
+         .append('AND (').append(nameClauses.join(' OR ')).append(') ')
+        if (!spaceKeys.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
+            q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
+        }
+        if (!statuses.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
+            q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
+        }
+        String query = q.toString()
 
         Set<Long> ids = new LinkedHashSet<Long>()
         DatabaseUtil.withSql(resource) { Sql sql ->
-            for (int i = 0; i < queries.size(); i++) {
-                sql.eachRow(queries.get(i), queryParams.get(i)) { row ->
-                    Object prev = row['prevver']
-                    ids.add(prev == null ? ((Number) row['rowid']).longValue() : ((Number) prev).longValue())
-                }
+            sql.eachRow(query, params) { row ->
+                Object prev = row['prevver']
+                ids.add(prev == null ? ((Number) row['rowid']).longValue() : ((Number) prev).longValue())
             }
         }
         return new ArrayList<Long>(ids)
     } catch (Exception e) {
         throw new RuntimeException('resolveScope failed: ' + e.getMessage(), e)
-    }
-}
-
-/**
- * Scans one body. Counts EVERY macro for macroIndex; records only those whose
- * ac:name matches a migration source. Returns plain-value findings.
- */
-List<MatchedMacro> scanBody(String body, Map<String, MigrationDef> bySource) {
-    try {
-        List<MatchedMacro> out = new ArrayList<MatchedMacro>()
-        if (body == null) return out
-        int macroIndex = 0, matchedIndex = 0
-        for (MacroSpan sp : findMacroSpans(body)) {
-            macroIndex++                       // counts containers too, at every depth
-            MigrationDef mig = bySource.get(sp.name)
-            if (mig == null) continue
-            matchedIndex++
-            MatchedMacro mm = new MatchedMacro()
-            mm.migrationId = mig.id
-            mm.sourceName = sp.name
-            mm.sourceType = mig.sourceType
-            mm.targetName = mig.targetName
-            mm.targetType = mig.targetType
-            mm.macroId = sp.macroId
-            mm.macroIndex = macroIndex
-            mm.matchedIndex = matchedIndex
-            mm.params.putAll(paramsOfSpan(body, sp))
-            out.add(mm)
-        }
-        return out
-    } catch (Exception e) {
-        throw new RuntimeException('scanBody failed: ' + e.getMessage(), e)
-    }
-}
-
-/** Version ids of a page: current first, then history (when enabled). */
-List<Long> versionContentIds(PageManager pageManager, Page page) {
-    try {
-        List<Long> ids = new ArrayList<Long>()
-        ids.add(page.getId())
-        if (!UPDATE_HISTORICAL_VERSIONS) return ids
-        for (VersionHistorySummary vhs : pageManager.getVersionHistorySummaries(page)) {
-            long hid = vhs.getId()
-            if (hid != page.getId()) ids.add(hid)
-        }
-        return ids
-    } catch (Exception e) {
-        throw new RuntimeException('versionContentIds failed: ' + e.getMessage(), e)
     }
 }
 
