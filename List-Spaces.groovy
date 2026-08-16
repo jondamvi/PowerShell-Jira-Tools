@@ -145,7 +145,10 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
         List<String> clauses = new ArrayList<String>()
         for (int i = 0; i < macros.size(); i++) {
             params.put('mp' + i, '%ac:name="' + likeEscape(macros.get(i)) + '"%')
-            clauses.add('bc.body LIKE :mp' + i + " ESCAPE '\\\\'")
+            // ESCAPE takes exactly ONE character. In a Groovy double-quoted
+            // string '\\' is a single backslash - '\\\\' would send two and
+            // PostgreSQL rejects it with "escape string must be one character".
+            clauses.add('bc.body LIKE :mp' + i + " ESCAPE '\\'")
         }
         // pages_with counts DISTINCT pages: a historical hit maps back to its
         // current page through prevver, so a page already clean in its current
