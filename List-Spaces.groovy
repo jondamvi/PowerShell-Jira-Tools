@@ -223,15 +223,23 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
             }
             matchClause = clauses.join(' OR ')
         }
-        // narrowing by space first is what makes this finish: without it every
-        // page body in the instance is read
+
         /*
-         * The status test belongs to the PAGE, not to each version row.
-         * Historical rows do not carry content_status = 'current', so testing
-         * every row by status silently drops all history - which for the engine
-         * means a page whose macros survive ONLY in old versions never enters
-         * scope at all. A historical row therefore qualifies when its live page
-         * qualifies, looked up through prevver on the primary key.
+         * A version row cannot answer page-level questions about itself, so the
+         * live page is joined through prevver and both rules are tested against
+         * it. Matches the engine's discovery exactly - these two scripts must
+         * answer the same question the same way, or their numbers disagree.
+         *
+         *   status - historical rows do not carry content_status = 'current',
+         *            so testing every row by status drops all history.
+         *   space  - historical rows frequently carry a NULL spaceid, so a row
+         *            is attributed to COALESCE(its own space, its page's space).
+         *            An inner join on the row's own space would discard every
+         *            space-less historical row outright.
+         *
+         * No correlated EXISTS: past ~10 values in an IN-list PostgreSQL can
+         * re-cost that shape and re-evaluate it per row, which is what made a
+         * 10-15 space run hang. Plain LEFT JOINs are planned once.
          */
         String statusFilter = ''
         if (!INCLUDE_STATUSES.isEmpty()) {
@@ -242,8 +250,7 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
             }
             String inList = sph.join(', ')
             statusFilter = 'AND (c.content_status IN (' + inList + ') ' +
-                           'OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ' +
-                           'WHERE p.contentid = c.prevver AND p.content_status IN (' + inList + ')))) '
+                           'OR p.content_status IN (' + inList + ')) '
         }
 
         String spaceFilter = ''
@@ -265,7 +272,8 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
                        'count(DISTINCT COALESCE(c.prevver, c.contentid)) AS pages_with ' +
                        'FROM content c ' +
                        'JOIN bodycontent bc ON bc.contentid = c.contentid ' +
-                       'JOIN spaces s ON s.spaceid = c.spaceid ' +
+                       'LEFT JOIN content p ON p.contentid = c.prevver ' +
+                       'LEFT JOIN spaces s ON s.spaceid = COALESCE(c.spaceid, p.spaceid) ' +
                        "WHERE c.contenttype IN ('PAGE','BLOGPOST') AND (" + matchClause + ') ' +
                        spaceFilter + statusFilter +
                        'GROUP BY s.spacekey'
@@ -274,7 +282,9 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
         DatabaseUtil.withSql(resource) { Sql sql ->
             if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
-                SpaceInfo si = spaces.get(row['sk'] as String)
+                Object sk = row['sk']
+                if (sk == null) return          // space could not be resolved
+                SpaceInfo si = spaces.get(sk as String)
                 if (si == null) return
                 si.macroRows = ((Number) row['macro_rows']).longValue()
                 si.historicalRows = ((Number) row['hist_rows']).longValue()

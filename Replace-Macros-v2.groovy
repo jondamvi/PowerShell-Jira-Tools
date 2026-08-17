@@ -94,6 +94,14 @@ enum ReplacementStatus {
  * 0/500, then 500/500, then 1000/500 - each run prints the next offset.
  * SCOPE_LIMIT = 0 means no limit.
  */
+/*
+ * Abort any discovery query after this many seconds instead of letting it run
+ * until the HTTP request is dropped - a dropped request returns NOTHING: no
+ * result, no error and no Logs tab, because the script never reaches its own
+ * logging. A timeout at least comes back as a visible error. 0 = no limit.
+ */
+@Field int SQL_TIMEOUT_SECONDS = 300
+
 @Field int SCOPE_OFFSET = 0
 @Field int SCOPE_LIMIT = 0
 
@@ -1078,96 +1086,134 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
 // =============================================================================
 
 /** Distinct current-page ids in scope, from the database (or the override). */
+/*
+ * Body of the discovery query, shared by resolveScope and scopeReport.
+ *
+ * Written as a CTE joined to content, NOT as "contentid IN (subquery)" with a
+ * correlated EXISTS. Past ~10 values in the space IN-list PostgreSQL re-costs
+ * that shape and can re-evaluate the subquery per row, which is why a run with
+ * 10-15 spaces hung while 5 finished quickly. A CTE is evaluated once.
+ *
+ * Two joins carry the page-level rules that a version row cannot answer itself:
+ *   p  - the live page of a historical row, via prevver. Historical rows do not
+ *        carry content_status = 'current', so status is tested against p.
+ *   sp - that live page's space. Historical rows frequently have a NULL
+ *        spaceid, so filtering a version row by its own space would drop every
+ *        historical row - the space is tested against the row OR its page.
+ *
+ * Returns the CTE text; params are filled in by the caller.
+ */
+String discoveryCte(Set<String> sourceNames, List<String> spaceKeys, List<String> statuses,
+                    Map<String, Object> params) {
+    List<String> nameClauses = new ArrayList<String>()
+    int n = 0
+    for (String name : sourceNames) {
+        params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
+        nameClauses.add("bc.body LIKE :mp" + n + " ESCAPE '\\'")
+        n++
+    }
+    if (nameClauses.isEmpty()) return null
+
+    StringBuilder q = new StringBuilder()
+    q.append('WITH matched AS (SELECT DISTINCT COALESCE(c.prevver, c.contentid) AS pid ')
+     .append('FROM content c ')
+     .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
+     .append('LEFT JOIN spaces s2 ON s2.spaceid = c.spaceid ')
+     .append('LEFT JOIN content p ON p.contentid = c.prevver ')
+     .append('LEFT JOIN spaces sp ON sp.spaceid = p.spaceid ')
+     .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
+     .append('AND (').append(nameClauses.join(' OR ')).append(') ')
+
+    if (!spaceKeys.isEmpty()) {
+        List<String> ph = new ArrayList<String>()
+        for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
+        String inList = ph.join(', ')
+        q.append('AND (s2.spacekey IN (').append(inList).append(') OR sp.spacekey IN (')
+         .append(inList).append(')) ')
+    }
+    if (!statuses.isEmpty()) {
+        List<String> ph = new ArrayList<String>()
+        for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
+        String inList = ph.join(', ')
+        q.append('AND (c.content_status IN (').append(inList).append(') OR p.content_status IN (')
+         .append(inList).append(')) ')
+    }
+    if (!UPDATE_HISTORICAL_VERSIONS) q.append('AND c.prevver IS NULL ')
+    q.append(') ')
+    return q.toString()
+}
+
 List<Long> resolveScope(Set<String> sourceNames) {
     try {
         if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
-        /*
-         * ONE query for ALL source macros, not one per macro.
-         *
-         * bc.body LIKE cannot use an index - it is a sequential scan of
-         * bodycontent - so issuing it once per migration meant scanning the
-         * largest table in the instance N times. The name predicates are OR-ed
-         * into a single pass instead: 23 migrations now cost one scan, not 23.
-         *
-         * This query only IDENTIFIES candidate pages. It does not parse
-         * anything: the database has no business picking macros apart. Each
-         * body is then tokenised ONCE in memory by findMacroSpans, which yields
-         * every macro at every nesting depth with its name, id, parameters and
-         * position in a single pass - see scanBody.
-         *
-         * Everything the closure needs is built into LOCALS first: inside a
-         * withSql closure, property resolution goes to the Sql delegate before
-         * the script, so reading a @Field there raises MissingPropertyException.
-         */
+
         List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
                 ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
-        List<String> statuses  = new ArrayList<String>(INCLUDE_STATUSES)
-        String resource = DB_RESOURCE
-
+        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
         Map<String, Object> params = new LinkedHashMap<String, Object>()
-        List<String> nameClauses = new ArrayList<String>()
-        int n = 0
-        for (String name : sourceNames) {
-            String key = 'mp' + n
-            // the closing quote is part of the pattern, so "artikel-status"
-            // cannot match a page using "artikel-status-ed"
-            params.put(key, '%ac:name="' + likeEscape(name) + '"%')
-            nameClauses.add("bc.body LIKE :" + key + " ESCAPE '\\'")
-            n++
-        }
-        if (nameClauses.isEmpty()) return new ArrayList<Long>()
+        String cte = discoveryCte(sourceNames, spaceKeys, statuses, params)
+        if (cte == null) return new ArrayList<Long>()
 
-        StringBuilder q = new StringBuilder()
-        q.append('SELECT c.contentid AS rowid, c.prevver AS prevver FROM content c ')
-         .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
-         .append('LEFT JOIN spaces s ON s.spaceid = c.spaceid ')
-         .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
-         .append('AND (').append(nameClauses.join(' OR ')).append(') ')
-        if (!spaceKeys.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
-            q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
-        }
-        /*
-         * The status test belongs to the PAGE, not to each version row.
-         * Historical rows do not carry content_status = 'current', so testing
-         * every row by status silently drops all history - which for the engine
-         * means a page whose macros survive ONLY in old versions never enters
-         * scope at all. A historical row therefore qualifies when its live page
-         * qualifies, looked up through prevver on the primary key.
-         */
-        if (!statuses.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-            String inList = ph.join(', ')
-            q.append('AND (c.content_status IN (').append(inList).append(') ')
-             .append('OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ')
-             .append('WHERE p.contentid = c.prevver AND p.content_status IN (').append(inList).append(')))) ')
-        }
-        /*
-         * With history out of scope, only current bodies can produce a match.
-         * Without this, a page whose macros survive ONLY in old versions still
-         * enters scope, gets every version loaded, and yields nothing - wasted
-         * work that also inflates the "pages in scope" count.
-         *
-         * With history IN scope the predicate must stay off: a historical hit is
-         * how a page whose current version is already clean is found at all.
-         */
-        if (!UPDATE_HISTORICAL_VERSIONS) {
-            q.append('AND c.prevver IS NULL ')
-        }
-        String query = q.toString()
+        String query = cte + 'SELECT pid FROM matched'
+        String resource = DB_RESOURCE
+        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
 
         Set<Long> ids = new LinkedHashSet<Long>()
         DatabaseUtil.withSql(resource) { Sql sql ->
+            if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
-                Object prev = row['prevver']
-                ids.add(prev == null ? ((Number) row['rowid']).longValue() : ((Number) prev).longValue())
+                Object pid = row['pid']
+                if (pid != null) ids.add(((Number) pid).longValue())
             }
         }
         return new ArrayList<Long>(ids)
     } catch (Exception e) {
         throw new RuntimeException('resolveScope failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * SCOPE mode: the affected pages, from the database alone.
+ *
+ * No Page objects are loaded and no version bodies are scanned - the inner
+ * query finds every macro-bearing version row and maps it to its current page
+ * through prevver, the outer one fetches that page's title and space. That is
+ * why it returns in seconds where INSPECT takes minutes: INSPECT's cost is
+ * loading and parsing every version of every affected page, not the discovery.
+ *
+ * Rows: [spaceKey, pageId, title]
+ */
+List<List<String>> scopeReport(Set<String> sourceNames) {
+    try {
+        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
+                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
+        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        String cte = discoveryCte(sourceNames, spaceKeys, statuses, params)
+        if (cte == null) return new ArrayList<List<String>>()
+
+        // join, not "contentid IN (subquery)" - same planner reason as the CTE.
+        // LEFT JOIN spaces so a page whose row carries no spaceid still appears
+        // with a blank space rather than vanishing from the list.
+        String query = cte +
+                'SELECT s.spacekey AS sk, cur.contentid AS pid, cur.title AS title ' +
+                'FROM matched m ' +
+                'JOIN content cur ON cur.contentid = m.pid ' +
+                'LEFT JOIN spaces s ON s.spaceid = cur.spaceid ' +
+                'ORDER BY s.spacekey, cur.title'
+        String resource = DB_RESOURCE
+        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
+
+        List<List<String>> out = new ArrayList<List<String>>()
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
+            sql.eachRow(query, params) { row ->
+                out.add([row['sk'] as String, row['pid'] as String, row['title'] as String])
+            }
+        }
+        return out
+    } catch (Exception e) {
+        throw new RuntimeException('scopeReport failed: ' + e.getMessage(), e)
     }
 }
 
@@ -1222,75 +1268,6 @@ List<Long> versionContentIds(PageManager pageManager, Page page) {
         return ids
     } catch (Exception e) {
         throw new RuntimeException('versionContentIds failed: ' + e.getMessage(), e)
-    }
-}
-
-/**
- * SCOPE mode: the affected pages, from the database alone.
- *
- * No Page objects are loaded and no version bodies are scanned - the inner
- * query finds every macro-bearing version row and maps it to its current page
- * through prevver, the outer one fetches that page's title and space. That is
- * why it returns in seconds where INSPECT takes minutes: INSPECT's cost is
- * loading and parsing every version of every affected page, not the discovery.
- *
- * Rows: [spaceKey, pageId, title]
- */
-List<List<String>> scopeReport(Set<String> sourceNames) {
-    try {
-        Map<String, Object> params = new LinkedHashMap<String, Object>()
-        List<String> nameClauses = new ArrayList<String>()
-        int n = 0
-        for (String name : sourceNames) {
-            params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
-            nameClauses.add("bc.body LIKE :mp" + n + " ESCAPE '\\'")
-            n++
-        }
-        if (nameClauses.isEmpty()) return new ArrayList<List<String>>()
-
-        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
-                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
-        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
-
-        StringBuilder inner = new StringBuilder()
-        inner.append('SELECT DISTINCT COALESCE(c.prevver, c.contentid) AS pid ')
-             .append('FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ')
-             .append('LEFT JOIN spaces s2 ON s2.spaceid = c.spaceid ')
-             .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
-             .append('AND (').append(nameClauses.join(' OR ')).append(') ')
-        if (!spaceKeys.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
-            inner.append('AND s2.spacekey IN (').append(ph.join(', ')).append(') ')
-        }
-        if (!statuses.isEmpty()) {
-            // same page-level status rule as resolveScope - see the note there
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-            String inList = ph.join(', ')
-            inner.append('AND (c.content_status IN (').append(inList).append(') ')
-                 .append('OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ')
-                 .append('WHERE p.contentid = c.prevver AND p.content_status IN (').append(inList).append(')))) ')
-        }
-        if (!UPDATE_HISTORICAL_VERSIONS) inner.append('AND c.prevver IS NULL ')
-
-        // LEFT JOIN: a page whose current row carries no spaceid would otherwise
-        // vanish from the list entirely rather than showing with a blank space
-        String query = 'SELECT s.spacekey AS sk, cur.contentid AS pid, cur.title AS title ' +
-                       'FROM content cur LEFT JOIN spaces s ON s.spaceid = cur.spaceid ' +
-                       'WHERE cur.contentid IN (' + inner.toString() + ') ' +
-                       'ORDER BY s.spacekey, cur.title'
-        String resource = DB_RESOURCE
-
-        List<List<String>> out = new ArrayList<List<String>>()
-        DatabaseUtil.withSql(resource) { Sql sql ->
-            sql.eachRow(query, params) { row ->
-                out.add([row['sk'] as String, row['pid'] as String, row['title'] as String])
-            }
-        }
-        return out
-    } catch (Exception e) {
-        throw new RuntimeException('scopeReport failed: ' + e.getMessage(), e)
     }
 }
 
