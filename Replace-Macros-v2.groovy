@@ -78,7 +78,24 @@ enum ReplacementStatus {
 //  CONFIG
 // =============================================================================
 
-@Field String MODE = 'INSPECT'                 // INSPECT | APPLY
+/*
+ * SCOPE   - discovery only: WHICH pages are affected. One query, no page loads,
+ *           no version scanning. Seconds even on a huge space. Use it to build
+ *           the space/page inventory.
+ * INSPECT - full read-only pass: loads every version of every affected page and
+ *           reports per-occurrence detail. This is the expensive mode.
+ * APPLY   - as INSPECT, and writes.
+ */
+@Field String MODE = 'INSPECT'                 // SCOPE | INSPECT | APPLY
+
+/*
+ * Process only a slice of the pages in scope, ordered by page id so slices stay
+ * stable between runs. For a space too large to INSPECT in one request: run
+ * 0/500, then 500/500, then 1000/500 - each run prints the next offset.
+ * SCOPE_LIMIT = 0 means no limit.
+ */
+@Field int SCOPE_OFFSET = 0
+@Field int SCOPE_LIMIT = 0
 
 // Migration ids to run. Empty = all of them.
 @Field List<String> RUN = []
@@ -1116,6 +1133,18 @@ List<Long> resolveScope(Set<String> sourceNames) {
             for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
             q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
         }
+        /*
+         * With history out of scope, only current bodies can produce a match.
+         * Without this, a page whose macros survive ONLY in old versions still
+         * enters scope, gets every version loaded, and yields nothing - wasted
+         * work that also inflates the "pages in scope" count.
+         *
+         * With history IN scope the predicate must stay off: a historical hit is
+         * how a page whose current version is already clean is found at all.
+         */
+        if (!UPDATE_HISTORICAL_VERSIONS) {
+            q.append('AND c.prevver IS NULL ')
+        }
         String query = q.toString()
 
         Set<Long> ids = new LinkedHashSet<Long>()
@@ -1182,6 +1211,69 @@ List<Long> versionContentIds(PageManager pageManager, Page page) {
         return ids
     } catch (Exception e) {
         throw new RuntimeException('versionContentIds failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * SCOPE mode: the affected pages, from the database alone.
+ *
+ * No Page objects are loaded and no version bodies are scanned - the inner
+ * query finds every macro-bearing version row and maps it to its current page
+ * through prevver, the outer one fetches that page's title and space. That is
+ * why it returns in seconds where INSPECT takes minutes: INSPECT's cost is
+ * loading and parsing every version of every affected page, not the discovery.
+ *
+ * Rows: [spaceKey, pageId, title]
+ */
+List<List<String>> scopeReport(Set<String> sourceNames) {
+    try {
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        List<String> nameClauses = new ArrayList<String>()
+        int n = 0
+        for (String name : sourceNames) {
+            params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
+            nameClauses.add("bc.body LIKE :mp" + n + " ESCAPE '\\'")
+            n++
+        }
+        if (nameClauses.isEmpty()) return new ArrayList<List<String>>()
+
+        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
+                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
+        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
+
+        StringBuilder inner = new StringBuilder()
+        inner.append('SELECT DISTINCT COALESCE(c.prevver, c.contentid) AS pid ')
+             .append('FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ')
+             .append('LEFT JOIN spaces s2 ON s2.spaceid = c.spaceid ')
+             .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
+             .append('AND (').append(nameClauses.join(' OR ')).append(') ')
+        if (!spaceKeys.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
+            inner.append('AND s2.spacekey IN (').append(ph.join(', ')).append(') ')
+        }
+        if (!statuses.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
+            inner.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
+        }
+        if (!UPDATE_HISTORICAL_VERSIONS) inner.append('AND c.prevver IS NULL ')
+
+        String query = 'SELECT s.spacekey AS sk, cur.contentid AS pid, cur.title AS title ' +
+                       'FROM content cur JOIN spaces s ON s.spaceid = cur.spaceid ' +
+                       'WHERE cur.contentid IN (' + inner.toString() + ') ' +
+                       'ORDER BY s.spacekey, cur.title'
+        String resource = DB_RESOURCE
+
+        List<List<String>> out = new ArrayList<List<String>>()
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(query, params) { row ->
+                out.add([row['sk'] as String, row['pid'] as String, row['title'] as String])
+            }
+        }
+        return out
+    } catch (Exception e) {
+        throw new RuntimeException('scopeReport failed: ' + e.getMessage(), e)
     }
 }
 
@@ -1834,7 +1926,9 @@ int rowsInChunk = 0
 boolean legendEmitted = false
 
 try {
-    if (MODE != 'INSPECT' && MODE != 'APPLY') throw new IllegalStateException('MODE must be INSPECT or APPLY')
+    if (MODE != 'SCOPE' && MODE != 'INSPECT' && MODE != 'APPLY') {
+        throw new IllegalStateException('MODE must be SCOPE, INSPECT or APPLY')
+    }
     if (ON_MISSING != 'SKIP' && ON_MISSING != 'FAIL') throw new IllegalStateException('ON_MISSING must be SKIP or FAIL')
 
     boolean apply = (MODE == 'APPLY')
@@ -1926,6 +2020,47 @@ try {
     }
     outp.append('\n')
 
+    // ---- SCOPE MODE: affected pages only, then stop -------------------------
+    if (MODE == 'SCOPE') {
+        Set<String> names = new LinkedHashSet<String>()
+        for (MigrationDef md : migrations) names.add(md.sourceName)
+        long t0 = System.currentTimeMillis()
+        List<List<String>> scopeRows = scopeReport(names)
+        outp.append('SCOPE  (discovery only - no page loads, no version scanning)\n')
+        outp.append('----------------------------------------------------------------\n')
+        outp.append('  affected pages: ').append(scopeRows.size())
+            .append('   in ').append(humanTime(System.currentTimeMillis() - t0)).append('\n')
+
+        Map<String, Integer> perSpace = new LinkedHashMap<String, Integer>()
+        for (List<String> r : scopeRows) {
+            Integer c = perSpace.get(r.get(0))
+            perSpace.put(r.get(0), c == null ? 1 : c + 1)
+        }
+        outp.append('\n  ').append(String.format('%-30s %s', 'SPACE', 'AFFECTED PAGES')).append('\n')
+        for (Map.Entry<String, Integer> e : perSpace.entrySet()) {
+            outp.append('  ').append(String.format('%-30s %s', e.getKey(), e.getValue() as String)).append('\n')
+        }
+
+        StringBuilder csv = new StringBuilder()
+        csv.append('space_key,page_id,page_url,title\n')
+        for (List<String> r : scopeRows) {
+            List<String> f = [r.get(0), r.get(1),
+                              baseUrl + '/pages/viewpage.action?pageId=' + r.get(1), r.get(2)]
+            List<String> q = new ArrayList<String>()
+            for (String v : f) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+            csv.append(q.join(',')).append('\n')
+        }
+        StringBuilder page = new StringBuilder()
+        page.append('<h3>Affected pages (').append(plural(scopeRows.size(), 'page')).append(')</h3>')
+            .append('<p style="font-size:90%">Click inside, Ctrl+A, Ctrl+C. One row per page - ')
+            .append('this is the space/page mapping, no per-occurrence detail.</p>')
+            .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
+            .append(htmlEsc(csv.toString())).append('</textarea>')
+        page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
+        log.warn("Macro engine v2 SCOPE: ${scopeRows.size()} affected page(s)")
+        return page.toString()
+    }
+
     // ---- STAGE 1 ----------------------------------------------------------
     Map<String, MigrationDef> bySource = new LinkedHashMap<String, MigrationDef>()
     Map<String, MigrationDef> byId = new LinkedHashMap<String, MigrationDef>()
@@ -1933,7 +2068,25 @@ try {
 
     outp.append('STAGE-1  SCAN\n----------------------------------------------------------------\n')
     List<Long> scope = resolveScope(bySource.keySet())
-    outp.append('  pages in scope: ').append(scope.size()).append('\n')
+    int totalInScope = scope.size()
+    // sorted so a slice means the same thing on every run
+    Collections.sort(scope)
+    if (SCOPE_OFFSET > 0 || SCOPE_LIMIT > 0) {
+        int from = Math.min(SCOPE_OFFSET, totalInScope)
+        int to = (SCOPE_LIMIT > 0) ? Math.min(from + SCOPE_LIMIT, totalInScope) : totalInScope
+        scope = new ArrayList<Long>(scope.subList(from, to))
+        outp.append('  pages in scope: ').append(totalInScope)
+            .append('   processing slice [').append(from).append(', ').append(to).append(')  = ')
+            .append(plural(scope.size(), 'page')).append('\n')
+        if (to < totalInScope) {
+            outp.append('  NEXT RUN: set SCOPE_OFFSET = ').append(to)
+                .append('   (').append(totalInScope - to).append(' still to process)\n')
+        } else {
+            outp.append('  this is the LAST slice\n')
+        }
+    } else {
+        outp.append('  pages in scope: ').append(totalInScope).append('\n')
+    }
 
     List<PageFinding> findings = new ArrayList<PageFinding>()
     int batchCount = 0, pagesDone = 0
