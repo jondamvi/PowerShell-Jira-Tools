@@ -48,6 +48,50 @@ import java.util.regex.Pattern
 // which keeps run times even when a few spaces hold most of the work.
 @Field int BATCH_TARGET_ROWS = 0
 
+/*
+ * false = list spaces only, no macro counting.
+ *
+ * Counting scans every row of bodycontent, and unlike the engine's discovery
+ * there is no space filter to narrow it first - so PostgreSQL evaluates the
+ * macro match against EVERY page body in the instance. On a large site that can
+ * run for many minutes, and the console returns nothing at all if the HTTP
+ * request is dropped by a proxy or gateway timeout before it finishes.
+ *
+ * Run with false first: the space list comes back in seconds.
+ */
+@Field boolean COUNT_MACROS = true
+
+/*
+ * true  = one regex pass per body:   body ~ 'ac:name="(a|b|c)"'
+ * false = one LIKE per macro name:   body LIKE '%ac:name="a"%' OR ...
+ *
+ * With ~50 migrations the LIKE form performs 50 separate substring searches on
+ * every body. The regex form walks each body once for all names. Both are
+ * sequential scans - neither can use an index - but the regex does a fraction
+ * of the work.
+ */
+@Field boolean USE_REGEX_MATCH = true
+
+/*
+ * Restrict COUNTING to these space keys. Empty = the whole instance.
+ *
+ * Counting a slice is what the engine's discovery does, and it is why that runs
+ * in minutes: PostgreSQL narrows by spaceid before touching a single body.
+ * Instance-wide counting has nothing to narrow by and reads every page body in
+ * the site. Count in slices taken from the space list this script produces with
+ * COUNT_MACROS = false.
+ */
+@Field List<String> COUNT_SPACE_KEYS = []
+
+/*
+ * Abort the counting query after this many seconds rather than letting it run
+ * until the HTTP request is dropped - a dropped request returns NOTHING: no
+ * result, no error, and no Logs tab, because the script never reached its own
+ * logging. A timeout at least comes back as a visible error.
+ * 0 = no limit.
+ */
+@Field int SQL_TIMEOUT_SECONDS = 120
+
 // false = list only spaces containing at least one source macro.
 @Field boolean SHOW_EMPTY_SPACES = false
 
@@ -70,6 +114,18 @@ String esc(Object v) {
 String likeEscape(String v) {
     if (v == null) return ''
     return v.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+}
+
+/** Escapes POSIX regex metacharacters in a literal macro name. */
+String regexEscape(String v) {
+    if (v == null) return ''
+    StringBuilder b = new StringBuilder()
+    for (int i = 0; i < v.length(); i++) {
+        char c = v.charAt(i)
+        if ('.^$*+?()[]{}|\\-'.indexOf(c as String) >= 0) b.append('\\')
+        b.append(c)
+    }
+    return b.toString()
 }
 
 String plural(int n, String one) {
@@ -142,14 +198,35 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
     try {
         if (macros.isEmpty()) return
         Map<String, Object> params = new LinkedHashMap<String, Object>()
-        List<String> clauses = new ArrayList<String>()
-        for (int i = 0; i < macros.size(); i++) {
-            params.put('mp' + i, '%ac:name="' + likeEscape(macros.get(i)) + '"%')
-            // ESCAPE takes exactly ONE character. In a Groovy double-quoted
-            // string '\\' is a single backslash - '\\\\' would send two and
-            // PostgreSQL rejects it with "escape string must be one character".
-            clauses.add('bc.body LIKE :mp' + i + " ESCAPE '\\'")
+        String matchClause
+        if (USE_REGEX_MATCH) {
+            List<String> alts = new ArrayList<String>()
+            for (String m : macros) alts.add(regexEscape(m))
+            params.put('re', 'ac:name="(' + alts.join('|') + ')"')
+            matchClause = 'bc.body ~ :re'
+        } else {
+            List<String> clauses = new ArrayList<String>()
+            for (int i = 0; i < macros.size(); i++) {
+                params.put('mp' + i, '%ac:name="' + likeEscape(macros.get(i)) + '"%')
+                // ESCAPE takes exactly ONE character. In a Groovy double-quoted
+                // string '\\' is a single backslash - '\\\\' would send two and
+                // PostgreSQL rejects it with "escape string must be one character".
+                clauses.add('bc.body LIKE :mp' + i + " ESCAPE '\\'")
+            }
+            matchClause = clauses.join(' OR ')
         }
+        // narrowing by space first is what makes this finish: without it every
+        // page body in the instance is read
+        String spaceFilter = ''
+        if (!COUNT_SPACE_KEYS.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < COUNT_SPACE_KEYS.size(); i++) {
+                ph.add(':csk' + i)
+                params.put('csk' + i, COUNT_SPACE_KEYS.get(i))
+            }
+            spaceFilter = 'AND s.spacekey IN (' + ph.join(', ') + ') '
+        }
+
         // pages_with counts DISTINCT pages: a historical hit maps back to its
         // current page through prevver, so a page already clean in its current
         // version but still carrying macros in history is counted once
@@ -160,10 +237,13 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
                        'FROM content c ' +
                        'JOIN bodycontent bc ON bc.contentid = c.contentid ' +
                        'JOIN spaces s ON s.spaceid = c.spaceid ' +
-                       "WHERE c.contenttype IN ('PAGE','BLOGPOST') AND (" + clauses.join(' OR ') + ') ' +
+                       "WHERE c.contenttype IN ('PAGE','BLOGPOST') AND (" + matchClause + ') ' +
+                       spaceFilter +
                        'GROUP BY s.spacekey'
         String resource = DB_RESOURCE
+        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
         DatabaseUtil.withSql(resource) { Sql sql ->
+            if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
                 SpaceInfo si = spaces.get(row['sk'] as String)
                 if (si == null) return
@@ -203,12 +283,22 @@ try {
     }
 
     Map<String, SpaceInfo> spaces = loadSpaces()
-    countMacrosPerSpace(macros, spaces)
+    long countStart = System.currentTimeMillis()
+    if (COUNT_MACROS) {
+        countMacrosPerSpace(macros, spaces)
+        head.append('Macro counting: ').append((System.currentTimeMillis() - countStart) / 1000)
+            .append(' s using ').append(USE_REGEX_MATCH ? 'one regex pass' : 'per-name LIKE')
+            .append(COUNT_SPACE_KEYS.isEmpty() ? ' across the WHOLE INSTANCE'
+                                               : ' across ' + plural(COUNT_SPACE_KEYS.size(), 'space'))
+            .append('\n')
+    } else {
+        head.append('Macro counting: SKIPPED (COUNT_MACROS = false) - space list only\n')
+    }
 
     List<SpaceInfo> rows = new ArrayList<SpaceInfo>()
     for (SpaceInfo si : spaces.values()) {
         if (!INCLUDE_PERSONAL && si.key.startsWith('~')) continue
-        if (!SHOW_EMPTY_SPACES && si.pagesWithMacros == 0) continue
+        if (COUNT_MACROS && !SHOW_EMPTY_SPACES && si.pagesWithMacros == 0) continue
         rows.add(si)
     }
     Collections.sort(rows, new Comparator<SpaceInfo>() {
