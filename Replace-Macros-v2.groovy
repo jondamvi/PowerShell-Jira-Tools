@@ -251,6 +251,14 @@ enum ReplacementStatus {
 @Field boolean COMPRESS_REPLACED_ON_SUCCESS = true
 @Field boolean COMPRESS_SOURCE_ON_FAILURE = false
 @Field boolean COMPRESS_REPLACED_ON_FAILURE = false
+
+/*
+ * Rollback copies are page bodies - they dwarf everything else in the output.
+ * Kept in their own fixed-height scroll box so the summary and the results
+ * table stay reachable instead of sitting above thousands of lines of storage
+ * format. 0 = render them inline as before.
+ */
+@Field int ROLLBACK_MAX_HEIGHT_PX = 400
 @Field boolean EMIT_REPLACED_ON_SUCCESS = false     // usually not needed
 @Field int MAX_ROLLBACK_ENTRIES = 200
 
@@ -2538,7 +2546,14 @@ try {
         page.append('<h3>Rollback copies (').append(rollbackEmitted).append(')</h3>')
             .append('<p>Console output is not a backup - take a database backup before bulk runs. ')
             .append('These are for surgical single-version restores.</p>')
-            .append('<pre>').append(htmlEsc(rollback.toString())).append('</pre>')
+        if (ROLLBACK_MAX_HEIGHT_PX > 0) {
+            page.append('<div style="max-height:').append(ROLLBACK_MAX_HEIGHT_PX)
+                .append('px;overflow:auto;border:1px solid #ccc;resize:vertical">')
+                .append('<pre style="margin:0">').append(htmlEsc(rollback.toString())).append('</pre>')
+                .append('</div>')
+        } else {
+            page.append('<pre>').append(htmlEsc(rollback.toString())).append('</pre>')
+        }
     }
     return page.toString()
 
