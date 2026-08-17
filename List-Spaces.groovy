@@ -95,6 +95,14 @@ import java.util.regex.Pattern
 // false = list only spaces containing at least one source macro.
 @Field boolean SHOW_EMPTY_SPACES = false
 
+/*
+ * content_status values to count. MUST match the engine's INCLUDE_STATUSES, or
+ * the two scripts answer the same question differently: this one counted every
+ * status, so drafts and trashed content inflated its totals against the
+ * engine's SCOPE list. Empty = every status.
+ */
+@Field List<String> INCLUDE_STATUSES = ['current']
+
 // Include personal spaces (keys starting with ~).
 @Field boolean INCLUDE_PERSONAL = true
 // ================================================================
@@ -217,6 +225,16 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
         }
         // narrowing by space first is what makes this finish: without it every
         // page body in the instance is read
+        String statusFilter = ''
+        if (!INCLUDE_STATUSES.isEmpty()) {
+            List<String> sph = new ArrayList<String>()
+            for (int i = 0; i < INCLUDE_STATUSES.size(); i++) {
+                sph.add(':st' + i)
+                params.put('st' + i, INCLUDE_STATUSES.get(i))
+            }
+            statusFilter = 'AND c.content_status IN (' + sph.join(', ') + ') '
+        }
+
         String spaceFilter = ''
         if (!COUNT_SPACE_KEYS.isEmpty()) {
             List<String> ph = new ArrayList<String>()
@@ -238,7 +256,7 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
                        'JOIN bodycontent bc ON bc.contentid = c.contentid ' +
                        'JOIN spaces s ON s.spaceid = c.spaceid ' +
                        "WHERE c.contenttype IN ('PAGE','BLOGPOST') AND (" + matchClause + ') ' +
-                       spaceFilter +
+                       spaceFilter + statusFilter +
                        'GROUP BY s.spacekey'
         String resource = DB_RESOURCE
         int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
@@ -290,6 +308,7 @@ try {
             .append(' s using ').append(USE_REGEX_MATCH ? 'one regex pass' : 'per-name LIKE')
             .append(COUNT_SPACE_KEYS.isEmpty() ? ' across the WHOLE INSTANCE'
                                                : ' across ' + plural(COUNT_SPACE_KEYS.size(), 'space'))
+            .append('   statuses: ').append(INCLUDE_STATUSES.isEmpty() ? 'ALL' : INCLUDE_STATUSES.join(', '))
             .append('\n')
     } else {
         head.append('Macro counting: SKIPPED (COUNT_MACROS = false) - space list only\n')

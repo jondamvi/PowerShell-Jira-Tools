@@ -1259,8 +1259,10 @@ List<List<String>> scopeReport(Set<String> sourceNames) {
         }
         if (!UPDATE_HISTORICAL_VERSIONS) inner.append('AND c.prevver IS NULL ')
 
+        // LEFT JOIN: a page whose current row carries no spaceid would otherwise
+        // vanish from the list entirely rather than showing with a blank space
         String query = 'SELECT s.spacekey AS sk, cur.contentid AS pid, cur.title AS title ' +
-                       'FROM content cur JOIN spaces s ON s.spaceid = cur.spaceid ' +
+                       'FROM content cur LEFT JOIN spaces s ON s.spaceid = cur.spaceid ' +
                        'WHERE cur.contentid IN (' + inner.toString() + ') ' +
                        'ORDER BY s.spacekey, cur.title'
         String resource = DB_RESOURCE
@@ -2048,21 +2050,49 @@ try {
             outp.append('  ').append(String.format('%-30s %s', e.getKey(), e.getValue() as String)).append('\n')
         }
 
-        StringBuilder csv = new StringBuilder()
-        csv.append('space_key,page_id,page_url,title\n')
-        for (List<String> r : scopeRows) {
-            List<String> f = [r.get(0), r.get(1),
-                              baseUrl + '/pages/viewpage.action?pageId=' + r.get(1), r.get(2)]
-            List<String> q = new ArrayList<String>()
-            for (String v : f) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
-            csv.append(q.join(',')).append('\n')
-        }
+        // RESULT_FORMAT applies in every mode - SCOPE used to force CSV
+        List<String> scopeHeaders = ['Space Key', 'Page ID', 'Page URL', 'Title']
         StringBuilder page = new StringBuilder()
         page.append('<h3>Affected pages (').append(plural(scopeRows.size(), 'page')).append(')</h3>')
-            .append('<p style="font-size:90%">Click inside, Ctrl+A, Ctrl+C. One row per page - ')
-            .append('this is the space/page mapping, no per-occurrence detail.</p>')
-            .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
-            .append(htmlEsc(csv.toString())).append('</textarea>')
+
+        if (RESULT_FORMAT == 'TABLE') {
+            page.append('<div style="max-height:').append(RESULT_TABLE_MAX_HEIGHT_PX)
+                .append('px;overflow:auto;border:1px solid #ccc;resize:vertical">')
+                .append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%"><tr>')
+            for (String h : scopeHeaders) page.append('<th>').append(htmlEsc(h)).append('</th>')
+            page.append('</tr>')
+            for (List<String> r : scopeRows) {
+                String url = baseUrl + '/pages/viewpage.action?pageId=' + r.get(1)
+                page.append('<tr><td>').append(htmlEsc(r.get(0)))
+                    .append('</td><td>').append(htmlEsc(r.get(1)))
+                    .append('</td><td><a href="').append(url).append('" target="_blank">open</a>')
+                    .append('</td><td>').append(htmlEsc(r.get(2))).append('</td></tr>')
+            }
+            page.append('</table></div>')
+
+        } else if (RESULT_FORMAT == 'LIST') {
+            StringBuilder urls = new StringBuilder()
+            for (List<String> r : scopeRows) {
+                urls.append(baseUrl).append('/pages/viewpage.action?pageId=').append(r.get(1)).append('\n')
+            }
+            page.append('<p style="font-size:90%">Click inside, Ctrl+A, Ctrl+C.</p>')
+                .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
+                .append(htmlEsc(urls.toString())).append('</textarea>')
+
+        } else if (RESULT_FORMAT == 'CSV') {
+            StringBuilder csv = new StringBuilder()
+            csv.append('space_key,page_id,page_url,title\n')
+            for (List<String> r : scopeRows) {
+                List<String> f = [r.get(0), r.get(1),
+                                  baseUrl + '/pages/viewpage.action?pageId=' + r.get(1), r.get(2)]
+                List<String> q = new ArrayList<String>()
+                for (String v : f) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
+                csv.append(q.join(',')).append('\n')
+            }
+            page.append('<p style="font-size:90%">Click inside, Ctrl+A, Ctrl+C.</p>')
+                .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
+                .append(htmlEsc(csv.toString())).append('</textarea>')
+        }
         page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
         log.warn("Macro engine v2 SCOPE: ${scopeRows.size()} affected page(s)")
         return page.toString()
