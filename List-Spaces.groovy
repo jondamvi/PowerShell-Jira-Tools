@@ -225,6 +225,14 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
         }
         // narrowing by space first is what makes this finish: without it every
         // page body in the instance is read
+        /*
+         * The status test belongs to the PAGE, not to each version row.
+         * Historical rows do not carry content_status = 'current', so testing
+         * every row by status silently drops all history - which for the engine
+         * means a page whose macros survive ONLY in old versions never enters
+         * scope at all. A historical row therefore qualifies when its live page
+         * qualifies, looked up through prevver on the primary key.
+         */
         String statusFilter = ''
         if (!INCLUDE_STATUSES.isEmpty()) {
             List<String> sph = new ArrayList<String>()
@@ -232,7 +240,10 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
                 sph.add(':st' + i)
                 params.put('st' + i, INCLUDE_STATUSES.get(i))
             }
-            statusFilter = 'AND c.content_status IN (' + sph.join(', ') + ') '
+            String inList = sph.join(', ')
+            statusFilter = 'AND (c.content_status IN (' + inList + ') ' +
+                           'OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ' +
+                           'WHERE p.contentid = c.prevver AND p.content_status IN (' + inList + ')))) '
         }
 
         String spaceFilter = ''

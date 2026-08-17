@@ -1128,10 +1128,21 @@ List<Long> resolveScope(Set<String> sourceNames) {
             for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
             q.append('AND s.spacekey IN (').append(ph.join(', ')).append(') ')
         }
+        /*
+         * The status test belongs to the PAGE, not to each version row.
+         * Historical rows do not carry content_status = 'current', so testing
+         * every row by status silently drops all history - which for the engine
+         * means a page whose macros survive ONLY in old versions never enters
+         * scope at all. A historical row therefore qualifies when its live page
+         * qualifies, looked up through prevver on the primary key.
+         */
         if (!statuses.isEmpty()) {
             List<String> ph = new ArrayList<String>()
             for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-            q.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
+            String inList = ph.join(', ')
+            q.append('AND (c.content_status IN (').append(inList).append(') ')
+             .append('OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ')
+             .append('WHERE p.contentid = c.prevver AND p.content_status IN (').append(inList).append(')))) ')
         }
         /*
          * With history out of scope, only current bodies can produce a match.
@@ -1253,9 +1264,13 @@ List<List<String>> scopeReport(Set<String> sourceNames) {
             inner.append('AND s2.spacekey IN (').append(ph.join(', ')).append(') ')
         }
         if (!statuses.isEmpty()) {
+            // same page-level status rule as resolveScope - see the note there
             List<String> ph = new ArrayList<String>()
             for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-            inner.append('AND c.content_status IN (').append(ph.join(', ')).append(') ')
+            String inList = ph.join(', ')
+            inner.append('AND (c.content_status IN (').append(inList).append(') ')
+                 .append('OR (c.prevver IS NOT NULL AND EXISTS (SELECT 1 FROM content p ')
+                 .append('WHERE p.contentid = c.prevver AND p.content_status IN (').append(inList).append(')))) ')
         }
         if (!UPDATE_HISTORICAL_VERSIONS) inner.append('AND c.prevver IS NULL ')
 
