@@ -2028,6 +2028,13 @@ try {
         List<List<String>> scopeRows = scopeReport(names)
         outp.append('SCOPE  (discovery only - no page loads, no version scanning)\n')
         outp.append('----------------------------------------------------------------\n')
+        if (SCOPE_OFFSET > 0 || SCOPE_LIMIT > 0) {
+            // slicing exists for the version-scanning stages, which SCOPE never
+            // reaches - saying so avoids a truncated-looking list being trusted
+            outp.append('  NOTE: SCOPE_OFFSET/SCOPE_LIMIT do not apply in SCOPE mode.\n')
+                .append('        This list is COMPLETE for the configured scope; slicing only\n')
+                .append('        affects INSPECT and APPLY, where every version is loaded.\n')
+        }
         outp.append('  affected pages: ').append(scopeRows.size())
             .append('   in ').append(humanTime(System.currentTimeMillis() - t0)).append('\n')
 
