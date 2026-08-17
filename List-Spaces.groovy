@@ -202,9 +202,37 @@ Map<String, SpaceInfo> loadSpaces() {
 }
 
 /** One grouped scan: per-space counts for all macros at once. */
+/*
+ * Counting, same rules as the engine's discovery.
+ *
+ * The body predicate cannot use an index, so everything here is about shrinking
+ * the row set before it: filter on content.spaceid (indexed integer), select
+ * three columns, no joins to spaces or to the parent row inside the scan.
+ *
+ * Aggregation happens in Groovy rather than in SQL - grouping needed a join to
+ * spaces, and joining a wide table into a sequential scan is exactly what made
+ * this unusable. Row counts here are thousands, not millions.
+ */
 void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
     try {
         if (macros.isEmpty()) return
+
+        // spaceid -> key, one small lookup; also the space filter when set
+        Map<Integer, String> keyById = new LinkedHashMap<Integer, String>()
+        String resource = DB_RESOURCE
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow('SELECT spaceid, spacekey FROM spaces') { row ->
+                keyById.put(((Number) row['spaceid']).intValue(), row['spacekey'] as String)
+            }
+        }
+        List<Integer> wantedIds = new ArrayList<Integer>()
+        if (!COUNT_SPACE_KEYS.isEmpty()) {
+            for (Map.Entry<Integer, String> e : keyById.entrySet()) {
+                if (COUNT_SPACE_KEYS.contains(e.getValue())) wantedIds.add(e.getKey())
+            }
+            if (wantedIds.isEmpty()) return
+        }
+
         Map<String, Object> params = new LinkedHashMap<String, Object>()
         String matchClause
         if (USE_REGEX_MATCH) {
@@ -216,80 +244,73 @@ void countMacrosPerSpace(List<String> macros, Map<String, SpaceInfo> spaces) {
             List<String> clauses = new ArrayList<String>()
             for (int i = 0; i < macros.size(); i++) {
                 params.put('mp' + i, '%ac:name="' + likeEscape(macros.get(i)) + '"%')
-                // ESCAPE takes exactly ONE character. In a Groovy double-quoted
-                // string '\\' is a single backslash - '\\\\' would send two and
-                // PostgreSQL rejects it with "escape string must be one character".
                 clauses.add('bc.body LIKE :mp' + i + " ESCAPE '\\'")
             }
             matchClause = clauses.join(' OR ')
         }
 
-        /*
-         * A version row cannot answer page-level questions about itself, so the
-         * live page is joined through prevver and both rules are tested against
-         * it. Matches the engine's discovery exactly - these two scripts must
-         * answer the same question the same way, or their numbers disagree.
-         *
-         *   status - historical rows do not carry content_status = 'current',
-         *            so testing every row by status drops all history.
-         *   space  - historical rows frequently carry a NULL spaceid, so a row
-         *            is attributed to COALESCE(its own space, its page's space).
-         *            An inner join on the row's own space would discard every
-         *            space-less historical row outright.
-         *
-         * No correlated EXISTS: past ~10 values in an IN-list PostgreSQL can
-         * re-cost that shape and re-evaluate it per row, which is what made a
-         * 10-15 space run hang. Plain LEFT JOINs are planned once.
-         */
-        String statusFilter = ''
+        StringBuilder q = new StringBuilder()
+        q.append('SELECT c.contentid AS cid, c.prevver AS prevver, c.spaceid AS sid ')
+         .append('FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ')
+         .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
+        if (!wantedIds.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < wantedIds.size(); i++) {
+                ph.add(':sid' + i)
+                params.put('sid' + i, wantedIds.get(i))
+            }
+            q.append('AND c.spaceid IN (').append(ph.join(', ')).append(') ')
+        }
+        // status applies to live rows only - historical rows do not carry
+        // content_status = 'current'
         if (!INCLUDE_STATUSES.isEmpty()) {
-            List<String> sph = new ArrayList<String>()
+            List<String> ph = new ArrayList<String>()
             for (int i = 0; i < INCLUDE_STATUSES.size(); i++) {
-                sph.add(':st' + i)
+                ph.add(':st' + i)
                 params.put('st' + i, INCLUDE_STATUSES.get(i))
             }
-            String inList = sph.join(', ')
-            statusFilter = 'AND (c.content_status IN (' + inList + ') ' +
-                           'OR p.content_status IN (' + inList + ')) '
+            q.append('AND (c.prevver IS NOT NULL OR c.content_status IN (')
+             .append(ph.join(', ')).append(')) ')
         }
+        q.append('AND (').append(matchClause).append(')')
 
-        String spaceFilter = ''
-        if (!COUNT_SPACE_KEYS.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < COUNT_SPACE_KEYS.size(); i++) {
-                ph.add(':csk' + i)
-                params.put('csk' + i, COUNT_SPACE_KEYS.get(i))
-            }
-            spaceFilter = 'AND s.spacekey IN (' + ph.join(', ') + ') '
-        }
-
-        // pages_with counts DISTINCT pages: a historical hit maps back to its
-        // current page through prevver, so a page already clean in its current
-        // version but still carrying macros in history is counted once
-        String query = 'SELECT s.spacekey AS sk, ' +
-                       'count(*) AS macro_rows, ' +
-                       'count(*) FILTER (WHERE c.prevver IS NOT NULL) AS hist_rows, ' +
-                       'count(DISTINCT COALESCE(c.prevver, c.contentid)) AS pages_with ' +
-                       'FROM content c ' +
-                       'JOIN bodycontent bc ON bc.contentid = c.contentid ' +
-                       'LEFT JOIN content p ON p.contentid = c.prevver ' +
-                       'LEFT JOIN spaces s ON s.spaceid = COALESCE(c.spaceid, p.spaceid) ' +
-                       "WHERE c.contenttype IN ('PAGE','BLOGPOST') AND (" + matchClause + ') ' +
-                       spaceFilter + statusFilter +
-                       'GROUP BY s.spacekey'
-        String resource = DB_RESOURCE
+        String query = q.toString()
         int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
+
+        Map<String, Long> rowsBySpace = new LinkedHashMap<String, Long>()
+        Map<String, Long> histBySpace = new LinkedHashMap<String, Long>()
+        Map<String, Set<Long>> pagesBySpace = new LinkedHashMap<String, Set<Long>>()
+
         DatabaseUtil.withSql(resource) { Sql sql ->
             if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
-                Object sk = row['sk']
-                if (sk == null) return          // space could not be resolved
-                SpaceInfo si = spaces.get(sk as String)
-                if (si == null) return
-                si.macroRows = ((Number) row['macro_rows']).longValue()
-                si.historicalRows = ((Number) row['hist_rows']).longValue()
-                si.pagesWithMacros = ((Number) row['pages_with']).longValue()
+                Object sid = row['sid']
+                if (sid == null) return
+                String key = keyById.get(((Number) sid).intValue())
+                if (key == null) return
+                Object prev = row['prevver']
+                long pid = (prev == null) ? ((Number) row['cid']).longValue()
+                                          : ((Number) prev).longValue()
+                Long r = rowsBySpace.get(key)
+                rowsBySpace.put(key, r == null ? 1L : r + 1L)
+                if (prev != null) {
+                    Long h = histBySpace.get(key)
+                    histBySpace.put(key, h == null ? 1L : h + 1L)
+                }
+                Set<Long> ps = pagesBySpace.get(key)
+                if (ps == null) { ps = new LinkedHashSet<Long>(); pagesBySpace.put(key, ps) }
+                ps.add(pid)
             }
+        }
+
+        for (Map.Entry<String, Long> e : rowsBySpace.entrySet()) {
+            SpaceInfo si = spaces.get(e.getKey())
+            if (si == null) continue
+            si.macroRows = e.getValue().longValue()
+            Long h = histBySpace.get(e.getKey())
+            si.historicalRows = (h == null) ? 0L : h.longValue()
+            Set<Long> ps = pagesBySpace.get(e.getKey())
+            si.pagesWithMacros = (ps == null) ? 0L : ps.size()
         }
     } catch (Exception e) {
         throw new RuntimeException('countMacrosPerSpace failed: ' + e.getMessage(), e)

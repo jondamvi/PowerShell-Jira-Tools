@@ -1095,74 +1095,99 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
 
 /** Distinct current-page ids in scope, from the database (or the override). */
 /*
- * Body of the discovery query, shared by resolveScope and scopeReport.
+ * DISCOVERY
  *
- * Written as a CTE joined to content, NOT as "contentid IN (subquery)" with a
- * correlated EXISTS. Past ~10 values in the space IN-list PostgreSQL re-costs
- * that shape and can re-evaluate the subquery per row, which is why a run with
- * 10-15 spaces hung while 5 finished quickly. A CTE is evaluated once.
+ * The only expensive predicate is "body contains this macro" - it cannot use an
+ * index, so whatever rows reach it are read in full. Everything here exists to
+ * make that set as small as possible BEFORE the body is touched:
  *
- * Two joins carry the page-level rules that a version row cannot answer itself:
- *   p  - the live page of a historical row, via prevver. Historical rows do not
- *        carry content_status = 'current', so status is tested against p.
- *   sp - that live page's space. Historical rows frequently have a NULL
- *        spaceid, so filtering a version row by its own space would drop every
- *        historical row - the space is tested against the row OR its page.
+ *   - filter on content.spaceid, an indexed integer resolved up front, NOT on
+ *     spaces.spacekey. Joining spaces to test a key means the space is unknown
+ *     until after the join, so every body in the instance gets read.
+ *   - select two columns, contentid and prevver. Nothing else is needed to
+ *     identify a page, and content is a wide table.
+ *   - no self-join to the parent row, no CTE, no COALESCE. The current page id
+ *     is prevver when set and contentid otherwise - trivial in Groovy, and it
+ *     keeps the SQL to one indexed filter plus one primary-key join.
  *
- * Returns the CTE text; params are filled in by the caller.
+ * Historical rows normally carry their own spaceid, so filtering on it keeps
+ * them. The handful that do not are the orphaned rows seen earlier; they are
+ * reported by Diagnose-NoSpacePages rather than being chased here at the cost
+ * of every query in the script.
  */
-String discoveryCte(Set<String> sourceNames, List<String> spaceKeys, List<String> statuses,
-                    Map<String, Object> params) {
-    List<String> nameClauses = new ArrayList<String>()
-    int n = 0
-    for (String name : sourceNames) {
-        params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
-        nameClauses.add("bc.body LIKE :mp" + n + " ESCAPE '\\'")
-        n++
-    }
-    if (nameClauses.isEmpty()) return null
 
-    StringBuilder q = new StringBuilder()
-    q.append('WITH matched AS (SELECT DISTINCT COALESCE(c.prevver, c.contentid) AS pid ')
-     .append('FROM content c ')
-     .append('JOIN bodycontent bc ON bc.contentid = c.contentid ')
-     .append('LEFT JOIN spaces s2 ON s2.spaceid = c.spaceid ')
-     .append('LEFT JOIN content p ON p.contentid = c.prevver ')
-     .append('LEFT JOIN spaces sp ON sp.spaceid = p.spaceid ')
-     .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
-     .append('AND (').append(nameClauses.join(' OR ')).append(') ')
-
-    if (!spaceKeys.isEmpty()) {
+/** spaceids for the configured space keys. One tiny indexed lookup. */
+List<Integer> spaceIdsFor(List<String> spaceKeys) {
+    try {
+        List<Integer> ids = new ArrayList<Integer>()
+        if (spaceKeys.isEmpty()) return ids
         List<String> ph = new ArrayList<String>()
-        for (int i = 0; i < spaceKeys.size(); i++) { ph.add(':sk' + i); params.put('sk' + i, spaceKeys.get(i)) }
-        String inList = ph.join(', ')
-        q.append('AND (s2.spacekey IN (').append(inList).append(') OR sp.spacekey IN (')
-         .append(inList).append(')) ')
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        for (int i = 0; i < spaceKeys.size(); i++) {
+            ph.add(':k' + i)
+            params.put('k' + i, spaceKeys.get(i))
+        }
+        String query = 'SELECT spaceid FROM spaces WHERE spacekey IN (' + ph.join(', ') + ')'
+        String resource = DB_RESOURCE
+        DatabaseUtil.withSql(resource) { Sql sql ->
+            sql.eachRow(query, params) { row -> ids.add(((Number) row['spaceid']).intValue()) }
+        }
+        return ids
+    } catch (Exception e) {
+        throw new RuntimeException('spaceIdsFor failed: ' + e.getMessage(), e)
     }
-    if (!statuses.isEmpty()) {
-        List<String> ph = new ArrayList<String>()
-        for (int i = 0; i < statuses.size(); i++) { ph.add(':st' + i); params.put('st' + i, statuses.get(i)) }
-        String inList = ph.join(', ')
-        q.append('AND (c.content_status IN (').append(inList).append(') OR p.content_status IN (')
-         .append(inList).append(')) ')
-    }
-    if (!UPDATE_HISTORICAL_VERSIONS) q.append('AND c.prevver IS NULL ')
-    q.append(') ')
-    return q.toString()
 }
 
+/**
+ * Current page ids that have at least one version carrying a source macro.
+ * Two columns out of content; the page id is derived in Groovy.
+ */
 List<Long> resolveScope(Set<String> sourceNames) {
     try {
         if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
 
         List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
                 ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
-        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
-        Map<String, Object> params = new LinkedHashMap<String, Object>()
-        String cte = discoveryCte(sourceNames, spaceKeys, statuses, params)
-        if (cte == null) return new ArrayList<Long>()
+        List<Integer> spaceIds = spaceIdsFor(spaceKeys)
+        if (!spaceKeys.isEmpty() && spaceIds.isEmpty()) return new ArrayList<Long>()
 
-        String query = cte + 'SELECT pid FROM matched'
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        List<String> nameClauses = new ArrayList<String>()
+        int n = 0
+        for (String name : sourceNames) {
+            params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
+            nameClauses.add('bc.body LIKE :mp' + n + " ESCAPE '\\'")
+            n++
+        }
+        if (nameClauses.isEmpty()) return new ArrayList<Long>()
+
+        StringBuilder q = new StringBuilder()
+        q.append('SELECT c.contentid AS cid, c.prevver AS prevver ')
+         .append('FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ')
+         .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
+        if (!spaceIds.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < spaceIds.size(); i++) {
+                ph.add(':sid' + i)
+                params.put('sid' + i, spaceIds.get(i))
+            }
+            q.append('AND c.spaceid IN (').append(ph.join(', ')).append(') ')
+        }
+        // status applies to live rows only - historical rows do not carry
+        // content_status = 'current', so testing them by it drops all history
+        if (!INCLUDE_STATUSES.isEmpty()) {
+            List<String> ph = new ArrayList<String>()
+            for (int i = 0; i < INCLUDE_STATUSES.size(); i++) {
+                ph.add(':st' + i)
+                params.put('st' + i, INCLUDE_STATUSES.get(i))
+            }
+            q.append('AND (c.prevver IS NOT NULL OR c.content_status IN (')
+             .append(ph.join(', ')).append(')) ')
+        }
+        if (!UPDATE_HISTORICAL_VERSIONS) q.append('AND c.prevver IS NULL ')
+        q.append('AND (').append(nameClauses.join(' OR ')).append(')')
+
+        String query = q.toString()
         String resource = DB_RESOURCE
         int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
 
@@ -1170,8 +1195,8 @@ List<Long> resolveScope(Set<String> sourceNames) {
         DatabaseUtil.withSql(resource) { Sql sql ->
             if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
-                Object pid = row['pid']
-                if (pid != null) ids.add(((Number) pid).longValue())
+                Object prev = row['prevver']
+                ids.add(prev == null ? ((Number) row['cid']).longValue() : ((Number) prev).longValue())
             }
         }
         return new ArrayList<Long>(ids)
@@ -1193,32 +1218,49 @@ List<Long> resolveScope(Set<String> sourceNames) {
  */
 List<List<String>> scopeReport(Set<String> sourceNames) {
     try {
-        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
-                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
-        List<String> statuses = new ArrayList<String>(INCLUDE_STATUSES)
-        Map<String, Object> params = new LinkedHashMap<String, Object>()
-        String cte = discoveryCte(sourceNames, spaceKeys, statuses, params)
-        if (cte == null) return new ArrayList<List<String>>()
-
-        // join, not "contentid IN (subquery)" - same planner reason as the CTE.
-        // LEFT JOIN spaces so a page whose row carries no spaceid still appears
-        // with a blank space rather than vanishing from the list.
-        String query = cte +
-                'SELECT s.spacekey AS sk, cur.contentid AS pid, cur.title AS title ' +
-                'FROM matched m ' +
-                'JOIN content cur ON cur.contentid = m.pid ' +
-                'LEFT JOIN spaces s ON s.spaceid = cur.spaceid ' +
-                'ORDER BY s.spacekey, cur.title'
-        String resource = DB_RESOURCE
-        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
-
+        // reuse discovery, then fetch only the three columns needed for display
+        List<Long> pageIds = resolveScope(sourceNames)
         List<List<String>> out = new ArrayList<List<String>>()
+        if (pageIds.isEmpty()) return out
+
+        Map<Integer, String> spaceKeyById = new LinkedHashMap<Integer, String>()
+        String resource = DB_RESOURCE
         DatabaseUtil.withSql(resource) { Sql sql ->
-            if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
-            sql.eachRow(query, params) { row ->
-                out.add([row['sk'] as String, row['pid'] as String, row['title'] as String])
+            sql.eachRow('SELECT spaceid, spacekey FROM spaces') { row ->
+                spaceKeyById.put(((Number) row['spaceid']).intValue(), row['spacekey'] as String)
             }
         }
+
+        // chunked IN list: one query per 1000 ids, each a primary-key lookup.
+        // A single IN with 20k values makes the planner give up on the index.
+        int chunk = 1000
+        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
+        for (int from = 0; from < pageIds.size(); from += chunk) {
+            int to = Math.min(from + chunk, pageIds.size())
+            List<Long> slice = pageIds.subList(from, to)
+            List<String> ph = new ArrayList<String>()
+            Map<String, Object> params = new LinkedHashMap<String, Object>()
+            for (int i = 0; i < slice.size(); i++) {
+                ph.add(':p' + i)
+                params.put('p' + i, slice.get(i))
+            }
+            String query = 'SELECT contentid, title, spaceid FROM content WHERE contentid IN (' +
+                           ph.join(', ') + ')'
+            DatabaseUtil.withSql(resource) { Sql sql ->
+                if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
+                sql.eachRow(query, params) { row ->
+                    Object sid = row['spaceid']
+                    String sk = (sid == null) ? '' : spaceKeyById.get(((Number) sid).intValue())
+                    out.add([sk == null ? '' : sk, row['contentid'] as String, row['title'] as String])
+                }
+            }
+        }
+        Collections.sort(out, new Comparator<List<String>>() {
+            @Override int compare(List<String> a, List<String> b) {
+                int c = (a.get(0) <=> b.get(0))
+                return c != 0 ? c : (a.get(2) <=> b.get(2))
+            }
+        })
         return out
     } catch (Exception e) {
         throw new RuntimeException('scopeReport failed: ' + e.getMessage(), e)
