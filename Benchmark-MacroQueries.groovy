@@ -464,22 +464,37 @@ try {
         v.id = id
         v.label = labels.get(id) == null ? id : labels.get(id)
         try {
+            /*
+             * TIMED RUNS CARRY NO EXPLAIN.
+             *
+             * EXPLAIN (ANALYZE) executes the query a second time. Collecting it
+             * inside a timed run therefore roughly DOUBLES that run's measured
+             * time - which is what made every variant's second run slower than
+             * its first, the opposite of what caching predicts. The plan is
+             * captured afterwards, outside the measurement.
+             */
             for (int r = 0; r < RUNS; r++) {
-                boolean wantExplain = (SHOW_EXPLAIN && r == RUNS - 1)
                 long start = System.nanoTime()
                 Map<String, Object> res
-                if (id == 'A')      res = runRowVariant(pageIds, macroNames, false, wantExplain)
-                else if (id == 'D') res = runRowVariant(pageIds, macroNames, true,  wantExplain)
-                else if (id == 'B') res = runExistsVariant(pageIds, macroNames, false, wantExplain)
-                else if (id == 'C') res = runExistsVariant(pageIds, macroNames, true,  wantExplain)
+                if (id == 'A')      res = runRowVariant(pageIds, macroNames, false, false)
+                else if (id == 'D') res = runRowVariant(pageIds, macroNames, true,  false)
+                else if (id == 'B') res = runExistsVariant(pageIds, macroNames, false, false)
+                else if (id == 'C') res = runExistsVariant(pageIds, macroNames, true,  false)
                 else break
                 long ms = (long) ((System.nanoTime() - start) / 1000000L)
                 v.millis.add(ms)
                 Set<Long> aff = (Set<Long>) res.get('affected')
                 v.affectedPages = aff.size()
                 v.versionRows = ((Integer) res.get('rows')).intValue()
-                String ex = (String) res.get('explain')
-                if (ex != null && !ex.isEmpty()) v.explain = ex
+            }
+            if (SHOW_EXPLAIN) {
+                Map<String, Object> ex
+                if (id == 'A')      ex = runRowVariant(pageIds, macroNames, false, true)
+                else if (id == 'D') ex = runRowVariant(pageIds, macroNames, true,  true)
+                else if (id == 'B') ex = runExistsVariant(pageIds, macroNames, false, true)
+                else                ex = runExistsVariant(pageIds, macroNames, true,  true)
+                String plan = (String) ex.get('explain')
+                if (plan != null) v.explain = plan
             }
         } catch (Exception e) {
             v.error = e.getClass().getSimpleName() + ': ' + e.getMessage()
@@ -526,10 +541,18 @@ try {
 
     outp.append('\nREADING THE TIMINGS\n')
     outp.append('================================================================\n')
-    outp.append('  The FIRST run of the first variant reads from disk; later runs read\n')
-    outp.append('  from shared buffers. Compare the LAST run of each variant, and if\n')
-    outp.append('  two are close, re-run with RUN_VARIANTS reversed to confirm the\n')
-    outp.append('  ordering is not what produced the difference.\n')
+    outp.append('  EXPLAIN is collected AFTER the timed runs, so no run includes it.\n')
+    outp.append('  The first run of the first variant reads from disk; later runs read\n')
+    outp.append('  from shared buffers, so compare the LAST run of each variant. If two\n')
+    outp.append('  are close, re-run with RUN_VARIANTS reversed - if the ranking follows\n')
+    outp.append('  the order rather than the variant, the difference is caching.\n')
+    if (pageIds.size() < 200) {
+        outp.append('\n  WARNING: only ').append(plural(pageIds.size(), 'page'))
+            .append(' in scope. At this size planning, connection setup and caching\n')
+            .append('  dominate, and differences of tens of milliseconds mean nothing.\n')
+            .append('  Benchmark on a space with hundreds of affected pages before\n')
+            .append('  choosing a shape.\n')
+    }
 
     // ---- explain plans -----------------------------------------------------
     if (SHOW_EXPLAIN) {
