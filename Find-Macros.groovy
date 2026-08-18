@@ -74,6 +74,11 @@ enum MacroType {
 // very large; a few hundred keeps every lookup on the index.
 @Field int CHUNK_SIZE = 500
 
+// Version ids per chunk in step 3c. Chunked separately from pages because one
+// page can have forty versions - chunking bodies by page id gives wildly uneven
+// IN lists, and it is the body reads that cost.
+@Field int BODY_CHUNK_SIZE = 300
+
 // Abort a query rather than let the HTTP request be dropped - a dropped request
 // returns nothing at all, not even a Logs tab. 0 = no limit.
 @Field int SQL_TIMEOUT_SECONDS = 300
@@ -281,30 +286,44 @@ List<PageRow> pagesInScope(Map<String, Integer> spaceIds) {
 // =============================================================================
 //  STEP 3 - THE DISCOVERY  (the one function that finds macros)
 //
-//  For a chunk of page ids, both queries below are run:
+//  WHY THIS IS THREE SEPARATE QUERIES AND NOT ONE JOIN
 //
-//    CURRENT versions
-//      SELECT c.contentid, c.version
+//  The previous shape was
 //      FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid
-//      WHERE c.contentid IN (:p0, ...)            <- primary key
-//        AND (bc.body LIKE :m0 ESCAPE '\' OR ...)
+//      WHERE c.contentid IN (...) AND bc.body LIKE ...
+//  which lets the planner choose which table to drive from. With a handful of
+//  ids it drives from content and fetches a handful of bodies by primary key.
+//  Past an estimated row count it re-costs, decides the IN list is no longer
+//  selective, and SEQ SCANS bodycontent instead - applying LIKE to every body in
+//  the instance. That is the cliff: 5 pages fine, 30 pages hangs, and it has
+//  nothing to do with the size of the space.
 //
-//    HISTORICAL versions
-//      SELECT c.contentid, c.version, c.prevver
-//      FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid
-//      WHERE c.prevver IN (:p0, ...)              <- points at the current row
-//        AND (bc.body LIKE :m0 ESCAPE '\' OR ...)
+//  So the join is removed. Three queries, each with exactly ONE sensible plan:
 //
-//  Why two queries rather than one with OR: an OR across two different columns
-//  stops Postgres using either index and turns the whole thing into a scan.
-//  Two single-column predicates each stay on their index.
+//    3a  version ids of the pages, CURRENT rows      content only, no body
+//          SELECT contentid FROM content WHERE contentid IN (:p0, ...)
 //
-//  Why bodycontent is joined on contentid: it is the primary key there, so each
-//  row is a direct lookup. Only the bodies of versions belonging to the pages in
-//  scope are read - the LIKE never sees the rest of the table.
+//    3b  version ids of the pages, HISTORICAL rows   content only, no body
+//          SELECT contentid, prevver FROM content WHERE prevver IN (:p0, ...)
+//        Separate from 3a because "contentid IN (...) OR prevver IN (...)"
+//        spans two columns and stops Postgres using either index. Worst case
+//        here is a scan of content, which carries no large text column - cheap
+//        and bounded, unlike a scan of bodycontent.
 //
-//  spaceid and content_status appear NOWHERE in this step. Version rows may have
-//  neither, and testing them here is what previously dropped historical rows.
+//    3c  the macro test                              bodycontent only, no join
+//          SELECT contentid FROM bodycontent
+//          WHERE contentid IN (:v0, ...)          <- primary key, IS the driver
+//            AND (body LIKE :m0 ESCAPE '\' OR ...)
+//        With no join and no other access path, the planner CANNOT decide to
+//        scan the table: the IN list drives it and body is only a filter on
+//        rows already fetched. LIKE therefore runs on exactly the versions
+//        asked about and never on anything else.
+//
+//  Chunking is by VERSION id in 3c, not by page id, because one page can have
+//  forty versions - chunking by page would produce wildly uneven IN lists.
+//
+//  spaceid and content_status appear NOWHERE here. Version rows may carry
+//  neither; both are properties of the page and are tested in step 2.
 // =============================================================================
 
 class MacroVersion {
@@ -314,28 +333,11 @@ class MacroVersion {
     boolean historical
 }
 
-/**
- * Every version carrying a source macro, for the given pages.
- * Pages are processed in chunks so each IN list stays small enough for Postgres
- * to keep using the index.
- */
-List<MacroVersion> findMacroVersions(List<Long> pageIds, List<String> macroNames,
-                                     StringBuilder progress) {
+/** 3a + 3b: every version id belonging to the given pages. */
+List<MacroVersion> versionsOfPages(List<Long> pageIds, StringBuilder progress) {
     try {
         List<MacroVersion> out = new ArrayList<MacroVersion>()
-        if (pageIds.isEmpty() || macroNames.isEmpty()) return out
-
-        // the macro predicate, identical in both queries
-        Map<String, Object> macroParams = new LinkedHashMap<String, Object>()
-        List<String> macroClauses = new ArrayList<String>()
-        for (int i = 0; i < macroNames.size(); i++) {
-            // the closing quote is inside the pattern, so "artikel-status"
-            // cannot match a page using "artikel-status-ed"
-            macroParams.put('m' + i, '%ac:name="' + likeEscape(macroNames.get(i)) + '"%')
-            macroClauses.add('bc.body LIKE :m' + i + " ESCAPE '\\'")
-        }
-        String macroWhere = '(' + macroClauses.join(' OR ') + ')'
-
+        if (pageIds.isEmpty()) return out
         String resource = DB_RESOURCE
         int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
         int chunks = 0
@@ -346,51 +348,120 @@ List<MacroVersion> findMacroVersions(List<Long> pageIds, List<String> macroNames
             chunks++
 
             List<String> ph = new ArrayList<String>()
-            Map<String, Object> params = new LinkedHashMap<String, Object>(macroParams)
+            Map<String, Object> params = new LinkedHashMap<String, Object>()
             for (int i = 0; i < slice.size(); i++) {
                 ph.add(':p' + i)
                 params.put('p' + i, slice.get(i))
             }
             String inList = ph.join(', ')
 
-            // --- current versions: matched on the primary key ---------------
-            String qCurrent = 'SELECT c.contentid AS cid, c.version AS ver ' +
-                              'FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ' +
-                              'WHERE c.contentid IN (' + inList + ') AND ' + macroWhere
-
-            // --- historical versions: matched on prevver --------------------
-            // prevver holds the id of the page's CURRENT row, which is exactly
-            // the id in the chunk. No spaceid, no content_status.
-            String qHistorical = 'SELECT c.contentid AS cid, c.version AS ver, c.prevver AS pid ' +
-                                 'FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ' +
-                                 'WHERE c.prevver IN (' + inList + ') AND ' + macroWhere
+            // 3a - the page's own row is its current version
+            String qCurrent = 'SELECT contentid, version FROM content WHERE contentid IN (' + inList + ')'
+            // 3b - a historical row stores the current version's id in prevver
+            String qHistorical = 'SELECT contentid, version, prevver FROM content ' +
+                                 'WHERE prevver IN (' + inList + ')'
 
             DatabaseUtil.withSql(resource) { Sql sql ->
                 if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
-
                 sql.eachRow(qCurrent, params) { row ->
                     MacroVersion mv = new MacroVersion()
-                    mv.contentId = ((Number) row['cid']).longValue()
-                    mv.pageId = mv.contentId          // a current row IS the page
-                    mv.versionNumber = ((Number) row['ver']).intValue()
+                    mv.contentId = ((Number) row['contentid']).longValue()
+                    mv.pageId = mv.contentId
+                    mv.versionNumber = ((Number) row['version']).intValue()
                     mv.historical = false
                     out.add(mv)
                 }
-
                 if (INCLUDE_HISTORICAL) {
                     sql.eachRow(qHistorical, params) { row ->
                         MacroVersion mv = new MacroVersion()
-                        mv.contentId = ((Number) row['cid']).longValue()
-                        mv.pageId = ((Number) row['pid']).longValue()
-                        mv.versionNumber = ((Number) row['ver']).intValue()
+                        mv.contentId = ((Number) row['contentid']).longValue()
+                        mv.pageId = ((Number) row['prevver']).longValue()
+                        mv.versionNumber = ((Number) row['version']).intValue()
                         mv.historical = true
                         out.add(mv)
                     }
                 }
             }
         }
-        progress.append('  chunks executed: ').append(chunks)
-               .append(' of ').append(CHUNK_SIZE).append(' page ids each\n')
+        progress.append('  step 3a/3b: ').append(out.size()).append(' version rows to test, in ')
+                .append(chunks).append(' chunk(s) of ').append(CHUNK_SIZE).append(' page ids
+')
+        return out
+    } catch (Exception e) {
+        throw new RuntimeException('versionsOfPages failed: ' + e.getMessage(), e)
+    }
+}
+
+/**
+ * 3c: which of those version ids carry a source macro.
+ * One table, primary key driven, no join. Returns the matching contentids.
+ */
+Set<Long> versionsWithMacros(List<Long> versionIds, List<String> macroNames,
+                             StringBuilder progress) {
+    try {
+        Set<Long> hits = new LinkedHashSet<Long>()
+        if (versionIds.isEmpty() || macroNames.isEmpty()) return hits
+
+        // the macro predicate: OR short-circuits per row, so a body stops being
+        // examined at its first match. The closing quote is part of the pattern,
+        // so "artikel-status" cannot match "artikel-status-ed".
+        Map<String, Object> macroParams = new LinkedHashMap<String, Object>()
+        List<String> macroClauses = new ArrayList<String>()
+        for (int i = 0; i < macroNames.size(); i++) {
+            macroParams.put('m' + i, '%ac:name="' + likeEscape(macroNames.get(i)) + '"%')
+            macroClauses.add('body LIKE :m' + i + " ESCAPE '\'")
+        }
+        String macroWhere = '(' + macroClauses.join(' OR ') + ')'
+
+        String resource = DB_RESOURCE
+        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
+        int chunks = 0
+
+        for (int from = 0; from < versionIds.size(); from += BODY_CHUNK_SIZE) {
+            int to = Math.min(from + BODY_CHUNK_SIZE, versionIds.size())
+            List<Long> slice = versionIds.subList(from, to)
+            chunks++
+
+            List<String> ph = new ArrayList<String>()
+            Map<String, Object> params = new LinkedHashMap<String, Object>(macroParams)
+            for (int i = 0; i < slice.size(); i++) {
+                ph.add(':v' + i)
+                params.put('v' + i, slice.get(i))
+            }
+
+            String query = 'SELECT contentid FROM bodycontent ' +
+                           'WHERE contentid IN (' + ph.join(', ') + ') AND ' + macroWhere
+
+            DatabaseUtil.withSql(resource) { Sql sql ->
+                if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
+                sql.eachRow(query, params) { row ->
+                    hits.add(((Number) row['contentid']).longValue())
+                }
+            }
+        }
+        progress.append('  step 3c: ').append(hits.size()).append(' version rows carry a macro, in ')
+                .append(chunks).append(' chunk(s) of ').append(BODY_CHUNK_SIZE).append(' version ids
+')
+        return hits
+    } catch (Exception e) {
+        throw new RuntimeException('versionsWithMacros failed: ' + e.getMessage(), e)
+    }
+}
+
+/** Step 3 end to end: page ids in, macro-bearing versions out. */
+List<MacroVersion> findMacroVersions(List<Long> pageIds, List<String> macroNames,
+                                     StringBuilder progress) {
+    try {
+        List<MacroVersion> candidates = versionsOfPages(pageIds, progress)
+        List<Long> versionIds = new ArrayList<Long>()
+        for (MacroVersion mv : candidates) versionIds.add(mv.contentId)
+
+        Set<Long> hits = versionsWithMacros(versionIds, macroNames, progress)
+
+        List<MacroVersion> out = new ArrayList<MacroVersion>()
+        for (MacroVersion mv : candidates) {
+            if (hits.contains(mv.contentId)) out.add(mv)
+        }
         return out
     } catch (Exception e) {
         throw new RuntimeException('findMacroVersions failed: ' + e.getMessage(), e)
