@@ -89,10 +89,20 @@ enum ReplacementStatus {
 @Field String MODE = 'INSPECT'                 // SCOPE | INSPECT | APPLY
 
 /*
- * Process only a slice of the pages in scope, ordered by page id so slices stay
- * stable between runs. For a space too large to INSPECT in one request: run
- * 0/500, then 500/500, then 1000/500 - each run prints the next offset.
- * SCOPE_LIMIT = 0 means no limit.
+ * Process only a slice, ordered by page id so slices stay stable between runs.
+ * Run 0/500, then 500/500, then 1000/500 - each run prints the next offset.
+ * SCOPE_LIMIT = 0 means no limit. What is sliced depends on the mode:
+ *
+ *   SCOPE          slices CANDIDATE pages - every page in the configured
+ *                  spaces - inside the discovery SQL itself, bounding the work
+ *                  of a single run. For a space where even discovery exceeds
+ *                  SQL_TIMEOUT_SECONDS, this is the way through: each slice
+ *                  probes only its own pages' bodies. A slice may return few
+ *                  or zero affected pages; that is not truncation.
+ *   INSPECT/APPLY  slices AFFECTED pages, after full discovery. Discovery
+ *                  runs whole every time; only version loading is sliced.
+ *                  If discovery itself is the problem, run SCOPE (sliced) and
+ *                  feed the ids into PAGE_IDS_OVERRIDE, which skips discovery.
  */
 /*
  * Abort any discovery query after this many seconds instead of letting it run
@@ -104,6 +114,18 @@ enum ReplacementStatus {
 
 @Field int SCOPE_OFFSET = 0
 @Field int SCOPE_LIMIT = 0
+
+/*
+ * Body-match strategy for discovery.
+ *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
+ *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
+ * Which is faster on THIS instance is NOT confirmed - the earlier benchmark
+ * results are untrusted. Both are exact (same matches, ESCAPE respectively
+ * regexEscape applied), so two SCOPE runs over the same space, one per
+ * setting, settle it empirically: affected-page counts must be identical and
+ * the reported timing decides.
+ */
+@Field boolean USE_REGEX_MATCH = false
 
 // Migration ids to run. Empty = all of them.
 @Field List<String> RUN = []
@@ -502,6 +524,18 @@ String htmlEsc(Object v) {
 String likeEscape(String v) {
     if (v == null) return ''
     return v.replace('\\', '\\\\').replace('%', '\\%').replace('_', '\\_')
+}
+
+/** Escapes POSIX regex metacharacters in a literal, for USE_REGEX_MATCH. */
+String regexEscape(String v) {
+    if (v == null) return ''
+    StringBuilder b = new StringBuilder()
+    for (int i = 0; i < v.length(); i++) {
+        char c = v.charAt(i)
+        if ('.^$*+?()[]{}|\\-'.indexOf(c as int) >= 0) b.append('\\')
+        b.append(c)
+    }
+    return b.toString()
 }
 
 /** "1 problem" / "2 problems" - avoids the "(s)" that reads as unfinished. */
@@ -1142,9 +1176,118 @@ List<Integer> spaceIdsFor(List<String> spaceKeys) {
  * Current page ids that have at least one version carrying a source macro.
  * Two columns out of content; the page id is derived in Groovy.
  */
+/**
+ * Body-match predicate over one bodycontent alias. Fills params and returns
+ * the SQL fragment. The clause is used twice per query (current-body probe and
+ * history probe), so parameter names carry a tag to stay distinct.
+ */
+String macroMatchClause(Set<String> sourceNames, String alias, String tag, Map<String, Object> params) {
+    if (USE_REGEX_MATCH) {
+        List<String> alts = new ArrayList<String>()
+        for (String name : sourceNames) alts.add(regexEscape(name))
+        params.put('re' + tag, 'ac:name="(' + alts.join('|') + ')"')
+        return alias + '.body ~ :re' + tag
+    }
+    List<String> clauses = new ArrayList<String>()
+    int n = 0
+    for (String name : sourceNames) {
+        params.put('m' + tag + n, '%ac:name="' + likeEscape(name) + '"%')
+        clauses.add(alias + '.body LIKE :m' + tag + n + " ESCAPE '\\'")
+        n++
+    }
+    return clauses.join(' OR ')
+}
+
+/**
+ * Candidate pages: CURRENT rows (prevver IS NULL) in the configured scope.
+ * The space and status filters live here and ONLY here - historical rows may
+ * carry NULL spaceid and never carry content_status = 'current', so filtering
+ * them by their own columns silently drops history. History is reached per
+ * candidate through prevver = <current id> instead: filtered by ownership.
+ * Ordered by contentid when sliced, so a slice means the same pages every run.
+ */
+String candidatePageSql(List<Integer> spaceIds, Map<String, Object> params,
+                        int candidateOffset, int candidateLimit) {
+    StringBuilder q = new StringBuilder()
+    q.append('SELECT cur.contentid AS pid FROM content cur ')
+     .append("WHERE cur.contenttype IN ('PAGE','BLOGPOST') AND cur.prevver IS NULL ")
+    if (!spaceIds.isEmpty()) {
+        List<String> ph = new ArrayList<String>()
+        for (int i = 0; i < spaceIds.size(); i++) {
+            ph.add(':sid' + i)
+            params.put('sid' + i, spaceIds.get(i))
+        }
+        q.append('AND cur.spaceid IN (').append(ph.join(', ')).append(') ')
+    }
+    if (!INCLUDE_STATUSES.isEmpty()) {
+        List<String> ph = new ArrayList<String>()
+        for (int i = 0; i < INCLUDE_STATUSES.size(); i++) {
+            ph.add(':st' + i)
+            params.put('st' + i, INCLUDE_STATUSES.get(i))
+        }
+        q.append('AND cur.content_status IN (').append(ph.join(', ')).append(') ')
+    }
+    if (candidateOffset > 0 || candidateLimit > 0) {
+        q.append('ORDER BY cur.contentid ')
+        if (candidateLimit > 0) q.append('LIMIT ').append(candidateLimit).append(' ')
+        if (candidateOffset > 0) q.append('OFFSET ').append(candidateOffset).append(' ')
+    }
+    return q.toString()
+}
+
+/**
+ * How many candidate pages the scope holds BEFORE the body probe - the number
+ * SCOPE-mode slices are measured against. Cheap: content rows only, no bodies.
+ */
+int candidatePageCount() {
+    try {
+        List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
+                ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
+        List<Integer> spaceIds = spaceIdsFor(spaceKeys)
+        if (!spaceKeys.isEmpty() && spaceIds.isEmpty()) return 0
+        Map<String, Object> params = new LinkedHashMap<String, Object>()
+        String inner = candidatePageSql(spaceIds, params, 0, 0)
+        int count = 0
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            sql.eachRow('SELECT COUNT(*) AS n FROM (' + inner + ') t', params) { row ->
+                count = ((Number) row['n']).intValue()
+            }
+        }
+        return count
+    } catch (Exception e) {
+        throw new RuntimeException('candidatePageCount failed: ' + e.getMessage(), e)
+    }
+}
+
+/** Full scope, no candidate slicing - what Stage-1 uses. */
 List<Long> resolveScope(Set<String> sourceNames) {
+    return resolveScope(sourceNames, 0, 0)
+}
+
+/**
+ * Current page ids having at least one version that carries a source macro.
+ *
+ * Shape: drive from the candidate pages (see candidatePageSql) and per page
+ * probe bodies with correlated EXISTS - the SQL form of "stop at the first
+ * matching version". The current body is probed first as its own EXISTS: one
+ * indexed bodycontent lookup decides every page whose live version still
+ * carries a macro, which is the common case. Only pages that fail that probe
+ * fall through to the history probe, and pages with no macros anywhere are the
+ * only ones whose every version must be read.
+ *
+ * This replaces a flat content-JOIN-bodycontent scan that (a) read every
+ * version body in the space before any page could be excluded and (b) filtered
+ * ALL rows by spaceid, silently dropping the NULL-spaceid historical rows this
+ * instance is known to have - a page whose macros survive only in such history
+ * was invisible to discovery, in every mode.
+ *
+ * candidateOffset/candidateLimit bound one run's work on spaces too large to
+ * probe within SQL_TIMEOUT_SECONDS. 0/0 = whole scope.
+ */
+List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candidateLimit) {
     try {
         if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
+        if (sourceNames.isEmpty()) return new ArrayList<Long>()
 
         List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
                 ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
@@ -1152,54 +1295,33 @@ List<Long> resolveScope(Set<String> sourceNames) {
         if (!spaceKeys.isEmpty() && spaceIds.isEmpty()) return new ArrayList<Long>()
 
         Map<String, Object> params = new LinkedHashMap<String, Object>()
-        List<String> nameClauses = new ArrayList<String>()
-        int n = 0
-        for (String name : sourceNames) {
-            params.put('mp' + n, '%ac:name="' + likeEscape(name) + '"%')
-            nameClauses.add('bc.body LIKE :mp' + n + " ESCAPE '\\'")
-            n++
-        }
-        if (nameClauses.isEmpty()) return new ArrayList<Long>()
+        String candidates = candidatePageSql(spaceIds, params, candidateOffset, candidateLimit)
+        String curMatch = macroMatchClause(sourceNames, 'bcc', 'c', params)
 
         StringBuilder q = new StringBuilder()
-        q.append('SELECT c.contentid AS cid, c.prevver AS prevver ')
-         .append('FROM content c JOIN bodycontent bc ON bc.contentid = c.contentid ')
-         .append("WHERE c.contenttype IN ('PAGE','BLOGPOST') ")
-        if (!spaceIds.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < spaceIds.size(); i++) {
-                ph.add(':sid' + i)
-                params.put('sid' + i, spaceIds.get(i))
-            }
-            q.append('AND c.spaceid IN (').append(ph.join(', ')).append(') ')
+        q.append('SELECT c2.pid FROM (').append(candidates).append(') c2 ')
+         .append('WHERE (EXISTS (SELECT 1 FROM bodycontent bcc ')
+         .append('WHERE bcc.contentid = c2.pid AND (').append(curMatch).append('))')
+        if (UPDATE_HISTORICAL_VERSIONS) {
+            String histMatch = macroMatchClause(sourceNames, 'bch', 'h', params)
+            q.append(' OR EXISTS (SELECT 1 FROM content v ')
+             .append('JOIN bodycontent bch ON bch.contentid = v.contentid ')
+             .append('WHERE v.prevver = c2.pid AND (').append(histMatch).append('))')
         }
-        // status applies to live rows only - historical rows do not carry
-        // content_status = 'current', so testing them by it drops all history
-        if (!INCLUDE_STATUSES.isEmpty()) {
-            List<String> ph = new ArrayList<String>()
-            for (int i = 0; i < INCLUDE_STATUSES.size(); i++) {
-                ph.add(':st' + i)
-                params.put('st' + i, INCLUDE_STATUSES.get(i))
-            }
-            q.append('AND (c.prevver IS NOT NULL OR c.content_status IN (')
-             .append(ph.join(', ')).append(')) ')
-        }
-        if (!UPDATE_HISTORICAL_VERSIONS) q.append('AND c.prevver IS NULL ')
-        q.append('AND (').append(nameClauses.join(' OR ')).append(')')
+        q.append(') ORDER BY c2.pid')
 
         String query = q.toString()
         String resource = DB_RESOURCE
         int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
 
-        Set<Long> ids = new LinkedHashSet<Long>()
+        List<Long> ids = new ArrayList<Long>()
         DatabaseUtil.withSql(resource) { Sql sql ->
             if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
             sql.eachRow(query, params) { row ->
-                Object prev = row['prevver']
-                ids.add(prev == null ? ((Number) row['cid']).longValue() : ((Number) prev).longValue())
+                ids.add(((Number) row['pid']).longValue())
             }
         }
-        return new ArrayList<Long>(ids)
+        return ids
     } catch (Exception e) {
         throw new RuntimeException('resolveScope failed: ' + e.getMessage(), e)
     }
@@ -1208,18 +1330,22 @@ List<Long> resolveScope(Set<String> sourceNames) {
 /**
  * SCOPE mode: the affected pages, from the database alone.
  *
- * No Page objects are loaded and no version bodies are scanned - the inner
- * query finds every macro-bearing version row and maps it to its current page
- * through prevver, the outer one fetches that page's title and space. That is
- * why it returns in seconds where INSPECT takes minutes: INSPECT's cost is
- * loading and parsing every version of every affected page, not the discovery.
+ * No Page objects are loaded - discovery decides per page from body probes
+ * that stop at the first matching version (see resolveScope), then only title
+ * and space are fetched for display. Its cost is proportional to the bodies
+ * that must be read before each page is decided, NOT to what INSPECT does
+ * afterwards: INSPECT additionally loads and parses every version of every
+ * affected page through the API.
+ *
+ * candidateOffset/candidateLimit slice the candidate pages inside discovery -
+ * the escape hatch for spaces where even discovery exceeds the SQL timeout.
  *
  * Rows: [spaceKey, pageId, title]
  */
-List<List<String>> scopeReport(Set<String> sourceNames) {
+List<List<String>> scopeReport(Set<String> sourceNames, int candidateOffset, int candidateLimit) {
     try {
         // reuse discovery, then fetch only the three columns needed for display
-        List<Long> pageIds = resolveScope(sourceNames)
+        List<Long> pageIds = resolveScope(sourceNames, candidateOffset, candidateLimit)
         List<List<String>> out = new ArrayList<List<String>>()
         if (pageIds.isEmpty()) return out
 
@@ -2069,15 +2195,25 @@ try {
         Set<String> names = new LinkedHashSet<String>()
         for (MigrationDef md : migrations) names.add(md.sourceName)
         long t0 = System.currentTimeMillis()
-        List<List<String>> scopeRows = scopeReport(names)
-        outp.append('SCOPE  (discovery only - no page loads, no version scanning)\n')
+        boolean sliced = (SCOPE_OFFSET > 0 || SCOPE_LIMIT > 0)
+        int candidates = sliced ? candidatePageCount() : 0
+        List<List<String>> scopeRows = scopeReport(names, SCOPE_OFFSET, SCOPE_LIMIT)
+        outp.append('SCOPE  (discovery only - no page loads; per page, body probing stops\n')
+        outp.append('        at the first version carrying any source macro)\n')
         outp.append('----------------------------------------------------------------\n')
-        if (SCOPE_OFFSET > 0 || SCOPE_LIMIT > 0) {
-            // slicing exists for the version-scanning stages, which SCOPE never
-            // reaches - saying so avoids a truncated-looking list being trusted
-            outp.append('  NOTE: SCOPE_OFFSET/SCOPE_LIMIT do not apply in SCOPE mode.\n')
-                .append('        This list is COMPLETE for the configured scope; slicing only\n')
-                .append('        affects INSPECT and APPLY, where every version is loaded.\n')
+        if (sliced) {
+            int from = Math.min(SCOPE_OFFSET, candidates)
+            int to = (SCOPE_LIMIT > 0) ? Math.min(from + SCOPE_LIMIT, candidates) : candidates
+            outp.append('  candidate pages in scope: ').append(candidates)
+                .append('   probed slice [').append(from).append(', ').append(to).append(')\n')
+            if (to < candidates) {
+                outp.append('  NEXT RUN: set SCOPE_OFFSET = ').append(to)
+                    .append('   (').append(candidates - to).append(' candidates still to probe)\n')
+            } else {
+                outp.append('  this is the LAST slice\n')
+            }
+            outp.append('  NOTE: slices count CANDIDATE pages (every page in scope), not\n')
+                .append('        affected ones - a slice returning few or none is not truncation.\n')
         }
         outp.append('  affected pages: ').append(scopeRows.size())
             .append('   in ').append(humanTime(System.currentTimeMillis() - t0)).append('\n')
