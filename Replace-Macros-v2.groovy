@@ -1278,6 +1278,33 @@ int candidatePageCount() {
     }
 }
 
+/** Candidate page ids for a window - ids only, no bodies touched. Cheap. */
+List<Long> fetchCandidateIds(List<Integer> spaceIds, int candidateOffset, int candidateLimit) {
+    Map<String, Object> params = new LinkedHashMap<String, Object>()
+    String q = candidatePageSql(spaceIds, params, candidateOffset, candidateLimit)
+    List<Long> ids = new ArrayList<Long>()
+    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+        if (SQL_TIMEOUT_SECONDS > 0) sql.execute('SET statement_timeout = ' + (SQL_TIMEOUT_SECONDS * 1000))
+        sql.eachRow(q, params) { row -> ids.add(((Number) row['pid']).longValue()) }
+    }
+    return ids
+}
+
+/**
+ * Ids as a SQL literal list. Safe by construction: every value is a long that
+ * came out of our own candidate query - there is nothing to inject. Literals
+ * are used instead of bind parameters because a chunk carries hundreds of ids
+ * and, more importantly, explicit values let the planner see exact cardinality.
+ */
+String joinIds(List<Long> ids) {
+    StringBuilder b = new StringBuilder()
+    for (int i = 0; i < ids.size(); i++) {
+        if (i > 0) b.append(',')
+        b.append(ids.get(i).longValue())
+    }
+    return b.toString()
+}
+
 /** Full scope, no candidate slicing - what Stage-1 uses. */
 List<Long> resolveScope(Set<String> sourceNames) {
     return resolveScope(sourceNames, 0, 0)
@@ -1286,22 +1313,38 @@ List<Long> resolveScope(Set<String> sourceNames) {
 /**
  * Current page ids having at least one version that carries a source macro.
  *
- * Shape: drive from the candidate pages (see candidatePageSql) and per page
- * probe bodies with correlated EXISTS - the SQL form of "stop at the first
- * matching version". The current body is probed first as its own EXISTS: one
- * indexed bodycontent lookup decides every page whose live version still
- * carries a macro, which is the common case. Only pages that fail that probe
- * fall through to the history probe, and pages with no macros anywhere are the
- * only ones whose every version must be read.
+ * TWO-PHASE, deliberately plain SQL with NO subqueries:
  *
- * This replaces a flat content-JOIN-bodycontent scan that (a) read every
- * version body in the space before any page could be excluded and (b) filtered
- * ALL rows by spaceid, silently dropping the NULL-spaceid historical rows this
- * instance is known to have - a page whose macros survive only in such history
- * was invisible to discovery, in every mode.
+ *   phase 0  fetch the candidate page ids for the window (ids only)
+ *   phase 1  probe each candidate's CURRENT body:
+ *              SELECT contentid FROM bodycontent WHERE contentid IN (ids)
+ *              AND (macro match) - one indexed body read per page; decides
+ *            every page whose live version still carries a macro
+ *   phase 2  only for candidates phase 1 did not hit, and only when
+ *            UPDATE_HISTORICAL_VERSIONS: scan their history through the
+ *            prevver index:
+ *              SELECT DISTINCT prevver FROM content JOIN bodycontent
+ *              WHERE prevver IN (ids) AND (macro match)
  *
- * candidateOffset/candidateLimit bound one run's work on spaces too large to
- * probe within SQL_TIMEOUT_SECONDS. 0/0 = whole scope.
+ * WHY not one query with EXISTS: Postgres may rewrite an EXISTS subplan into a
+ * "hashed SubPlan" - precompute the subquery UNCORRELATED, i.e. scan the body
+ * of EVERY version on the ENTIRE INSTANCE, then hash. Observed on OKR: chunks
+ * of 500 candidates flipped the history probe into a parallel seq scan over
+ * all of bodycontent and burned the full statement timeout, while the same
+ * query on small spaces (and small LIMITs) planned as cheap per-row index
+ * probes. Cost-based flips are input-dependent and cannot be ruled out by
+ * testing; queries above have no subqueries at all, so there is nothing for
+ * the planner to flip - each is a plain indexed semi-scan over an explicit id
+ * list, and its plan is the same at every scale.
+ *
+ * Early exit note: phase 1 is exactly one body per page. Phase 2 reads all
+ * matching history rows of the pages it probes instead of stopping at the
+ * first - those are pages whose current version is clean, and for the (many)
+ * fully clean ones every version must be read anyway to prove absence, so the
+ * difference is a few extra rows on the (few) history-only-affected pages.
+ *
+ * candidateOffset/candidateLimit bound the window as before. Ids are embedded
+ * in chunks of ID_LIST_MAX per statement.
  */
 List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candidateLimit) {
     try {
@@ -1313,33 +1356,43 @@ List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candid
         List<Integer> spaceIds = spaceIdsFor(spaceKeys)
         if (!spaceKeys.isEmpty() && spaceIds.isEmpty()) return new ArrayList<Long>()
 
-        Map<String, Object> params = new LinkedHashMap<String, Object>()
-        String candidates = candidatePageSql(spaceIds, params, candidateOffset, candidateLimit)
-        String curMatch = macroMatchClause(sourceNames, 'bcc', 'c', params)
+        List<Long> cand = fetchCandidateIds(spaceIds, candidateOffset, candidateLimit)
+        if (cand.isEmpty()) return new ArrayList<Long>()
 
-        StringBuilder q = new StringBuilder()
-        q.append('SELECT c2.pid FROM (').append(candidates).append(') c2 ')
-         .append('WHERE (EXISTS (SELECT 1 FROM bodycontent bcc ')
-         .append('WHERE bcc.contentid = c2.pid AND (').append(curMatch).append('))')
-        if (UPDATE_HISTORICAL_VERSIONS) {
-            String histMatch = macroMatchClause(sourceNames, 'bch', 'h', params)
-            q.append(' OR EXISTS (SELECT 1 FROM content v ')
-             .append('JOIN bodycontent bch ON bch.contentid = v.contentid ')
-             .append('WHERE v.prevver = c2.pid AND (').append(histMatch).append('))')
-        }
-        q.append(') ORDER BY c2.pid')
+        final int ID_LIST_MAX = 1000
+        Set<Long> hits = new LinkedHashSet<Long>()
 
-        String query = q.toString()
-        String resource = DB_RESOURCE
-        int timeoutMs = SQL_TIMEOUT_SECONDS * 1000
+        DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+            if (SQL_TIMEOUT_SECONDS > 0) sql.execute('SET statement_timeout = ' + (SQL_TIMEOUT_SECONDS * 1000))
 
-        List<Long> ids = new ArrayList<Long>()
-        DatabaseUtil.withSql(resource) { Sql sql ->
-            if (timeoutMs > 0) sql.execute('SET statement_timeout = ' + timeoutMs)
-            sql.eachRow(query, params) { row ->
-                ids.add(((Number) row['pid']).longValue())
+            // ---- phase 1: current bodies, one indexed probe per page --------
+            for (int i = 0; i < cand.size(); i += ID_LIST_MAX) {
+                List<Long> part = cand.subList(i, Math.min(i + ID_LIST_MAX, cand.size()))
+                Map<String, Object> p = new LinkedHashMap<String, Object>()
+                String q = 'SELECT bcc.contentid AS pid FROM bodycontent bcc ' +
+                           'WHERE bcc.contentid IN (' + joinIds(part) + ') ' +
+                           'AND (' + macroMatchClause(sourceNames, 'bcc', 'c', p) + ')'
+                sql.eachRow(q, p) { row -> hits.add(((Number) row['pid']).longValue()) }
+            }
+
+            // ---- phase 2: history of the pages phase 1 did not decide -------
+            if (UPDATE_HISTORICAL_VERSIONS) {
+                List<Long> rest = new ArrayList<Long>()
+                for (Long id : cand) if (!hits.contains(id)) rest.add(id)
+                for (int i = 0; i < rest.size(); i += ID_LIST_MAX) {
+                    List<Long> part = rest.subList(i, Math.min(i + ID_LIST_MAX, rest.size()))
+                    Map<String, Object> p = new LinkedHashMap<String, Object>()
+                    String q = 'SELECT DISTINCT v.prevver AS pid FROM content v ' +
+                               'JOIN bodycontent bch ON bch.contentid = v.contentid ' +
+                               'WHERE v.prevver IN (' + joinIds(part) + ') ' +
+                               'AND (' + macroMatchClause(sourceNames, 'bch', 'h', p) + ')'
+                    sql.eachRow(q, p) { row -> hits.add(((Number) row['pid']).longValue()) }
+                }
             }
         }
+
+        List<Long> ids = new ArrayList<Long>(hits)
+        Collections.sort(ids)
         return ids
     } catch (Exception e) {
         throw new RuntimeException('resolveScope failed: ' + e.getMessage(), e)
