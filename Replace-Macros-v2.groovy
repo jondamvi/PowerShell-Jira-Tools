@@ -2228,7 +2228,7 @@ try {
         int candidates = candidatePageCount()
         int windowFrom = Math.min(SCOPE_OFFSET, candidates)
         int windowTo = (SCOPE_LIMIT > 0) ? Math.min(windowFrom + SCOPE_LIMIT, candidates) : candidates
-        int chunk = (SCOPE_CHUNK_PAGES > 0) ? SCOPE_CHUNK_PAGES : (windowTo - windowFrom)
+        int chunk = (SCOPE_CHUNK_PAGES > 0) ? SCOPE_CHUNK_PAGES : Math.max(1, windowTo - windowFrom)
         long budgetMs = SCOPE_TIME_BUDGET_SECONDS * 1000L
 
         List<List<String>> scopeRows = new ArrayList<List<String>>()
@@ -2248,39 +2248,45 @@ try {
             try {
                 List<List<String>> rows = scopeReport(names, off, take)
                 scopeRows.addAll(rows)
-                chunkLog.append('  chunk [').append(off).append(', ').append(off + take)
-                        .append(')   affected: ').append(String.format('%5d', rows.size()))
+                chunkLog.append('  chunk ').append(off).append('..').append(off + take - 1)
+                        .append('   affected: ').append(String.format('%5d', rows.size()))
                         .append('   ').append(humanTime(System.currentTimeMillis() - ct0)).append('\n')
                 off += take
             } catch (Exception e) {
                 failure = e.getMessage()
                 resumeAt = off
-                chunkLog.append('  chunk [').append(off).append(', ').append(off + take)
-                        .append(')   FAILED after ').append(humanTime(System.currentTimeMillis() - ct0)).append('\n')
+                chunkLog.append('  chunk ').append(off).append('..').append(off + take - 1)
+                        .append('   FAILED after ').append(humanTime(System.currentTimeMillis() - ct0)).append('\n')
                 break
             }
         }
+        int doneTo = (resumeAt >= 0) ? resumeAt : windowTo   // offsets < doneTo are fully probed
 
         outp.append('SCOPE  (discovery only - no page loads; per page, body probing stops\n')
         outp.append('        at the first version carrying any source macro)\n')
         outp.append('----------------------------------------------------------------\n')
         outp.append('  candidate pages in scope: ').append(candidates)
-            .append('   window [').append(windowFrom).append(', ').append(windowTo)
-            .append(')   chunk size: ').append(chunk).append('\n')
+            .append('   window: offsets ').append(windowFrom).append('..').append(Math.max(windowFrom, windowTo - 1))
+            .append(' (').append(plural(windowTo - windowFrom, 'page')).append(')')
+            .append('   chunk size: ').append(chunk).append('\n')
         outp.append(chunkLog)
         outp.append('  affected pages collected: ').append(scopeRows.size())
             .append('   in ').append(humanTime(System.currentTimeMillis() - t0)).append('\n')
 
         if (failure != null) {
             outp.append('\n  CHUNK FAILED: ').append(failure).append('\n')
-                .append('  Results below are COMPLETE for [').append(windowFrom)
-                .append(', ').append(resumeAt).append(') and the failed chunk was not probed.\n')
-                .append('  RESUME: set SCOPE_OFFSET = ').append(resumeAt)
+            if (doneTo > windowFrom) {
+                outp.append('  Results are COMPLETE for offsets ').append(windowFrom)
+                    .append('..').append(doneTo - 1).append('; the failed chunk was not probed.\n')
+            } else {
+                outp.append('  No chunk completed - nothing was collected.\n')
+            }
+            outp.append('  RESUME: set SCOPE_OFFSET = ').append(resumeAt)
                 .append('. If the failure is a statement timeout, also lower SCOPE_CHUNK_PAGES.\n')
         } else if (resumeAt >= 0) {
             outp.append('\n  TIME BUDGET REACHED - stopped cleanly before the request could be killed.\n')
-                .append('  Results below are COMPLETE for [').append(windowFrom)
-                .append(', ').append(resumeAt).append(').\n')
+                .append('  Results are COMPLETE for offsets ').append(windowFrom)
+                .append('..').append(doneTo - 1).append('.\n')
                 .append('  RESUME: set SCOPE_OFFSET = ').append(resumeAt)
                 .append('   (').append(candidates - resumeAt).append(' candidates remaining)\n')
         } else if (windowTo < candidates) {
@@ -2303,9 +2309,21 @@ try {
         }
 
         // RESULT_FORMAT applies in every mode - SCOPE used to force CSV
+        // Assembly order: run log FIRST (mode, migrations, validation, chunk log),
+        // THEN the results block - the results describe what the log explains.
         List<String> scopeHeaders = ['Space Key', 'Page ID', 'Page URL', 'Title']
         StringBuilder page = new StringBuilder()
-        page.append('<h3>Affected pages (').append(plural(scopeRows.size(), 'page')).append(')</h3>')
+        page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
+
+        boolean partial = (doneTo < candidates)
+        page.append('<h3>Affected pages (').append(plural(scopeRows.size(), 'page')).append(') - ')
+        if (doneTo > windowFrom) {
+            page.append('candidate offsets ').append(windowFrom).append('..').append(doneTo - 1)
+        } else {
+            page.append('no offsets completed')
+        }
+        page.append(partial ? ' - PARTIAL, resume at SCOPE_OFFSET = ' + Math.max(doneTo, windowFrom) : ' - scope complete')
+        page.append('</h3>')
 
         if (RESULT_FORMAT == 'TABLE') {
             page.append('<div style="max-height:').append(RESULT_TABLE_MAX_HEIGHT_PX)
@@ -2345,7 +2363,8 @@ try {
                 .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
                 .append(htmlEsc(csv.toString())).append('</textarea>')
         }
-        page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
+        page.append('<p style="font-size:85%;color:#666">Legend: one row per affected page; ')
+            .append('a page is affected when any of its versions carries any source macro.</p>')
         log.warn("Macro engine v2 SCOPE: ${scopeRows.size()} affected page(s)")
         return page.toString()
     }
@@ -2365,7 +2384,7 @@ try {
         int to = (SCOPE_LIMIT > 0) ? Math.min(from + SCOPE_LIMIT, totalInScope) : totalInScope
         scope = new ArrayList<Long>(scope.subList(from, to))
         outp.append('  pages in scope: ').append(totalInScope)
-            .append('   processing slice [').append(from).append(', ').append(to).append(')  = ')
+            .append('   processing slice: offsets ').append(from).append('..').append(Math.max(from, to - 1)).append('  = ')
             .append(plural(scope.size(), 'page')).append('\n')
         if (to < totalInScope) {
             outp.append('  NEXT RUN: set SCOPE_OFFSET = ').append(to)
