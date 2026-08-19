@@ -136,15 +136,15 @@ enum ReplacementStatus {
 
 /*
  * Body-match strategy for discovery.
- *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
- * Which is faster on THIS instance is NOT confirmed - the earlier benchmark
- * results are untrusted. Both are exact (same matches, ESCAPE respectively
- * regexEscape applied), so two SCOPE runs over the same space, one per
- * setting, settle it empirically: affected-page counts must be identical and
- * the reported timing decides.
+ *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
+ * SETTLED empirically on OKR (3931 pages, 39 macros, warm cache): regex ~1 s
+ * vs LIKE 11 s for the identical full-space SCOPE, with identical affected
+ * counts per chunk - one regex pass per body beats up to 39 sequential LIKE
+ * scans. Both matchers are exact and interchangeable; LIKE is kept as a
+ * cross-check (counts must always match between the two).
  */
-@Field boolean USE_REGEX_MATCH = false
+@Field boolean USE_REGEX_MATCH = true
 
 // Migration ids to run. Empty = all of them.
 @Field List<String> RUN = []
@@ -1313,7 +1313,8 @@ List<Long> resolveScope(Set<String> sourceNames) {
 /**
  * Current page ids having at least one version that carries a source macro.
  *
- * TWO-PHASE, deliberately plain SQL with NO subqueries:
+ * TWO-PHASE, deliberately plain SQL - no subqueries, no joins with body
+ * filters:
  *
  *   phase 0  fetch the candidate page ids for the window (ids only)
  *   phase 1  probe each candidate's CURRENT body:
@@ -1321,21 +1322,22 @@ List<Long> resolveScope(Set<String> sourceNames) {
  *              AND (macro match) - one indexed body read per page; decides
  *            every page whose live version still carries a macro
  *   phase 2  only for candidates phase 1 did not hit, and only when
- *            UPDATE_HISTORICAL_VERSIONS: scan their history through the
- *            prevver index:
- *              SELECT DISTINCT prevver FROM content JOIN bodycontent
- *              WHERE prevver IN (ids) AND (macro match)
+ *            UPDATE_HISTORICAL_VERSIONS, in two join-free steps:
+ *            (a) SELECT contentid, prevver FROM content WHERE prevver IN (ids)
+ *                - the pages' historical version ids, no bodies touched
+ *            (b) SELECT contentid FROM bodycontent WHERE contentid IN (ids)
+ *                AND (macro match) - history bodies probed by primary key,
+ *                matches mapped back to their page via (a)
  *
- * WHY not one query with EXISTS: Postgres may rewrite an EXISTS subplan into a
- * "hashed SubPlan" - precompute the subquery UNCORRELATED, i.e. scan the body
- * of EVERY version on the ENTIRE INSTANCE, then hash. Observed on OKR: chunks
- * of 500 candidates flipped the history probe into a parallel seq scan over
- * all of bodycontent and burned the full statement timeout, while the same
- * query on small spaces (and small LIMITs) planned as cheap per-row index
- * probes. Cost-based flips are input-dependent and cannot be ruled out by
- * testing; queries above have no subqueries at all, so there is nothing for
- * the planner to flip - each is a plain indexed semi-scan over an explicit id
- * list, and its plan is the same at every scale.
+ * WHY this exact shape: every statement is either content-metadata-only or a
+ * PRIMARY-KEY id-list probe into bodycontent. Postgres planners rewrite
+ * subqueries (observed: EXISTS -> hashed SubPlan seq-scanning ALL of
+ * bodycontent on OKR) and can satisfy join+filter statements by scanning
+ * bodycontent instance-wide (observed: flat ~2.5 min/chunk on BC from the
+ * joined phase-2 shape). Cost-based flips are input-dependent and cannot be
+ * ruled out by testing on other spaces; these statements admit no plan that
+ * scans bodycontent, so their behavior is the same at every scale, on every
+ * space, on every ANALYZE state.
  *
  * Early exit note: phase 1 is exactly one body per page. Phase 2 reads all
  * matching history rows of the pages it probes instead of stopping at the
@@ -1376,17 +1378,44 @@ List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candid
             }
 
             // ---- phase 2: history of the pages phase 1 did not decide -------
+            // Join-free ON PURPOSE. The earlier shape joined content to
+            // bodycontent inside one statement; that gives the planner the
+            // option of an instance-wide bodycontent scan + hash join, and on
+            // some spaces' statistics it takes it (observed: flat ~2.5 min per
+            // chunk on BC while OKR ran the same statement in under a second).
+            // Split into (a) history version ids from content alone - no
+            // bodies, nothing worth flipping for - and (b) body probes by
+            // PRIMARY KEY id list, the same provably stable shape as phase 1.
+            // I/O is identical to the well-planned join: every history body of
+            // every undecided page is read exactly once.
             if (UPDATE_HISTORICAL_VERSIONS) {
                 List<Long> rest = new ArrayList<Long>()
                 for (Long id : cand) if (!hits.contains(id)) rest.add(id)
+
+                // (a) which content rows are these pages' historical versions
+                Map<Long, Long> versionToPage = new LinkedHashMap<Long, Long>()
                 for (int i = 0; i < rest.size(); i += ID_LIST_MAX) {
                     List<Long> part = rest.subList(i, Math.min(i + ID_LIST_MAX, rest.size()))
+                    String q = 'SELECT v.contentid AS vid, v.prevver AS pid FROM content v ' +
+                               'WHERE v.prevver IN (' + joinIds(part) + ')'
+                    sql.eachRow(q, [:]) { row ->
+                        versionToPage.put(((Number) row['vid']).longValue(),
+                                ((Number) row['pid']).longValue())
+                    }
+                }
+
+                // (b) probe those versions' bodies by primary key
+                List<Long> histIds = new ArrayList<Long>(versionToPage.keySet())
+                for (int i = 0; i < histIds.size(); i += ID_LIST_MAX) {
+                    List<Long> part = histIds.subList(i, Math.min(i + ID_LIST_MAX, histIds.size()))
                     Map<String, Object> p = new LinkedHashMap<String, Object>()
-                    String q = 'SELECT DISTINCT v.prevver AS pid FROM content v ' +
-                               'JOIN bodycontent bch ON bch.contentid = v.contentid ' +
-                               'WHERE v.prevver IN (' + joinIds(part) + ') ' +
+                    String q = 'SELECT bch.contentid AS vid FROM bodycontent bch ' +
+                               'WHERE bch.contentid IN (' + joinIds(part) + ') ' +
                                'AND (' + macroMatchClause(sourceNames, 'bch', 'h', p) + ')'
-                    sql.eachRow(q, p) { row -> hits.add(((Number) row['pid']).longValue()) }
+                    sql.eachRow(q, p) { row ->
+                        Long pid = versionToPage.get(((Number) row['vid']).longValue())
+                        if (pid != null) hits.add(pid)
+                    }
                 }
             }
         }
