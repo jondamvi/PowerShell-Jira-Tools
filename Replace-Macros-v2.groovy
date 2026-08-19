@@ -116,6 +116,25 @@ enum ReplacementStatus {
 @Field int SCOPE_LIMIT = 0
 
 /*
+ * SCOPE mode processes its window in chunks of this many candidate pages, each
+ * chunk one bounded SQL statement. A statement timeout kills one chunk, not
+ * the run; everything already collected is printed together with the offset to
+ * resume from. 0 = single statement for the whole window (NOT recommended for
+ * big spaces: the query sorts before returning, so a timeout yields nothing).
+ */
+@Field int SCOPE_CHUNK_PAGES = 500
+
+/*
+ * Wall-clock budget for a SCOPE run, seconds. When the next chunk would start
+ * past this budget, the run stops CLEANLY: collected results and a resume
+ * offset are printed. This exists because the console request itself gets
+ * killed by proxy/LB timeouts with ALL output lost - a self-imposed stop just
+ * under that ceiling always beats a dead request. 0 = no budget. If you do not
+ * know the proxy ceiling, 240 is a safe console default.
+ */
+@Field int SCOPE_TIME_BUDGET_SECONDS = 240
+
+/*
  * Body-match strategy for discovery.
  *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
@@ -2195,28 +2214,83 @@ try {
         Set<String> names = new LinkedHashSet<String>()
         for (MigrationDef md : migrations) names.add(md.sourceName)
         long t0 = System.currentTimeMillis()
-        boolean sliced = (SCOPE_OFFSET > 0 || SCOPE_LIMIT > 0)
-        int candidates = sliced ? candidatePageCount() : 0
-        List<List<String>> scopeRows = scopeReport(names, SCOPE_OFFSET, SCOPE_LIMIT)
+
+        /*
+         * Chunked discovery. The window [SCOPE_OFFSET, SCOPE_OFFSET+SCOPE_LIMIT)
+         * of candidate pages (whole scope when SCOPE_LIMIT = 0) is processed in
+         * chunks of SCOPE_CHUNK_PAGES, each its own bounded SQL statement, so:
+         *   - statement_timeout can only kill one chunk, never the whole run
+         *   - everything collected before a failure is still printed
+         *   - the run stops itself before SCOPE_TIME_BUDGET_SECONDS and prints
+         *     the offset to resume from - a controlled stop instead of the
+         *     proxy killing the request with all output lost
+         */
+        int candidates = candidatePageCount()
+        int windowFrom = Math.min(SCOPE_OFFSET, candidates)
+        int windowTo = (SCOPE_LIMIT > 0) ? Math.min(windowFrom + SCOPE_LIMIT, candidates) : candidates
+        int chunk = (SCOPE_CHUNK_PAGES > 0) ? SCOPE_CHUNK_PAGES : (windowTo - windowFrom)
+        long budgetMs = SCOPE_TIME_BUDGET_SECONDS * 1000L
+
+        List<List<String>> scopeRows = new ArrayList<List<String>>()
+        StringBuilder chunkLog = new StringBuilder()
+        int resumeAt = -1
+        String failure = null
+
+        int off = windowFrom
+        while (off < windowTo) {
+            int take = Math.min(chunk, windowTo - off)
+            if (budgetMs > 0 && off > windowFrom
+                    && (System.currentTimeMillis() - t0) >= budgetMs) {
+                resumeAt = off
+                break
+            }
+            long ct0 = System.currentTimeMillis()
+            try {
+                List<List<String>> rows = scopeReport(names, off, take)
+                scopeRows.addAll(rows)
+                chunkLog.append('  chunk [').append(off).append(', ').append(off + take)
+                        .append(')   affected: ').append(String.format('%5d', rows.size()))
+                        .append('   ').append(humanTime(System.currentTimeMillis() - ct0)).append('\n')
+                off += take
+            } catch (Exception e) {
+                failure = e.getMessage()
+                resumeAt = off
+                chunkLog.append('  chunk [').append(off).append(', ').append(off + take)
+                        .append(')   FAILED after ').append(humanTime(System.currentTimeMillis() - ct0)).append('\n')
+                break
+            }
+        }
+
         outp.append('SCOPE  (discovery only - no page loads; per page, body probing stops\n')
         outp.append('        at the first version carrying any source macro)\n')
         outp.append('----------------------------------------------------------------\n')
-        if (sliced) {
-            int from = Math.min(SCOPE_OFFSET, candidates)
-            int to = (SCOPE_LIMIT > 0) ? Math.min(from + SCOPE_LIMIT, candidates) : candidates
-            outp.append('  candidate pages in scope: ').append(candidates)
-                .append('   probed slice [').append(from).append(', ').append(to).append(')\n')
-            if (to < candidates) {
-                outp.append('  NEXT RUN: set SCOPE_OFFSET = ').append(to)
-                    .append('   (').append(candidates - to).append(' candidates still to probe)\n')
-            } else {
-                outp.append('  this is the LAST slice\n')
-            }
-            outp.append('  NOTE: slices count CANDIDATE pages (every page in scope), not\n')
-                .append('        affected ones - a slice returning few or none is not truncation.\n')
-        }
-        outp.append('  affected pages: ').append(scopeRows.size())
+        outp.append('  candidate pages in scope: ').append(candidates)
+            .append('   window [').append(windowFrom).append(', ').append(windowTo)
+            .append(')   chunk size: ').append(chunk).append('\n')
+        outp.append(chunkLog)
+        outp.append('  affected pages collected: ').append(scopeRows.size())
             .append('   in ').append(humanTime(System.currentTimeMillis() - t0)).append('\n')
+
+        if (failure != null) {
+            outp.append('\n  CHUNK FAILED: ').append(failure).append('\n')
+                .append('  Results below are COMPLETE for [').append(windowFrom)
+                .append(', ').append(resumeAt).append(') and the failed chunk was not probed.\n')
+                .append('  RESUME: set SCOPE_OFFSET = ').append(resumeAt)
+                .append('. If the failure is a statement timeout, also lower SCOPE_CHUNK_PAGES.\n')
+        } else if (resumeAt >= 0) {
+            outp.append('\n  TIME BUDGET REACHED - stopped cleanly before the request could be killed.\n')
+                .append('  Results below are COMPLETE for [').append(windowFrom)
+                .append(', ').append(resumeAt).append(').\n')
+                .append('  RESUME: set SCOPE_OFFSET = ').append(resumeAt)
+                .append('   (').append(candidates - resumeAt).append(' candidates remaining)\n')
+        } else if (windowTo < candidates) {
+            outp.append('\n  window complete. NEXT RUN: set SCOPE_OFFSET = ').append(windowTo)
+                .append('   (').append(candidates - windowTo).append(' candidates still to probe)\n')
+        } else {
+            outp.append('\n  scope COMPLETE - every candidate page probed.\n')
+        }
+        outp.append('  NOTE: offsets count CANDIDATE pages (every page in scope), not affected\n')
+            .append('        ones - a chunk with few or zero affected pages is not truncation.\n')
 
         Map<String, Integer> perSpace = new LinkedHashMap<String, Integer>()
         for (List<String> r : scopeRows) {
