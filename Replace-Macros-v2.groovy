@@ -177,6 +177,16 @@ enum ReplacementStatus {
 @Field boolean EMIT_VERSION_MAP = true
 
 /*
+ * Same mapping as VERSION_MAP_OVERRIDE, as PLAIN TEXT - one entry per line,
+ * split into parts (each part one triple-quoted string). THIS is the form the
+ * INSPECT section emits and the one to use for big mappings: a list literal
+ * costs bytecode per element and a 16k-entry paste blows the JVM's 64 KB
+ * method limit, while a text part is a single constant. Both forms are read;
+ * quotes and commas on pasted lines are tolerated.
+ */
+@Field List<String> VERSION_MAP_TEXT_PARTS = []
+
+/*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
  *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
@@ -2283,7 +2293,19 @@ String targetLabelFor(Map<String, MigrationDef> byId, MatchedMacro mm) {
 // =============================================================================
 //  MAIN
 // =============================================================================
+/*
+ * The whole flow lives in ONE METHOD, not at script level, because the JVM
+ * caps every method at 64 KB of bytecode and everything at script level -
+ * flow AND pasted config literals - compiles into the single generated
+ * Script.run(). The two grew until they no longer fit together ("Method too
+ * large"). In this shape run() holds only field initialization, runEngine()
+ * holds the flow, and each has its own 64 KB budget. Large pasted data must
+ * additionally use the *_TEXT_PARTS form (one string constant per part)
+ * rather than list literals, which cost bytecode PER ELEMENT.
+ */
+return runEngine()
 
+String runEngine() {
 long runStart = System.currentTimeMillis()
 StringBuilder outp = new StringBuilder()
 StringBuilder rollbackPlain = new StringBuilder()      // entries with uncompressed BEFORE body
@@ -2613,7 +2635,14 @@ try {
 
     // pageId -> affected version contentids, from VERSION_MAP_OVERRIDE
     Map<Long, List<Long>> versionMap = new LinkedHashMap<Long, List<Long>>()
-    for (String entry : VERSION_MAP_OVERRIDE) {
+    List<String> versionMapEntries = new ArrayList<String>(VERSION_MAP_OVERRIDE)
+    for (String part : VERSION_MAP_TEXT_PARTS) {
+        for (String line : part.split('\n')) {
+            String t = line.replace("'", '').replace('"', '').replace(',', '').trim()
+            if (!t.isEmpty()) versionMapEntries.add(t)
+        }
+    }
+    for (String entry : versionMapEntries) {
         String[] parts = entry.trim().split(':')
         if (parts.length < 2) { RUN_LOG.add('VERSION_MAP_OVERRIDE entry ignored (want pageId:contentId[:vN]): ' + entry); continue }
         try {
@@ -2627,7 +2656,7 @@ try {
         }
     }
     if (!versionMap.isEmpty()) {
-        outp.append('  version mapping: ').append(plural(VERSION_MAP_OVERRIDE.size(), 'affected version'))
+        outp.append('  version mapping: ').append(plural(versionMapEntries.size(), 'affected version'))
             .append(' across ').append(plural(versionMap.size(), 'page'))
             .append(' - unaffected versions will not be loaded\n')
     }
@@ -3182,22 +3211,33 @@ try {
     page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
     page.append(results)
     if (!apply && EMIT_VERSION_MAP && !findings.isEmpty()) {
-        StringBuilder vmap = new StringBuilder()
+        // text-parts form: one entry per line, chunked so every part stays a
+        // single string constant well under the JVM's 64 KB constant limit
+        final int PART_MAX_CHARS = 45000
+        List<String> vmapParts = new ArrayList<String>()
+        StringBuilder cur = new StringBuilder()
         int vmapCount = 0
-        vmap.append('VERSION_MAP_OVERRIDE = [\n')
         for (PageFinding pf : findings) {
             for (VersionFinding vf : pf.versions) {
-                vmap.append("    '").append(pf.pageId).append(':').append(vf.contentId)
-                    .append(':v').append(vf.versionNumber)
-                if (vf.isCurrent) vmap.append('(current)')
-                vmap.append("',\n")
+                cur.append(pf.pageId).append(':').append(vf.contentId)
+                   .append(':v').append(vf.versionNumber)
+                if (vf.isCurrent) cur.append('(current)')
+                cur.append('\n')
                 vmapCount++
+                if (cur.length() >= PART_MAX_CHARS) { vmapParts.add(cur.toString()); cur = new StringBuilder() }
             }
+        }
+        if (cur.length() > 0) vmapParts.add(cur.toString())
+        StringBuilder vmap = new StringBuilder()
+        vmap.append('VERSION_MAP_TEXT_PARTS = [\n')
+        for (int vp = 0; vp < vmapParts.size(); vp++) {
+            vmap.append("'''").append('\n').append(vmapParts.get(vp)).append("'''")
+            vmap.append(vp < vmapParts.size() - 1 ? ',' : '').append('\n')
         }
         vmap.append(']\n')
         page.append('<h3>Affected versions mapping (').append(plural(vmapCount, 'version'))
             .append(' across ').append(plural(findings.size(), 'page')).append(')</h3>')
-            .append('<p style="font-size:90%">Paste over the VERSION_MAP_OVERRIDE field for the APPLY run ')
+            .append('<p style="font-size:90%">Paste over the VERSION_MAP_TEXT_PARTS field for the APPLY run ')
             .append('of this same scope and Migrations list - Stage-1 then loads only these versions ')
             .append('instead of walking full page histories. The :vN tail is the version number as shown ')
             .append('in the Confluence UI (metadata - ignored on paste-back). ')
@@ -3269,4 +3309,6 @@ try {
                 rollbackComp.toString(), ROLLBACK_MAX_HEIGHT_PX))
     }
     return tail.toString()
+}
+
 }
