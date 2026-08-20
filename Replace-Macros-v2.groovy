@@ -175,41 +175,6 @@ enum ReplacementStatus {
  * pasted back in.
  */
 @Field boolean EMIT_VERSION_MAP = true
-
-/*
- * Same mapping as VERSION_MAP_OVERRIDE, as plain text: one pageId:contentId:vN
- * entry per line, wrapped in triple quotes. The usual filled-in field is ONE
- * block:
- *
- *   @Field List<String> VERSION_MAP_TEXT_PARTS = ['''
- *   131074:131074:v7(current)
- *   131074:9830401:v3
- *   163842:163842:v2(current)
- *   ''']
- *
- * WHY a list at all: the JVM caps every single string literal at 65,535 bytes
- * (a compiler limit, same family as the 64 KB method cap). A big mapping -
- * 16k entries is ~330 KB - cannot legally be one string, so it must arrive as
- * several blocks in a plain Groovy list, separated by ordinary commas:
- *
- *   = ['''
- *   ...first ~45,000 chars of entries...
- *   ''',
- *   '''
- *   ...the rest...
- *   ''']
- *
- * The split points carry no meaning - all blocks are concatenated before
- * parsing. None of this is composed by hand: INSPECT's "Affected versions
- * mapping" section prints the complete literal, blocks and brackets included,
- * already split where required - paste it over everything after the = sign.
- * The :vN(current) tail is human-readable metadata, ignored on parse; stray
- * quotes/commas on lines are tolerated. Prefer this over VERSION_MAP_OVERRIDE
- * for anything beyond a few hundred entries: list literals cost bytecode PER
- * ELEMENT and large ones break compilation ("Method too large").
- */
-@Field List<String> VERSION_MAP_TEXT_PARTS = []
-
 /*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
@@ -514,14 +479,6 @@ class VersionFinding {
 
 class PageFinding {
     long pageId
-    /*
-     * Absolute position of this page in the (sorted, sliced) scope list,
-     * SCOPE_OFFSET included. THE resume currency: pages with no matches never
-     * become findings, so counting processed findings undercounts scope
-     * positions on any rerun where part of the window no-ops - the resume
-     * offset must come from here, never from a findings counter.
-     */
-    int scopeIndex = -1
     String pageName = '', spaceKey = '', url = ''
     List<VersionFinding> versions = new ArrayList<VersionFinding>()
 }
@@ -2317,19 +2274,7 @@ String targetLabelFor(Map<String, MigrationDef> byId, MatchedMacro mm) {
 // =============================================================================
 //  MAIN
 // =============================================================================
-/*
- * The whole flow lives in ONE METHOD, not at script level, because the JVM
- * caps every method at 64 KB of bytecode and everything at script level -
- * flow AND pasted config literals - compiles into the single generated
- * Script.run(). The two grew until they no longer fit together ("Method too
- * large"). In this shape run() holds only field initialization, runEngine()
- * holds the flow, and each has its own 64 KB budget. Large pasted data must
- * additionally use the *_TEXT_PARTS form (one string constant per part)
- * rather than list literals, which cost bytecode PER ELEMENT.
- */
-return runEngine()
 
-String runEngine() {
 long runStart = System.currentTimeMillis()
 StringBuilder outp = new StringBuilder()
 StringBuilder rollbackPlain = new StringBuilder()      // entries with uncompressed BEFORE body
@@ -2659,14 +2604,7 @@ try {
 
     // pageId -> affected version contentids, from VERSION_MAP_OVERRIDE
     Map<Long, List<Long>> versionMap = new LinkedHashMap<Long, List<Long>>()
-    List<String> versionMapEntries = new ArrayList<String>(VERSION_MAP_OVERRIDE)
-    for (String part : VERSION_MAP_TEXT_PARTS) {
-        for (String line : part.split('\n')) {
-            String t = line.replace("'", '').replace('"', '').replace(',', '').trim()
-            if (!t.isEmpty()) versionMapEntries.add(t)
-        }
-    }
-    for (String entry : versionMapEntries) {
+    for (String entry : VERSION_MAP_OVERRIDE) {
         String[] parts = entry.trim().split(':')
         if (parts.length < 2) { RUN_LOG.add('VERSION_MAP_OVERRIDE entry ignored (want pageId:contentId[:vN]): ' + entry); continue }
         try {
@@ -2680,21 +2618,19 @@ try {
         }
     }
     if (!versionMap.isEmpty()) {
-        outp.append('  version mapping: ').append(plural(versionMapEntries.size(), 'affected version'))
+        outp.append('  version mapping: ').append(plural(VERSION_MAP_OVERRIDE.size(), 'affected version'))
             .append(' across ').append(plural(versionMap.size(), 'page'))
             .append(' - unaffected versions will not be loaded\n')
     }
 
     List<PageFinding> findings = new ArrayList<PageFinding>()
     int batchCount = 0, pagesDone = 0
-    for (int scopePos = 0; scopePos < scope.size(); scopePos++) {
-        Long pid = scope.get(scopePos)
+    for (Long pid : scope) {
         Page page = pageManager.getPage(pid.longValue())
         if (page == null) { RUN_LOG.add('page ' + pid + ' not found during scan'); continue }
         if (page.getOriginalVersionId() != null) { RUN_LOG.add('page ' + pid + ' is a historical id; skipped'); continue }
 
         PageFinding pf = new PageFinding()
-        pf.scopeIndex = SCOPE_OFFSET + scopePos
         pf.pageId = pid.longValue()
         pf.pageName = page.getTitle() == null ? '' : page.getTitle()
         // space is read ONCE from the current version; version rows never carry it
@@ -3099,29 +3035,6 @@ try {
     if (legendEmitted && RESULT_FORMAT == 'TABLE' && RESULT_TABLE_SCROLLBOX) {
         results.append('</div>')
     }
-    // ---- verdict banner: the first thing after the results listbox ----------
-    // Totals and the partial/complete verdict live HERE, where the eye lands
-    // after scrolling the table - not only up in the run log.
-    int totFound = 0, totRep = 0, totSkip = 0, totFail = 0
-    for (MigrationDef mdSum : migrations) {
-        totFound += mdSum.occFound; totRep += mdSum.occReplaced
-        totSkip += mdSum.occSkipped; totFail += mdSum.occFailed
-    }
-    results.append('<p style="font-size:110%"><b>')
-           .append(apply ? 'APPLY' : 'INSPECT (dry run)')
-           .append(budgetStopIndex >= 0 ? ' - PARTIAL RESULT' : ' - window complete')
-           .append('.</b> pages: ').append(pagesProcessed).append(' of ').append(findings.size())
-           .append(' processed; occurrences: <b>').append(totRep).append(' replaced</b>, ')
-           .append(totSkip).append(' skipped, ')
-           .append(totFail == 0 ? '0 failed' : '<b>' + totFail + ' FAILED</b>')
-           .append(' of ').append(totFound).append(' found')
-    if (budgetStopIndex >= 0) {
-        results.append('. <b>RESUME: set SCOPE_OFFSET = ').append(findings.get(budgetStopIndex).scopeIndex)
-               .append('</b> (found counts cover the whole loaded window; ')
-               .append('replaced/skipped/failed cover processed pages only)')
-    }
-    results.append('</p>')
-
     // outside the scroll box, so it stays visible without scrolling to the end
     if (resultRowsTruncated > 0) {
         results.append('<p><b>').append(plural(resultRowsTruncated, 'further row'))
@@ -3169,9 +3082,7 @@ try {
         outp.append('\n  (the pre-write guard reserves worst-observed write + verify time)\n\n')
     }
     if (budgetStopIndex >= 0) {
-        // scope position of the first page NOT fully processed - correct even
-        // when earlier pages in the window no-oped and never became findings
-        int resumeOffset = findings.get(budgetStopIndex).scopeIndex
+        int resumeOffset = SCOPE_OFFSET + pagesProcessed
         outp.append('  TIME BUDGET REACHED - stopped cleanly at a ')
             .append(stoppedMidPage ? 'version boundary (pre-write guard).' : 'page boundary.').append('\n')
             .append('  pages processed: ').append(pagesProcessed).append(' of ').append(findings.size())
@@ -3235,33 +3146,22 @@ try {
     page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
     page.append(results)
     if (!apply && EMIT_VERSION_MAP && !findings.isEmpty()) {
-        // text-parts form: one entry per line, chunked so every part stays a
-        // single string constant well under the JVM's 64 KB constant limit
-        final int PART_MAX_CHARS = 45000
-        List<String> vmapParts = new ArrayList<String>()
-        StringBuilder cur = new StringBuilder()
+        StringBuilder vmap = new StringBuilder()
         int vmapCount = 0
+        vmap.append('VERSION_MAP_OVERRIDE = [\n')
         for (PageFinding pf : findings) {
             for (VersionFinding vf : pf.versions) {
-                cur.append(pf.pageId).append(':').append(vf.contentId)
-                   .append(':v').append(vf.versionNumber)
-                if (vf.isCurrent) cur.append('(current)')
-                cur.append('\n')
+                vmap.append("    '").append(pf.pageId).append(':').append(vf.contentId)
+                    .append(':v').append(vf.versionNumber)
+                if (vf.isCurrent) vmap.append('(current)')
+                vmap.append("',\n")
                 vmapCount++
-                if (cur.length() >= PART_MAX_CHARS) { vmapParts.add(cur.toString()); cur = new StringBuilder() }
             }
-        }
-        if (cur.length() > 0) vmapParts.add(cur.toString())
-        StringBuilder vmap = new StringBuilder()
-        vmap.append('VERSION_MAP_TEXT_PARTS = [\n')
-        for (int vp = 0; vp < vmapParts.size(); vp++) {
-            vmap.append("'''").append('\n').append(vmapParts.get(vp)).append("'''")
-            vmap.append(vp < vmapParts.size() - 1 ? ',' : '').append('\n')
         }
         vmap.append(']\n')
         page.append('<h3>Affected versions mapping (').append(plural(vmapCount, 'version'))
             .append(' across ').append(plural(findings.size(), 'page')).append(')</h3>')
-            .append('<p style="font-size:90%">Paste over the VERSION_MAP_TEXT_PARTS field for the APPLY run ')
+            .append('<p style="font-size:90%">Paste over the VERSION_MAP_OVERRIDE field for the APPLY run ')
             .append('of this same scope and Migrations list - Stage-1 then loads only these versions ')
             .append('instead of walking full page histories. The :vN tail is the version number as shown ')
             .append('in the Confluence UI (metadata - ignored on paste-back). ')
@@ -3333,6 +3233,4 @@ try {
                 rollbackComp.toString(), ROLLBACK_MAX_HEIGHT_PX))
     }
     return tail.toString()
-}
-
 }
