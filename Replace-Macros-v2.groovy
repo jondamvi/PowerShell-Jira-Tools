@@ -132,7 +132,7 @@ enum ReplacementStatus {
  * under that ceiling always beats a dead request. 0 = no budget. If you do not
  * know the proxy ceiling, 240 is a safe console default.
  */
-@Field int SCOPE_TIME_BUDGET_SECONDS = 240
+@Field int SCOPE_TIME_BUDGET_SECONDS = 300
 
 /*
  * Wall-clock budget for INSPECT and APPLY runs, seconds, measured from run
@@ -145,8 +145,12 @@ enum ReplacementStatus {
  * macros cannot match again, so re-running the same scope is a no-op for
  * everything already written - the budget stop saves re-inspection time and
  * keeps the output, it is not what protects the data.
+ * This guards the HTTP REQUEST (proxy/LB ceiling), a different clock from
+ * SQL_TIMEOUT_SECONDS, which bounds a single database statement. A console
+ * run has survived 5 m 18 s on this instance, so the request ceiling is
+ * above 300; raise this once the actual proxy limit is confirmed.
  */
-@Field int RUN_TIME_BUDGET_SECONDS = 240
+@Field int RUN_TIME_BUDGET_SECONDS = 300
 
 /*
  * Affected-version mapping, produced by an INSPECT run over the same scope
@@ -2261,6 +2265,9 @@ long runStart = System.currentTimeMillis()
 StringBuilder outp = new StringBuilder()
 StringBuilder rollbackPlain = new StringBuilder()      // entries with uncompressed BEFORE body
 StringBuilder rollbackComp = new StringBuilder()       // entries with compressed BEFORE body
+// declared here, not inside the try: the fatal catch prints them too
+int rollbackPlainCount = 0
+int rollbackCompCount = 0
 StringBuilder results = new StringBuilder()
 // Declared out here so the fatal handler can close and emit whatever the run
 // produced before it stopped: partial results are the record of what completed.
@@ -2702,8 +2709,6 @@ try {
     List<String> notes = new ArrayList<String>()
     batchCount = 0
     int rollbackEmitted = 0
-    int rollbackPlainCount = 0
-    int rollbackCompCount = 0
 
     int pagesProcessed = 0
     int budgetStopIndex = -1          // index of the first UNPROCESSED page
