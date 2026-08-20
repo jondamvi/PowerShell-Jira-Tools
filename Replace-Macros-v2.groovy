@@ -177,12 +177,36 @@ enum ReplacementStatus {
 @Field boolean EMIT_VERSION_MAP = true
 
 /*
- * Same mapping as VERSION_MAP_OVERRIDE, as PLAIN TEXT - one entry per line,
- * split into parts (each part one triple-quoted string). THIS is the form the
- * INSPECT section emits and the one to use for big mappings: a list literal
- * costs bytecode per element and a 16k-entry paste blows the JVM's 64 KB
- * method limit, while a text part is a single constant. Both forms are read;
- * quotes and commas on pasted lines are tolerated.
+ * Same mapping as VERSION_MAP_OVERRIDE, as plain text: one pageId:contentId:vN
+ * entry per line, wrapped in triple quotes. The usual filled-in field is ONE
+ * block:
+ *
+ *   @Field List<String> VERSION_MAP_TEXT_PARTS = ['''
+ *   131074:131074:v7(current)
+ *   131074:9830401:v3
+ *   163842:163842:v2(current)
+ *   ''']
+ *
+ * WHY a list at all: the JVM caps every single string literal at 65,535 bytes
+ * (a compiler limit, same family as the 64 KB method cap). A big mapping -
+ * 16k entries is ~330 KB - cannot legally be one string, so it must arrive as
+ * several blocks in a plain Groovy list, separated by ordinary commas:
+ *
+ *   = ['''
+ *   ...first ~45,000 chars of entries...
+ *   ''',
+ *   '''
+ *   ...the rest...
+ *   ''']
+ *
+ * The split points carry no meaning - all blocks are concatenated before
+ * parsing. None of this is composed by hand: INSPECT's "Affected versions
+ * mapping" section prints the complete literal, blocks and brackets included,
+ * already split where required - paste it over everything after the = sign.
+ * The :vN(current) tail is human-readable metadata, ignored on parse; stray
+ * quotes/commas on lines are tolerated. Prefer this over VERSION_MAP_OVERRIDE
+ * for anything beyond a few hundred entries: list literals cost bytecode PER
+ * ELEMENT and large ones break compilation ("Method too large").
  */
 @Field List<String> VERSION_MAP_TEXT_PARTS = []
 
