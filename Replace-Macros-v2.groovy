@@ -480,6 +480,14 @@ class VersionFinding {
 
 class PageFinding {
     long pageId
+    /*
+     * Absolute position of this page in the (sorted, sliced) scope list,
+     * SCOPE_OFFSET included. THE resume currency: pages with no matches never
+     * become findings, so counting processed findings undercounts scope
+     * positions on any rerun where part of the window no-ops - the resume
+     * offset must come from here, never from a findings counter.
+     */
+    int scopeIndex = -1
     String pageName = '', spaceKey = '', url = ''
     List<VersionFinding> versions = new ArrayList<VersionFinding>()
 }
@@ -2054,8 +2062,23 @@ void writeCurrentVersion(PageManager pm, Page page, String newBody) {
     }
 }
 
-void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String newBody) {
+void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String newBody, long currentPageId) {
     try {
+        /*
+         * Historical rows on this instance may carry NULL spaceid - the same
+         * inconsistency that blinded the old discovery. Confluence's own save
+         * path dereferences entity.getSpace(), so such rows NPE from inside
+         * the product. Hydrate the space from the CURRENT page (ownership,
+         * the only reliable source) before saving. Side effect: the save then
+         * persists the spaceid onto the row - the exact value Confluence
+         * itself would have written - quietly repairing the inconsistency on
+         * every version this migration touches anyway.
+         */
+        if (hist instanceof Page && ((Page) hist).getSpace() == null) {
+            Page cur = pm.getPage(currentPageId)
+            Space owner = (cur == null) ? null : cur.getSpace()
+            if (owner != null) ((Page) hist).setSpace(owner)
+        }
         Date keep = hist.getLastModificationDate()
         hist.setBodyAsString(newBody)
         hist.setLastModificationDate(keep)
@@ -2611,12 +2634,14 @@ try {
 
     List<PageFinding> findings = new ArrayList<PageFinding>()
     int batchCount = 0, pagesDone = 0
-    for (Long pid : scope) {
+    for (int scopePos = 0; scopePos < scope.size(); scopePos++) {
+        Long pid = scope.get(scopePos)
         Page page = pageManager.getPage(pid.longValue())
         if (page == null) { RUN_LOG.add('page ' + pid + ' not found during scan'); continue }
         if (page.getOriginalVersionId() != null) { RUN_LOG.add('page ' + pid + ' is a historical id; skipped'); continue }
 
         PageFinding pf = new PageFinding()
+        pf.scopeIndex = SCOPE_OFFSET + scopePos
         pf.pageId = pid.longValue()
         pf.pageName = page.getTitle() == null ? '' : page.getTitle()
         // space is read ONCE from the current version; version rows never carry it
@@ -2801,7 +2826,7 @@ try {
                         } else {
                             ContentEntityObject target = pageManager.getPage(vf.contentId)
                             if (target == null) { werr = 'version disappeared before write'; break }
-                            writeHistoricalVersion(pageManager, target, bodyToWrite)
+                            writeHistoricalVersion(pageManager, target, bodyToWrite, pf.pageId)
                         }
                         werr = null
                         break
@@ -3021,6 +3046,29 @@ try {
     if (legendEmitted && RESULT_FORMAT == 'TABLE' && RESULT_TABLE_SCROLLBOX) {
         results.append('</div>')
     }
+    // ---- verdict banner: the first thing after the results listbox ----------
+    // Totals and the partial/complete verdict live HERE, where the eye lands
+    // after scrolling the table - not only up in the run log.
+    int totFound = 0, totRep = 0, totSkip = 0, totFail = 0
+    for (MigrationDef mdSum : migrations) {
+        totFound += mdSum.occFound; totRep += mdSum.occReplaced
+        totSkip += mdSum.occSkipped; totFail += mdSum.occFailed
+    }
+    results.append('<p style="font-size:110%"><b>')
+           .append(apply ? 'APPLY' : 'INSPECT (dry run)')
+           .append(budgetStopIndex >= 0 ? ' - PARTIAL RESULT' : ' - window complete')
+           .append('.</b> pages: ').append(pagesProcessed).append(' of ').append(findings.size())
+           .append(' processed; occurrences: <b>').append(totRep).append(' replaced</b>, ')
+           .append(totSkip).append(' skipped, ')
+           .append(totFail == 0 ? '0 failed' : '<b>' + totFail + ' FAILED</b>')
+           .append(' of ').append(totFound).append(' found')
+    if (budgetStopIndex >= 0) {
+        results.append('. <b>RESUME: set SCOPE_OFFSET = ').append(findings.get(budgetStopIndex).scopeIndex)
+               .append('</b> (found counts cover the whole loaded window; ')
+               .append('replaced/skipped/failed cover processed pages only)')
+    }
+    results.append('</p>')
+
     // outside the scroll box, so it stays visible without scrolling to the end
     if (resultRowsTruncated > 0) {
         results.append('<p><b>').append(plural(resultRowsTruncated, 'further row'))
@@ -3068,7 +3116,9 @@ try {
         outp.append('\n  (the pre-write guard reserves worst-observed write + verify time)\n\n')
     }
     if (budgetStopIndex >= 0) {
-        int resumeOffset = SCOPE_OFFSET + pagesProcessed
+        // scope position of the first page NOT fully processed - correct even
+        // when earlier pages in the window no-oped and never became findings
+        int resumeOffset = findings.get(budgetStopIndex).scopeIndex
         outp.append('  TIME BUDGET REACHED - stopped cleanly at a ')
             .append(stoppedMidPage ? 'version boundary (pre-write guard).' : 'page boundary.').append('\n')
             .append('  pages processed: ').append(pagesProcessed).append(' of ').append(findings.size())
