@@ -135,6 +135,44 @@ enum ReplacementStatus {
 @Field int SCOPE_TIME_BUDGET_SECONDS = 240
 
 /*
+ * Wall-clock budget for INSPECT and APPLY runs, seconds, measured from run
+ * start (so it covers Stage-1 loading too). Checked BETWEEN PAGES in Stage-3:
+ * a page's versions are never split - either all of a page's versions were
+ * processed or none were, the same atomicity chunks give SCOPE. On stop, the
+ * summary states how many pages were processed and the exact SCOPE_OFFSET to
+ * resume from; pages past the stop produce no result rows and no writes.
+ * 0 = no budget. Writes are also safe against ungraceful cutoffs: replaced
+ * macros cannot match again, so re-running the same scope is a no-op for
+ * everything already written - the budget stop saves re-inspection time and
+ * keeps the output, it is not what protects the data.
+ */
+@Field int RUN_TIME_BUDGET_SECONDS = 240
+
+/*
+ * Affected-version mapping, produced by an INSPECT run over the same scope
+ * ("Affected versions mapping" section - paste it here verbatim). Entries are
+ * 'pageId:contentId'. When set, Stage-1 loads ONLY these versions instead of
+ * walking every version of every page - INSPECT already paid for finding
+ * which versions matter, so APPLY does not pay again. Removes the largest
+ * unknown from APPLY's runtime: version-history walking of unaffected rows.
+ * Empty = walk full histories as before. Use with the SAME Migrations list
+ * the INSPECT run used; a stale mapping cannot corrupt anything (versions
+ * are re-matched before writing - an entry with no matches is reported and
+ * skipped), it can only miss versions that a newer Migrations list would
+ * have caught.
+ */
+@Field List<String> VERSION_MAP_OVERRIDE = []
+
+/*
+ * Emit the affected-versions mapping section from INSPECT runs. Entries are
+ * 'pageId:contentId:vN' - the third token is the human-readable version
+ * number as shown in the Confluence UI, metadata only; the script operates
+ * on the first two and ignores everything after them when the mapping is
+ * pasted back in.
+ */
+@Field boolean EMIT_VERSION_MAP = true
+
+/*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
  *   false = one LIKE per macro name:  body LIKE '%ac:name="a"%' OR ...
@@ -300,6 +338,9 @@ enum ReplacementStatus {
  * format. 0 = render them inline as before.
  */
 @Field int ROLLBACK_MAX_HEIGHT_PX = 400
+
+// Same, for the trace section (TRACE_MAPPING). 0 = plain, unboxed output.
+@Field int TRACE_MAX_HEIGHT_PX = 300
 @Field boolean EMIT_REPLACED_ON_SUCCESS = false     // usually not needed
 @Field int MAX_ROLLBACK_ENTRIES = 200
 
@@ -530,6 +571,25 @@ String xmlText(Object v) {
 String htmlEsc(Object v) {
     if (v == null) return ''
     return v.toString().replace('&', '&amp;').replace('<', '&lt;').replace('>', '&gt;')
+}
+
+/**
+ * A heading plus its own scrollable box around escaped text. Every bulk
+ * section (trace, rollback copies) gets one, so each can be skimmed or
+ * skipped independently and none can dominate the page. Escaping happens
+ * HERE and only here - the builders hold raw text.
+ */
+String bulkBox(String heading, String bodyText, int maxPx) {
+    StringBuilder b = new StringBuilder()
+    b.append('<h3>').append(heading).append('</h3>')
+    if (maxPx > 0) {
+        b.append('<div style="max-height:').append(maxPx)
+         .append('px;overflow:auto;border:1px solid #ccc;resize:vertical">')
+         .append('<pre style="margin:0">').append(htmlEsc(bodyText)).append('</pre></div>')
+    } else {
+        b.append('<pre>').append(htmlEsc(bodyText)).append('</pre>')
+    }
+    return b.toString()
 }
 
 /*
@@ -1225,11 +1285,11 @@ String macroMatchClause(Set<String> sourceNames, String alias, String tag, Map<S
  * candidate through prevver = <current id> instead: filtered by ownership.
  * Ordered by contentid when sliced, so a slice means the same pages every run.
  */
-String candidatePageSql(List<Integer> spaceIds, Map<String, Object> params,
-                        int candidateOffset, int candidateLimit) {
+/** The scope filter over a current-page alias `cur` - shared by candidate
+ *  queries and the per-space totals. Returns the WHERE conditions only. */
+String currentPageScopeClause(List<Integer> spaceIds, Map<String, Object> params) {
     StringBuilder q = new StringBuilder()
-    q.append('SELECT cur.contentid AS pid FROM content cur ')
-     .append("WHERE cur.contenttype IN ('PAGE','BLOGPOST') AND cur.prevver IS NULL ")
+    q.append("cur.contenttype IN ('PAGE','BLOGPOST') AND cur.prevver IS NULL ")
     if (!spaceIds.isEmpty()) {
         List<String> ph = new ArrayList<String>()
         for (int i = 0; i < spaceIds.size(); i++) {
@@ -1246,6 +1306,14 @@ String candidatePageSql(List<Integer> spaceIds, Map<String, Object> params,
         }
         q.append('AND cur.content_status IN (').append(ph.join(', ')).append(') ')
     }
+    return q.toString()
+}
+
+String candidatePageSql(List<Integer> spaceIds, Map<String, Object> params,
+                        int candidateOffset, int candidateLimit) {
+    StringBuilder q = new StringBuilder()
+    q.append('SELECT cur.contentid AS pid FROM content cur ')
+     .append('WHERE ').append(currentPageScopeClause(spaceIds, params))
     if (candidateOffset > 0 || candidateLimit > 0) {
         q.append('ORDER BY cur.contentid ')
         if (candidateLimit > 0) q.append('LIMIT ').append(candidateLimit).append(' ')
@@ -1350,7 +1418,13 @@ List<Long> resolveScope(Set<String> sourceNames) {
  */
 List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candidateLimit) {
     try {
-        if (!PAGE_IDS_OVERRIDE.isEmpty()) return new ArrayList<Long>(PAGE_IDS_OVERRIDE)
+        if (!PAGE_IDS_OVERRIDE.isEmpty()) {
+            // sorted so SCOPE_OFFSET means the same pages on every run,
+            // whatever order the ids were pasted in
+            List<Long> ov = new ArrayList<Long>(PAGE_IDS_OVERRIDE)
+            Collections.sort(ov)
+            return ov
+        }
         if (sourceNames.isEmpty()) return new ArrayList<Long>()
 
         List<String> spaceKeys = RESOLVED_SPACE_KEYS.isEmpty()
@@ -2185,7 +2259,8 @@ String targetLabelFor(Map<String, MigrationDef> byId, MatchedMacro mm) {
 
 long runStart = System.currentTimeMillis()
 StringBuilder outp = new StringBuilder()
-StringBuilder rollback = new StringBuilder()
+StringBuilder rollbackPlain = new StringBuilder()      // entries with uncompressed BEFORE body
+StringBuilder rollbackComp = new StringBuilder()       // entries with compressed BEFORE body
 StringBuilder results = new StringBuilder()
 // Declared out here so the fatal handler can close and emit whatever the run
 // produced before it stopped: partial results are the record of what completed.
@@ -2385,9 +2460,37 @@ try {
             Integer c = perSpace.get(r.get(0))
             perSpace.put(r.get(0), c == null ? 1 : c + 1)
         }
-        outp.append('\n  ').append(String.format('%-30s %s', 'SPACE', 'AFFECTED PAGES')).append('\n')
-        for (Map.Entry<String, Integer> e : perSpace.entrySet()) {
-            outp.append('  ').append(String.format('%-30s %s', e.getKey(), e.getValue() as String)).append('\n')
+        // per-space totals: how many candidate pages each space holds, so the
+        // affected count has its denominator right next to it
+        Map<String, Integer> totalPerSpace = new LinkedHashMap<String, Integer>()
+        try {
+            List<String> tk = RESOLVED_SPACE_KEYS.isEmpty()
+                    ? new ArrayList<String>(SPACE_KEYS) : new ArrayList<String>(RESOLVED_SPACE_KEYS)
+            List<Integer> tids = spaceIdsFor(tk)
+            if (!tids.isEmpty()) {
+                Map<String, Object> tp = new LinkedHashMap<String, Object>()
+                String tq = 'SELECT s.spacekey AS sk, COUNT(*) AS n ' +
+                        'FROM content cur JOIN spaces s ON s.spaceid = cur.spaceid WHERE ' +
+                        currentPageScopeClause(tids, tp) + ' GROUP BY s.spacekey'
+                DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+                    sql.eachRow(tq, tp) { row ->
+                        totalPerSpace.put(row['sk'] as String, ((Number) row['n']).intValue())
+                    }
+                }
+            }
+        } catch (Exception e) {
+            RUN_LOG.add('per-space totals unavailable: ' + e.getMessage())
+        }
+        outp.append('\n  ').append(String.format('%-30s %-16s %s', 'SPACE', 'TOTAL PAGES', 'AFFECTED PAGES')).append('\n')
+        Set<String> allKeys = new LinkedHashSet<String>()
+        allKeys.addAll(totalPerSpace.keySet())
+        allKeys.addAll(perSpace.keySet())
+        for (String k : allKeys) {
+            Integer tot = totalPerSpace.get(k)
+            Integer aff = perSpace.get(k)
+            outp.append('  ').append(String.format('%-30s %-16s %s', k,
+                    tot == null ? '?' : tot.toString(),
+                    aff == null ? '0' : aff.toString())).append('\n')
         }
 
         // RESULT_FORMAT applies in every mode - SCOPE used to force CSV
@@ -2478,6 +2581,27 @@ try {
         outp.append('  pages in scope: ').append(totalInScope).append('\n')
     }
 
+    // pageId -> affected version contentids, from VERSION_MAP_OVERRIDE
+    Map<Long, List<Long>> versionMap = new LinkedHashMap<Long, List<Long>>()
+    for (String entry : VERSION_MAP_OVERRIDE) {
+        String[] parts = entry.trim().split(':')
+        if (parts.length < 2) { RUN_LOG.add('VERSION_MAP_OVERRIDE entry ignored (want pageId:contentId[:vN]): ' + entry); continue }
+        try {
+            Long pgId = Long.parseLong(parts[0].trim())
+            Long ctId = Long.parseLong(parts[1].trim())
+            List<Long> lst = versionMap.get(pgId)
+            if (lst == null) { lst = new ArrayList<Long>(); versionMap.put(pgId, lst) }
+            lst.add(ctId)
+        } catch (NumberFormatException nfe) {
+            RUN_LOG.add('VERSION_MAP_OVERRIDE entry ignored (not numeric): ' + entry)
+        }
+    }
+    if (!versionMap.isEmpty()) {
+        outp.append('  version mapping: ').append(plural(VERSION_MAP_OVERRIDE.size(), 'affected version'))
+            .append(' across ').append(plural(versionMap.size(), 'page'))
+            .append(' - unaffected versions will not be loaded\n')
+    }
+
     List<PageFinding> findings = new ArrayList<PageFinding>()
     int batchCount = 0, pagesDone = 0
     for (Long pid : scope) {
@@ -2497,7 +2621,14 @@ try {
 
         // typed local first: the checker cannot always infer the element type
         // of a method call used directly as the loop source
-        List<Long> versionIds = versionContentIds(pageManager, page)
+        List<Long> versionIds
+        if (!versionMap.isEmpty()) {
+            List<Long> mapped = versionMap.get(pid.longValue())
+            if (mapped == null) continue      // page has no affected versions per mapping
+            versionIds = mapped
+        } else {
+            versionIds = versionContentIds(pageManager, page)
+        }
         for (Long cid : versionIds) {
             ContentEntityObject ceo = pageManager.getPage(cid.longValue())
             if (ceo == null) continue
@@ -2571,8 +2702,29 @@ try {
     List<String> notes = new ArrayList<String>()
     batchCount = 0
     int rollbackEmitted = 0
+    int rollbackPlainCount = 0
+    int rollbackCompCount = 0
 
-    for (PageFinding pf : findings) {
+    int pagesProcessed = 0
+    int budgetStopIndex = -1          // index of the first UNPROCESSED page
+    boolean stoppedMidPage = false    // predictive guard fired inside a page
+    long budgetMs3 = RUN_TIME_BUDGET_SECONDS * 1000L
+
+    // measured write cost, fed back into the pre-write guard
+    int writeCount = 0
+    long writeMsTotal = 0, writeMsMax = 0
+    long verifyMsTotal = 0, verifyMsMax = 0
+    // until measured: assume a write costs this much (generous on purpose)
+    long writeMsEstimate = 3000L
+
+    for (int pfIdx = 0; pfIdx < findings.size(); pfIdx++) {
+        PageFinding pf = findings.get(pfIdx)
+        // page-atomic budget stop: never split a page's versions
+        if (budgetMs3 > 0 && pfIdx > 0
+                && (System.currentTimeMillis() - runStart) >= budgetMs3) {
+            budgetStopIndex = pfIdx
+            break
+        }
         for (VersionFinding vf : pf.versions) {
             try {
                 ContentEntityObject ceo = pageManager.getPage(vf.contentId)
@@ -2604,11 +2756,37 @@ try {
                     continue
                 }
 
+                // ---- predictive budget guard, checked BEFORE each write --
+                // A write started must be allowed to finish; so the question
+                // is asked before starting: does the remaining budget still
+                // fit one write plus its verify, at the cost measured so far?
+                // Guard estimate: the WORST write seen (or the initial
+                // assumption before any measurement), not the average.
+                if (budgetMs3 > 0 && writeCount + pagesProcessed > 0) {
+                    long est = Math.max(writeMsEstimate, writeMsMax + verifyMsMax)
+                    if ((System.currentTimeMillis() - runStart) + est >= budgetMs3) {
+                        stoppedMidPage = true
+                        budgetStopIndex = pfIdx
+                        vf.status = ReplacementStatus.Skipped
+                        vf.message = 'not written - time budget'
+                        for (MatchedMacro mm : vf.matchedMacros) {
+                            if (mm.status == ReplacementStatus.Success || mm.status == ReplacementStatus.Unknown) {
+                                mm.status = ReplacementStatus.Skipped
+                                mm.message = 'not written - time budget'
+                                MigrationDef mdb = byId.get(mm.migrationId)
+                                if (mdb != null) { mdb.occReplaced--; mdb.occSkipped++ }
+                            }
+                        }
+                        continue      // finally still emits this version's rows
+                    }
+                }
+
                 // ---- write, with retry on stale entity -------------------
                 String werr = null
                 Exception lastWriteEx = null
                 int attempt = 0
                 String bodyToWrite = after
+                long writeT0 = System.currentTimeMillis()
                 while (true) {
                     try {
                         if (vf.isCurrent) {
@@ -2639,6 +2817,11 @@ try {
                     }
                 }
 
+                long writeT1 = System.currentTimeMillis()
+                writeCount++
+                writeMsTotal += (writeT1 - writeT0)
+                if (writeT1 - writeT0 > writeMsMax) writeMsMax = writeT1 - writeT0
+
                 if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
                     throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
                             ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retr(y/ies): ' +
@@ -2656,8 +2839,12 @@ try {
                         }
                     }
                 } else if (VERIFY_AFTER_WRITE) {
+                    long verifyT0 = System.currentTimeMillis()
                     ContentEntityObject check = pageManager.getPage(vf.contentId)
                     String freshBody = check == null ? '' : check.getBodyAsString()
+                    long verifyT1 = System.currentTimeMillis()
+                    verifyMsTotal += (verifyT1 - verifyT0)
+                    if (verifyT1 - verifyT0 > verifyMsMax) verifyMsMax = verifyT1 - verifyT0
                     int stillThere = 0
                     for (MatchedMacro mm : vf.matchedMacros) {
                         if (mm.status != ReplacementStatus.Success) continue
@@ -2780,24 +2967,40 @@ try {
             }
 
             // ---- rollback copies, emitted per version then dropped ------
+            // Routed whole into the plain or the compressed section by the
+            // form of the BEFORE body (the actual rollback material). Text is
+            // stored RAW here; bulkBox escapes exactly once at assembly -
+            // the old emission-time htmlEsc double-escaped bodies.
             if (EMIT_ROLLBACK_COPIES && apply && vf.bodyBefore != null && rollbackEmitted < MAX_ROLLBACK_ENTRIES) {
                 boolean ok = (vf.status == ReplacementStatus.Success)
                 rollbackEmitted++
-                rollback.append('---- page ').append(pf.pageId).append(' contentid ').append(vf.contentId)
-                        .append(' v').append(vf.versionNumber).append('  ').append(vf.status).append('\n')
                 boolean cSrc = ok ? COMPRESS_SOURCE_ON_SUCCESS : COMPRESS_SOURCE_ON_FAILURE
-                rollback.append('BEFORE:\n')
-                        .append(cSrc ? compressToText(vf.bodyBefore) : htmlEsc(vf.bodyBefore)).append('\n')
+                StringBuilder rb = cSrc ? rollbackComp : rollbackPlain
+                if (cSrc) rollbackCompCount++ else rollbackPlainCount++
+                rb.append('---- page ').append(pf.pageId).append(' contentid ').append(vf.contentId)
+                  .append(' v').append(vf.versionNumber).append('  ').append(vf.status).append('\n')
+                rb.append('BEFORE:\n')
+                  .append(cSrc ? compressToText(vf.bodyBefore) : vf.bodyBefore).append('\n')
                 if (!ok || EMIT_REPLACED_ON_SUCCESS) {
                     boolean cRep = ok ? COMPRESS_REPLACED_ON_SUCCESS : COMPRESS_REPLACED_ON_FAILURE
-                    rollback.append('AFTER:\n')
-                            .append(cRep ? compressToText(vf.bodyAfter) : htmlEsc(vf.bodyAfter)).append('\n')
+                    rb.append('AFTER:\n')
+                      .append(cRep ? compressToText(vf.bodyAfter) : vf.bodyAfter).append('\n')
                 }
-                rollback.append('\n')
+                rb.append('\n')
             }
             vf.bodyBefore = null; vf.bodyAfter = null      // do not accumulate bodies
             }   // end finally
         }
+        if (stoppedMidPage) {
+            // versions written before the guard fired are real and were
+            // flushed with their batch; the page itself is NOT counted as
+            // processed, so the resume offset repeats it - already-written
+            // versions re-run as no-ops
+            batchCount++
+            if (FLUSH_AFTER_BATCH) { flushSession(); batchCount = 0 }
+            break
+        }
+        pagesProcessed++
         batchCount++
         if (FLUSH_AFTER_BATCH && batchCount >= BATCH_MAX_PAGES) { flushSession(); batchCount = 0 }
     }
@@ -2849,6 +3052,32 @@ try {
     }
 
     // ---- SUMMARY ----------------------------------------------------------
+    if (apply && writeCount > 0) {
+        outp.append('  WRITE TIMING  writes: ').append(writeCount)
+            .append('   avg: ').append(writeMsTotal / writeCount).append(' ms')
+            .append('   max: ').append(writeMsMax).append(' ms')
+        if (VERIFY_AFTER_WRITE) {
+            outp.append('   verify avg: ').append(verifyMsTotal / writeCount).append(' ms')
+                .append('   max: ').append(verifyMsMax).append(' ms')
+        }
+        outp.append('\n  (the pre-write guard reserves worst-observed write + verify time)\n\n')
+    }
+    if (budgetStopIndex >= 0) {
+        int resumeOffset = SCOPE_OFFSET + pagesProcessed
+        outp.append('  TIME BUDGET REACHED - stopped cleanly at a ')
+            .append(stoppedMidPage ? 'version boundary (pre-write guard).' : 'page boundary.').append('\n')
+            .append('  pages processed: ').append(pagesProcessed).append(' of ').append(findings.size())
+            .append(' in this window; every processed page is fully done.\n')
+            .append(stoppedMidPage
+                ? '  The stop page has its written versions marked Success and the rest\n' +
+                  '  Skipped (time budget); resuming repeats that page - already-written\n' +
+                  '  versions are no-ops.\n'
+                : '  No version of any later page was touched or listed.\n')
+            .append('  RESUME: set SCOPE_OFFSET = ').append(resumeOffset)
+            .append('   (keep SPACE_KEYS / PAGE_IDS_OVERRIDE and their order unchanged)\n')
+            .append('  NOTE: FOUND counts below cover ALL pages loaded in Stage-1;\n')
+            .append('        REPLACED / SKIPPED / FAILED cover processed pages only.\n\n')
+    }
     outp.append('  RESULTS BY MIGRATION\n')
     // width driven by the longest id actually present, not a fixed guess
     int idW = 'MIGRATION'.length()
@@ -2877,9 +3106,9 @@ try {
         outp.append('\n  RUN LOG\n')
         for (String l : RUN_LOG) outp.append('    ').append(l).append('\n')
     }
+    StringBuilder traceOut = new StringBuilder()
     if (TRACE_MAPPING && !notes.isEmpty()) {
-        outp.append('\n  TRACE\n')
-        for (String n : notes) outp.append('    ').append(n).append('\n')
+        for (String n : notes) traceOut.append('  ').append(n).append('\n')
     }
     outp.append('\nTOTAL ELAPSED: ').append(humanTime(System.currentTimeMillis() - runStart)).append('\n')
 
@@ -2887,25 +3116,58 @@ try {
     log.warn("Macro engine v2: mode=${MODE}, pages=${findings.size()}, elapsed=${System.currentTimeMillis() - runStart} ms")
 
     /*
-     * Order matters: the results table goes FIRST. The trace and the rollback
-     * copies can run to megabytes, and the console truncates long output - which
-     * is why the tables appeared to be missing entirely when they were simply
-     * past the cut. Bulk data goes last, where losing the tail costs nothing.
+     * Assembly order, same convention as SCOPE: the RUN LOG leads (stage
+     * summaries, migration table, failures - always small now that TRACE is
+     * split out), the results block follows it, and the genuinely bulky
+     * sections - trace and rollback copies, which can run to megabytes and
+     * fall past the console's truncation point - go last, where losing the
+     * tail costs nothing.
      */
     StringBuilder page = new StringBuilder()
-    page.append(results)
     page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
-    if (rollback.length() > 0) {
-        page.append('<h3>Rollback copies (').append(rollbackEmitted).append(')</h3>')
-            .append('<p>Console output is not a backup - take a database backup before bulk runs. ')
-            .append('These are for surgical single-version restores.</p>')
-        if (ROLLBACK_MAX_HEIGHT_PX > 0) {
-            page.append('<div style="max-height:').append(ROLLBACK_MAX_HEIGHT_PX)
-                .append('px;overflow:auto;border:1px solid #ccc;resize:vertical">')
-                .append('<pre style="margin:0">').append(htmlEsc(rollback.toString())).append('</pre>')
-                .append('</div>')
-        } else {
-            page.append('<pre>').append(htmlEsc(rollback.toString())).append('</pre>')
+    page.append(results)
+    if (!apply && EMIT_VERSION_MAP && !findings.isEmpty()) {
+        StringBuilder vmap = new StringBuilder()
+        int vmapCount = 0
+        vmap.append('VERSION_MAP_OVERRIDE = [\n')
+        for (PageFinding pf : findings) {
+            for (VersionFinding vf : pf.versions) {
+                vmap.append("    '").append(pf.pageId).append(':').append(vf.contentId)
+                    .append(':v').append(vf.versionNumber)
+                if (vf.isCurrent) vmap.append('(current)')
+                vmap.append("',\n")
+                vmapCount++
+            }
+        }
+        vmap.append(']\n')
+        page.append('<h3>Affected versions mapping (').append(plural(vmapCount, 'version'))
+            .append(' across ').append(plural(findings.size(), 'page')).append(')</h3>')
+            .append('<p style="font-size:90%">Paste over the VERSION_MAP_OVERRIDE field for the APPLY run ')
+            .append('of this same scope and Migrations list - Stage-1 then loads only these versions ')
+            .append('instead of walking full page histories. The :vN tail is the version number as shown ')
+            .append('in the Confluence UI (metadata - ignored on paste-back). ')
+            .append('Click inside, <b>Ctrl+A</b>, <b>Ctrl+C</b>.</p>')
+            .append('<textarea readonly rows="14" style="width:100%;font-family:monospace;font-size:85%;')
+            .append('white-space:pre;resize:vertical">')
+            .append(htmlEsc(vmap.toString()))
+            .append('</textarea>')
+    }
+    if (traceOut.length() > 0) {
+        page.append(bulkBox('Trace (' + plural(notes.size(), 'note') + ')',
+                traceOut.toString(), TRACE_MAX_HEIGHT_PX))
+    }
+    if (rollbackPlain.length() > 0 || rollbackComp.length() > 0) {
+        page.append('<p><b>Rollback copies (').append(rollbackEmitted).append(' total).</b> ')
+            .append('Console output is not a backup - take a database backup before bulk runs. ')
+            .append('These are for surgical single-version restores. Sections are split by the ')
+            .append('form of the BEFORE body.</p>')
+        if (rollbackPlain.length() > 0) {
+            page.append(bulkBox('Rollback copies - plain (' + rollbackPlainCount + ')',
+                    rollbackPlain.toString(), ROLLBACK_MAX_HEIGHT_PX))
+        }
+        if (rollbackComp.length() > 0) {
+            page.append(bulkBox('Rollback copies - compressed (' + rollbackCompCount + ')',
+                    rollbackComp.toString(), ROLLBACK_MAX_HEIGHT_PX))
         }
     }
     return page.toString()
@@ -2939,5 +3201,17 @@ try {
         cause = cause.getCause()
     }
     err.append('\nFull stack trace is in atlassian-confluence.log\n')
-    return results.toString() + '<pre>' + htmlEsc(err.toString()) + '</pre>'
+    StringBuilder tail = new StringBuilder()
+    tail.append(results).append('<pre>').append(htmlEsc(err.toString())).append('</pre>')
+    // rollback copies collected before the crash are the record of what was
+    // already written - on a terminated APPLY they matter more, not less
+    if (rollbackPlain.length() > 0) {
+        tail.append(bulkBox('Rollback copies - plain (' + rollbackPlainCount + ', PARTIAL)',
+                rollbackPlain.toString(), ROLLBACK_MAX_HEIGHT_PX))
+    }
+    if (rollbackComp.length() > 0) {
+        tail.append(bulkBox('Rollback copies - compressed (' + rollbackCompCount + ', PARTIAL)',
+                rollbackComp.toString(), ROLLBACK_MAX_HEIGHT_PX))
+    }
+    return tail.toString()
 }
