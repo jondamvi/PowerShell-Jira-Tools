@@ -365,6 +365,32 @@ enum ReplacementStatus {
 //                       allowed values are constrained inside the macro body.
 //        valueRange     optional, [from, to] integers expanded to a list, e.g.
 //                       [0, 10]. Shorthand for values.
+//        aliases        optional, historical spelling -> today's canonical value.
+//                       For values RENAMED in the macro mid-life: pages saved
+//                       while the old spelling was live still carry it in
+//                       storage, and without a mapping those occurrences fail
+//                       as unknown values. Example - the process-status macro
+//                       once shipped the option "UnterVeranderung", later
+//                       corrected to "Unter Veranderung"; pages from that era
+//                       still say "UnterVeranderung":
+//
+//                           source: [name: 'process-status',
+//                                    type: MacroType.UserMacro,
+//                                    sourceParam: 'status',
+//                                    aliases: ['UnterVeranderung': 'Unter Veranderung']],
+//
+//                       The alias resolves BEFORE the option lookup, and the
+//                       TARGET macro is written with the canonical value - the
+//                       migration also heals the stale spelling on the page.
+//                       Every hit is logged in the trace (TRACE_MAPPING) as
+//                       alias: "old" -> "new". Stage-0 rejects an alias whose
+//                       canonical side is not a known option value, and an
+//                       alias whose OLD side is itself a legitimate value
+//                       (that would silently rewrite valid data). Alias only
+//                       spellings you can attribute to the macro's edit
+//                       history - do not add fuzzy/normalizing aliases; an
+//                       unknown value failing loudly is the tool telling you
+//                       a human needs to look.
 //    EddStatusMacro target
 //        setId, setName, options: [ '<source enum value>': '<option-id>', ... ]
 //    Static_QualificationTable target
@@ -444,6 +470,17 @@ class MigrationDef {
     Map<String, String> staticParams = new LinkedHashMap<String, String>()
     Map<String, String> paramDefaults= new LinkedHashMap<String, String>()
     boolean unwrapParagraph, dropUnmapped = true
+    /*
+     * Historical spellings of source values -> today's canonical value.
+     * For values that were RENAMED in the user macro mid-life: pages saved
+     * while the old spelling was live still carry it in storage, and without
+     * a mapping those occurrences fail as unknown values. Declared on the
+     * source block:  aliases: ['UnterVeranderung': 'Unter Veranderung']
+     * The alias is resolved BEFORE the option lookup, and the TARGET macro is
+     * written with the canonical value - so migration also heals the stale
+     * spelling on the page.
+     */
+    Map<String, String> valueAliases = new LinkedHashMap<String, String>()
     // filled by Stage-0
     List<String> sourceEnumValues = new ArrayList<String>()
     // set from config when the macro declares no enumValues because its allowed
@@ -1026,6 +1063,12 @@ MigrationDef toMigration(Map<String, Object> cfg) {
             for (int i = from; i <= to; i++) m.sourceValuesOverride.add(i as String)
         }
 
+        if (src.get('aliases') != null) {
+            for (Map.Entry<Object, Object> ae : ((Map<Object, Object>) src.get('aliases')).entrySet()) {
+                m.valueAliases.put(ae.getKey() as String, ae.getValue() as String)
+            }
+        }
+
         m.unwrapParagraph = cfg.get('unwrapParagraph') == null ? false : (Boolean) cfg.get('unwrapParagraph')
         if (tgt.get('dropUnmapped') != null) m.dropUnmapped = (Boolean) tgt.get('dropUnmapped')
         return m
@@ -1108,6 +1151,19 @@ List<ValidationIssue> validateMigration(MigrationDef m, StringBuilder detail) {
 
         // Explicit config wins: a parameter can be constrained inside the macro
         // body rather than in its @param line, where introspection cannot see it.
+        for (Map.Entry<String, String> ae : m.valueAliases.entrySet()) {
+            if (!m.options.containsKey(ae.getValue())) {
+                issues.add(issue(m.id, m.sourceName, m.targetName,
+                        'alias "' + ae.getKey() + '" points at "' + ae.getValue() +
+                        '", which is not a known option value of set "' + m.setName +
+                        '". Known: ' + m.options.keySet()))
+            }
+            if (m.options.containsKey(ae.getKey())) {
+                issues.add(issue(m.id, m.sourceName, m.targetName,
+                        'alias key "' + ae.getKey() + '" is ITSELF a known option value - ' +
+                        'an alias would silently rewrite a legitimate value; remove one of the two'))
+            }
+        }
         if (!m.sourceValuesOverride.isEmpty()) {
             m.sourceEnumValues = new ArrayList<String>(m.sourceValuesOverride)
             detail.append('  ').append(m.id).append(': source values taken from config (')
@@ -1676,21 +1732,30 @@ String replaceEddStatus(MigrationDef mig, MatchedMacro mm, List<String> notes) {
                     '" is absent from the page and has no declared default; parsed from this macro: ' +
                     describeParams(mm.params))
         }
-        String optionId = mig.options.get(srcVal)
+        // stale spellings first: pages saved before a value was renamed in the
+        // macro still carry the old text - map it to today's canonical value
+        String canonVal = srcVal
+        if (mig.valueAliases.containsKey(srcVal)) {
+            canonVal = mig.valueAliases.get(srcVal)
+            notes.add('alias: "' + srcVal + '" -> "' + canonVal + '" (' + mig.id + ')')
+        }
+        String optionId = mig.options.get(canonVal)
         if (optionId == null) {
-            throw new IllegalStateException('value ' + (srcVal.isEmpty() ? '(empty)' : '"' + srcVal + '"') +
-                    ' has no option-id in set "' + mig.setName + '". Known values: ' + mig.options.keySet())
+            throw new IllegalStateException('value ' + (canonVal.isEmpty() ? '(empty)' : '"' + canonVal + '"') +
+                    (canonVal == srcVal ? '' : ' (via alias from "' + srcVal + '")') +
+                    ' has no option-id in set "' + mig.setName + '". Known values: ' + mig.options.keySet() +
+                    '. Aliases checked: ' + mig.valueAliases.keySet())
         }
         Map<String, String> out = new LinkedHashMap<String, String>()
         out.putAll(mig.staticParams)
         out.put('set-id', mig.setId)
-        out.put('current-option-value', srcVal)
+        out.put('current-option-value', canonVal)
         out.put('option-id', optionId)
         String macroId = UUID.randomUUID().toString()
         // the matched key IS the target option name, so showing it in braces
         // makes a wrong or renamed mapping visible at a glance
         String optionName = null
-        for (String k : mig.options.keySet()) { if (k == srcVal) optionName = k }
+        for (String k : mig.options.keySet()) { if (k == canonVal) optionName = k }
         /*
          * Source enum values are stored as their text, so the value needs no
          * lookup to be readable. A required parameter ABSENT from page storage
