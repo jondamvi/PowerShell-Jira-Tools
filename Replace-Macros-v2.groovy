@@ -36,6 +36,7 @@
  * =============================================================================
  */
 
+import com.atlassian.confluence.core.ContentEntityManager
 import com.atlassian.confluence.core.ContentEntityObject
 import com.atlassian.confluence.core.DefaultSaveContext
 import com.atlassian.confluence.core.Modification
@@ -2073,7 +2074,20 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
         Date keep = hist.getLastModificationDate()
         hist.setBodyAsString(newBody)
         hist.setLastModificationDate(keep)
-        pm.saveContentEntity(hist, new DefaultSaveContext(true, false, HISTORICAL_SUPPRESS_EVENTS))
+        /*
+         * Saved through the BASE ContentEntityManager, not PageManager.
+         * PageManager.saveContentEntity() runs CURRENT-page validations on
+         * whatever it is given; on a historical row those are wrong twice
+         * over - with NULL space the validation chain NPEs (the v1 crashes),
+         * and with the space hydrated it proceeds to the duplicate-title
+         * check and rejects the row because its old title exists on a live
+         * page ("A page already exists with the title..."). History is not a
+         * page being created; the base manager persists the entity without
+         * page-level validation, events still suppressed via the SaveContext.
+         */
+        ContentEntityManager cem =
+                (ContentEntityManager) ContainerManager.getComponent('contentEntityManager')
+        cem.saveContentEntity(hist, new DefaultSaveContext(true, false, HISTORICAL_SUPPRESS_EVENTS))
     } catch (Exception e) {
         throw new RuntimeException('writeHistoricalVersion failed: ' + e.getMessage(), e)
     }
@@ -2843,7 +2857,7 @@ try {
 
                 if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
                     throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
-                            ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retr(y/ies): ' +
+                            ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retries: ' +
                             werr, lastWriteEx)
                 }
                 if (werr != null) {
