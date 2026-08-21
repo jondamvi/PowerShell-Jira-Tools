@@ -41,6 +41,8 @@ import com.atlassian.confluence.core.ContentEntityObject
 import com.atlassian.confluence.core.DefaultSaveContext
 import com.atlassian.confluence.core.Modification
 import com.atlassian.confluence.core.VersionHistorySummary
+import com.atlassian.confluence.core.SpaceContentEntityObject
+import com.atlassian.confluence.pages.AbstractPage
 import com.atlassian.confluence.pages.Page
 import com.atlassian.confluence.pages.PageManager
 import com.atlassian.confluence.setup.settings.SettingsManager
@@ -1096,11 +1098,11 @@ List<ValidationIssue> validateScope(SpaceManager spaceManager, PageManager pageM
             }
         }
         for (Long pid : PAGE_IDS_OVERRIDE) {
-            Page p = pageManager.getPage(pid.longValue())
+            AbstractPage p = pageManager.getAbstractPage(pid.longValue())
             ValidationIssue i = new ValidationIssue()
             i.migrationId = '(scope)'; i.sourceLabel = pid as String; i.targetLabel = ''
             if (p == null) {
-                i.description = 'PAGE_IDS_OVERRIDE names a page id that does not exist'
+                i.description = 'PAGE_IDS_OVERRIDE names an id that is neither a page nor a blog post'
                 issues.add(i)
             } else if (p.getOriginalVersionId() != null) {
                 i.description = 'PAGE_IDS_OVERRIDE names a HISTORICAL version id; pass the current page id'
@@ -1666,7 +1668,7 @@ List<MatchedMacro> scanBody(String body, Map<String, MigrationDef> bySource) {
 }
 
 /** Version content ids of a page: current first, then history when enabled. */
-List<Long> versionContentIds(PageManager pageManager, Page page) {
+List<Long> versionContentIds(PageManager pageManager, AbstractPage page) {
     try {
         List<Long> ids = new ArrayList<Long>()
         ids.add(page.getId())
@@ -2102,12 +2104,12 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
     }
 }
 
-void writeCurrentVersion(PageManager pm, Page page, String newBody) {
+void writeCurrentVersion(PageManager pm, AbstractPage page, String newBody) {
     try {
         if (CURRENT_CREATES_NEW_VERSION) {
             final String b = newBody
-            Modification<Page> mod = new Modification<Page>() {
-                @Override void modify(Page target) { target.setBodyAsString(b) }
+            Modification<AbstractPage> mod = new Modification<AbstractPage>() {
+                @Override void modify(AbstractPage target) { target.setBodyAsString(b) }
             }
             pm.saveNewVersion(page, mod, new DefaultSaveContext(true, false, false))
         } else {
@@ -2131,10 +2133,10 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
          * itself would have written - quietly repairing the inconsistency on
          * every version this migration touches anyway.
          */
-        if (hist instanceof Page && ((Page) hist).getSpace() == null) {
-            Page cur = pm.getPage(currentPageId)
+        if (hist instanceof SpaceContentEntityObject && ((SpaceContentEntityObject) hist).getSpace() == null) {
+            AbstractPage cur = pm.getAbstractPage(currentPageId)
             Space owner = (cur == null) ? null : cur.getSpace()
-            if (owner != null) ((Page) hist).setSpace(owner)
+            if (owner != null) ((SpaceContentEntityObject) hist).setSpace(owner)
         }
         Date keep = hist.getLastModificationDate()
         hist.setBodyAsString(newBody)
@@ -2705,8 +2707,11 @@ try {
     List<PageFinding> findings = new ArrayList<PageFinding>()
     int batchCount = 0, pagesDone = 0
     for (Long pid : scope) {
-        Page page = pageManager.getPage(pid.longValue())
-        if (page == null) { RUN_LOG.add('page ' + pid + ' not found during scan'); continue }
+        // getAbstractPage, not getPage: discovery scope includes BLOGPOST rows
+        // on purpose, and getPage() returns null for a blog post id - which
+        // silently dropped affected blog posts from INSPECT and APPLY
+        AbstractPage page = pageManager.getAbstractPage(pid.longValue())
+        if (page == null) { RUN_LOG.add('page ' + pid + ' not found during scan (not a page or blog post)'); continue }
         if (page.getOriginalVersionId() != null) { RUN_LOG.add('page ' + pid + ' is a historical id; skipped'); continue }
 
         PageFinding pf = new PageFinding()
@@ -2825,7 +2830,7 @@ try {
         }
         for (VersionFinding vf : pf.versions) {
             try {
-                ContentEntityObject ceo = pageManager.getPage(vf.contentId)
+                ContentEntityObject ceo = pageManager.getAbstractPage(vf.contentId)
                 if (ceo == null) {
                     vf.status = ReplacementStatus.Failed
                     vf.message = 'version disappeared before execution'
@@ -2888,11 +2893,11 @@ try {
                 while (true) {
                     try {
                         if (vf.isCurrent) {
-                            Page target = pageManager.getPage(pf.pageId)
+                            AbstractPage target = pageManager.getAbstractPage(pf.pageId)
                             if (target == null) { werr = 'page disappeared before write'; break }
                             writeCurrentVersion(pageManager, target, bodyToWrite)
                         } else {
-                            ContentEntityObject target = pageManager.getPage(vf.contentId)
+                            ContentEntityObject target = pageManager.getAbstractPage(vf.contentId)
                             if (target == null) { werr = 'version disappeared before write'; break }
                             writeHistoricalVersion(pageManager, target, bodyToWrite, pf.pageId)
                         }
@@ -2909,7 +2914,7 @@ try {
                             werr = we.getClass().getSimpleName() + ': ' + msg
                             break
                         }
-                        ContentEntityObject reread = pageManager.getPage(vf.contentId)
+                        ContentEntityObject reread = pageManager.getAbstractPage(vf.contentId)
                         if (reread == null) { werr = 'version disappeared during retry'; break }
                         bodyToWrite = applyToBody(reread.getBodyAsString(), vf, byId, bySource, notes)
                     }
@@ -2938,7 +2943,7 @@ try {
                     }
                 } else if (VERIFY_AFTER_WRITE) {
                     long verifyT0 = System.currentTimeMillis()
-                    ContentEntityObject check = pageManager.getPage(vf.contentId)
+                    ContentEntityObject check = pageManager.getAbstractPage(vf.contentId)
                     String freshBody = check == null ? '' : check.getBodyAsString()
                     long verifyT1 = System.currentTimeMillis()
                     verifyMsTotal += (verifyT1 - verifyT0)
