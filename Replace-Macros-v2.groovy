@@ -48,6 +48,11 @@ import com.atlassian.confluence.pages.PageManager
 import com.atlassian.confluence.setup.settings.SettingsManager
 import com.atlassian.confluence.spaces.Space
 import com.atlassian.confluence.spaces.SpaceManager
+import com.atlassian.confluence.api.model.Expansion
+import com.atlassian.confluence.api.model.content.Content
+import com.atlassian.confluence.api.model.content.ContentStatus
+import com.atlassian.confluence.api.model.content.id.ContentId
+import com.atlassian.confluence.api.service.content.ContentService
 import com.atlassian.sal.api.component.ComponentLocator
 import com.atlassian.spring.container.ContainerManager
 import com.onresolve.scriptrunner.db.DatabaseUtil
@@ -234,6 +239,18 @@ enum ReplacementStatus {
 @Field boolean HISTORICAL_SUPPRESS_EVENTS = true
 
 @Field boolean VERIFY_AFTER_WRITE = true
+/*
+ * When a CURRENT-version write is refused with "unreconciled page"
+ * (ExternalChangesException), the page carries a stale collaborative-editing
+ * shared draft. true = discard that draft programmatically (the exact
+ * equivalent of opening the editor and clicking Discard) and retry the write
+ * once. DANGEROUS ON PRODUCTION: discarding destroys whoever's unpublished
+ * edits irrecoverably - on a live instance leave this false, review the
+ * FAILED list, and resolve drafts with their owners. On a test copy the
+ * drafts are snapshot artifacts and this is the sane setting.
+ */
+@Field boolean FORCE_DISCARD_STALE_DRAFTS = false
+
 @Field int WRITE_RETRIES = 2
 
 // SKIP -> an occurrence that cannot be resolved is left in place and reported
@@ -2161,15 +2178,51 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
 }
 
 /*
- * The ONLY error class that does not terminate the run.
+ * Error classes that do NOT terminate the run - the version is recorded as
+ * failed and the run continues. Every other exception is unexpected and
+ * terminates immediately: discovering a systematic fault on the last
+ * iteration of a long run is worse than failing on the first.
  *
- * Some page versions have no space row, and Confluence's own save path
- * dereferences the space, so the NPE comes from inside the product rather than
- * from this script. That version is recorded as failed and the run continues.
- * Every other exception is unexpected and terminates immediately - discovering
- * a systematic fault on the last iteration of a long run is worse than failing
- * on the first.
+ * 1. Space-dereference NPE: some page versions have no space row, and
+ *    Confluence's own save path dereferences the space - the NPE comes from
+ *    inside the product, not from this script.
+ * 2. ExternalChangesException ("unreconciled page"): the collaborative-editing
+ *    guard. The page has a Synchrony shared draft that was never published or
+ *    discarded (common on production copies), and Confluence refuses
+ *    programmatic saves to its CURRENT version until the draft is resolved -
+ *    deliberately, so a script cannot clobber someone's in-flight edit.
+ *    Retries cannot fix it (the draft persists); the remedy is human: open
+ *    the page in the editor, publish or discard the draft, re-run - the page
+ *    no-ops back into scope. Detected by class name/message, not import, so
+ *    the script compiles on versions where the class moved packages.
  */
+/**
+ * Discards the shared (collaborative-editing) draft of a page - unified
+ * drafts share the page's content id under DRAFT status, so this is the
+ * public-API equivalent of REST DELETE /rest/api/content/{id}?status=draft,
+ * i.e. of the editor's Discard button. Returns true if a draft existed and
+ * was removed.
+ */
+boolean discardSharedDraft(long pageId, List<String> notes) {
+    try {
+        ContentService cs = ComponentLocator.getComponent(ContentService)
+        Optional<Content> draft = cs.find(new Expansion[0])
+                .withId(ContentId.of(pageId))
+                .withStatus(ContentStatus.DRAFT)
+                .fetch()
+        if (!draft.isPresent()) {
+            notes.add('page ' + pageId + ': unreconciled but no DRAFT-status content found - not forcing')
+            return false
+        }
+        cs.delete(draft.get())
+        notes.add('page ' + pageId + ': stale shared draft DISCARDED (FORCE_DISCARD_STALE_DRAFTS)')
+        return true
+    } catch (Exception e) {
+        notes.add('page ' + pageId + ': draft discard failed: ' + e.getMessage())
+        return false
+    }
+}
+
 boolean isTolerableError(Throwable t) {
     Throwable c = t
     while (c != null) {
@@ -2177,9 +2230,27 @@ boolean isTolerableError(Throwable t) {
             String m = c.getMessage() == null ? '' : c.getMessage()
             if (m.contains('confluence.spaces.Space') || m.contains('getSpace()')) return true
         }
+        String cls = c.getClass().getName()
+        String msg = c.getMessage() == null ? '' : c.getMessage()
+        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) return true
         c = c.getCause()
     }
     return false
+}
+
+/** Actionable failure text for the unreconciled-page case. */
+String tolerableErrorHint(Throwable t) {
+    Throwable c = t
+    while (c != null) {
+        String cls = c.getClass().getName()
+        String msg = c.getMessage() == null ? '' : c.getMessage()
+        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) {
+            return ' [stale collaborative-editing draft: open the page in the editor, ' +
+                   'publish or discard the draft, then re-run - the page re-enters scope by itself]'
+        }
+        c = c.getCause()
+    }
+    return ''
 }
 
 /*
@@ -2888,6 +2959,7 @@ try {
                 String werr = null
                 Exception lastWriteEx = null
                 int attempt = 0
+                boolean draftDiscardTried = false
                 String bodyToWrite = after
                 long writeT0 = System.currentTimeMillis()
                 while (true) {
@@ -2907,6 +2979,13 @@ try {
                         lastWriteEx = we
                         String cn = we.getClass().getName()
                         String msg = we.getMessage() == null ? '' : we.getMessage()
+                        // unreconciled current version + explicit consent = discard the
+                        // stale shared draft (once) and retry the same write
+                        if (FORCE_DISCARD_STALE_DRAFTS && vf.isCurrent && !draftDiscardTried
+                                && (cn.contains('ExternalChangesException') || msg.contains('unreconciled'))) {
+                            draftDiscardTried = true
+                            if (discardSharedDraft(pf.pageId, notes)) continue
+                        }
                         boolean stale = cn.contains('OptimisticLocking') || cn.contains('StaleObject') ||
                                         msg.contains('unexpected row count')
                         attempt++
@@ -2932,7 +3011,7 @@ try {
                 }
                 if (werr != null) {
                     vf.status = ReplacementStatus.Failed
-                    vf.message = werr
+                    vf.message = werr + (lastWriteEx == null ? '' : tolerableErrorHint(lastWriteEx))
                     for (MatchedMacro mm : vf.matchedMacros) {
                         if (mm.status == ReplacementStatus.Success) {
                             mm.status = ReplacementStatus.Failed
