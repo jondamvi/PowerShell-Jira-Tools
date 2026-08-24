@@ -2175,11 +2175,11 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
  *    discarded (common on production copies), and Confluence refuses
  *    programmatic saves to its CURRENT version until the draft is resolved -
  *    deliberately, so a script cannot clobber someone's in-flight edit.
- *    Retries cannot fix it (the draft persists). POLICY: drafts are never
- *    touched by this migration - such pages are reported as Failed with the
- *    reason in the Details column and the run continues. Detected by class
- *    name/message, not import, so the script compiles on versions where the
- *    class moved packages.
+ *    Normally classified as SKIPPED before this function is consulted (the
+ *    retry loop detects it on first catch); kept here as a backstop so the
+ *    same guard surfacing anywhere else can never terminate a run. Detected
+ *    by class name/message, not import, so the script compiles on versions
+ *    where the class moved packages.
  */
 boolean isTolerableError(Throwable t) {
     Throwable c = t
@@ -2194,22 +2194,6 @@ boolean isTolerableError(Throwable t) {
         c = c.getCause()
     }
     return false
-}
-
-/** Actionable failure text for the unreconciled-page case. */
-String tolerableErrorHint(Throwable t) {
-    Throwable c = t
-    while (c != null) {
-        String cls = c.getClass().getName()
-        String msg = c.getMessage() == null ? '' : c.getMessage()
-        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) {
-            return ' [page has an unresolved collaborative-editing draft; by policy drafts ' +
-                   'are never touched, so this current version was left as is - it stays in ' +
-                   'scope and no-ops into place if the draft is ever resolved and the scope re-run]'
-        }
-        c = c.getCause()
-    }
-    return ''
 }
 
 /*
@@ -2918,6 +2902,7 @@ try {
                 String werr = null
                 Exception lastWriteEx = null
                 int attempt = 0
+                boolean pageLocked = false
                 String bodyToWrite = after
                 long writeT0 = System.currentTimeMillis()
                 while (true) {
@@ -2937,6 +2922,14 @@ try {
                         lastWriteEx = we
                         String cn = we.getClass().getName()
                         String msg = we.getMessage() == null ? '' : we.getMessage()
+                        // EXPECTED state, not a failure: the collaborative-editing
+                        // guard refuses writes while unpublished in-editor changes
+                        // exist. The exception IS Confluence's detector for this
+                        // state; classify immediately, no retry can change it.
+                        if (cn.contains('ExternalChangesException') || msg.contains('unreconciled')) {
+                            pageLocked = true
+                            break
+                        }
                         boolean stale = cn.contains('OptimisticLocking') || cn.contains('StaleObject') ||
                                         msg.contains('unexpected row count')
                         attempt++
@@ -2955,18 +2948,31 @@ try {
                 writeMsTotal += (writeT1 - writeT0)
                 if (writeT1 - writeT0 > writeMsMax) writeMsMax = writeT1 - writeT0
 
-                if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
+                if (pageLocked) {
+                    String lockText = 'page locked from writing due to unpublished in-editor changes'
+                    vf.status = ReplacementStatus.Skipped
+                    vf.message = lockText
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        if (mm.status == ReplacementStatus.Success) {
+                            mm.status = ReplacementStatus.Skipped
+                            mm.message = lockText
+                            MigrationDef mdl = byId.get(mm.migrationId)
+                            if (mdl != null) { mdl.occReplaced--; mdl.occSkipped++ }
+                        }
+                    }
+                } else if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
                     throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
                             ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retries: ' +
                             werr, lastWriteEx)
                 }
                 if (werr != null) {
                     vf.status = ReplacementStatus.Failed
-                    vf.message = werr + (lastWriteEx == null ? '' : tolerableErrorHint(lastWriteEx))
+                    String failText = werr
+                    vf.message = failText
                     for (MatchedMacro mm : vf.matchedMacros) {
                         if (mm.status == ReplacementStatus.Success) {
                             mm.status = ReplacementStatus.Failed
-                            mm.message = werr
+                            mm.message = failText
                             MigrationDef md = byId.get(mm.migrationId)
                             if (md != null) { md.occReplaced--; md.occFailed++ }
                         }
