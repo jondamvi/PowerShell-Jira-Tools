@@ -2105,6 +2105,21 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
     }
 }
 
+/** Flip this version's still-Success macros to the given status, adjusting counters. */
+void markMacros(VersionFinding vf, ReplacementStatus st, String text, Map<String, MigrationDef> byId) {
+    for (MatchedMacro mm : vf.matchedMacros) {
+        if (mm.status == ReplacementStatus.Success) {
+            mm.status = st
+            mm.message = text
+            MigrationDef md = byId.get(mm.migrationId)
+            if (md != null) {
+                md.occReplaced--
+                if (st == ReplacementStatus.Failed) md.occFailed++ else md.occSkipped++
+            }
+        }
+    }
+}
+
 void writeCurrentVersion(PageManager pm, AbstractPage page, String newBody) {
     try {
         if (CURRENT_CREATES_NEW_VERSION) {
@@ -2887,10 +2902,7 @@ try {
                         lastWriteEx = we
                         String cn = we.getClass().getName()
                         String msg = we.getMessage() == null ? '' : we.getMessage()
-                        // EXPECTED state, not a failure: the collaborative-editing
-                        // guard refuses writes while unpublished in-editor changes
-                        // exist. The exception IS Confluence's detector for this
-                        // state; classify immediately, no retry can change it.
+                        // collab-editing guard = expected lock, not a failure; no retry helps
                         if (cn.contains('ExternalChangesException') || msg.contains('unreconciled')) {
                             pageLocked = true
                             break
@@ -2914,33 +2926,15 @@ try {
                 if (writeT1 - writeT0 > writeMsMax) writeMsMax = writeT1 - writeT0
 
                 if (pageLocked) {
-                    String lockText = 'page locked from writing due to unpublished in-editor changes'
+                    // expected state, not a failure - see markMacros/catch comments
                     vf.status = ReplacementStatus.Skipped
-                    vf.message = lockText
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        if (mm.status == ReplacementStatus.Success) {
-                            mm.status = ReplacementStatus.Skipped
-                            mm.message = lockText
-                            MigrationDef mdl = byId.get(mm.migrationId)
-                            if (mdl != null) { mdl.occReplaced--; mdl.occSkipped++ }
-                        }
-                    }
+                    vf.message = 'page locked from writing due to unpublished in-editor changes'
+                    markMacros(vf, ReplacementStatus.Skipped, vf.message, byId)
                 } else if (werr != null) {
-                    // FAILED, by definition: an unexpected exception, or the write
-                    // did not complete. Recorded on the row, run continues - a
-                    // write problem on one version never costs the rest of the
-                    // window its replacements.
+                    // unexpected exception or incomplete write = Failed row, run continues
                     vf.status = ReplacementStatus.Failed
-                    String failText = werr
-                    vf.message = failText
-                    for (MatchedMacro mm : vf.matchedMacros) {
-                        if (mm.status == ReplacementStatus.Success) {
-                            mm.status = ReplacementStatus.Failed
-                            mm.message = failText
-                            MigrationDef md = byId.get(mm.migrationId)
-                            if (md != null) { md.occReplaced--; md.occFailed++ }
-                        }
-                    }
+                    vf.message = werr
+                    markMacros(vf, ReplacementStatus.Failed, werr, byId)
                 } else if (VERIFY_AFTER_WRITE) {
                     long verifyT0 = System.currentTimeMillis()
                     ContentEntityObject check = pageManager.getAbstractPage(vf.contentId)
@@ -2968,21 +2962,11 @@ try {
                 }
                 vf.bodyBefore = before; vf.bodyAfter = after
             } catch (Exception ve) {
-                // FAILED, by definition: an unexpected exception while processing
-                // this version. Recorded on the row with the exception as the
-                // reason; the run continues - one broken version never costs the
-                // rest of the window its replacements.
+                // unexpected exception = Failed row, run continues
                 vf.status = ReplacementStatus.Failed
                 vf.message = ve.getClass().getSimpleName() + ': ' + ve.getMessage()
                 RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' FAILED - ' + vf.message)
-                for (MatchedMacro mm : vf.matchedMacros) {
-                    if (mm.status == ReplacementStatus.Success) {
-                        mm.status = ReplacementStatus.Failed
-                        mm.message = vf.message
-                        MigrationDef mdx = byId.get(mm.migrationId)
-                        if (mdx != null) { mdx.occReplaced--; mdx.occFailed++ }
-                    }
-                }
+                markMacros(vf, ReplacementStatus.Failed, vf.message, byId)
             } finally {
             /*
              * finally, not straight-line code: the block above exits early with
