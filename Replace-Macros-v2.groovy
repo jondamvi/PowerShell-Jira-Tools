@@ -2162,41 +2162,6 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
 }
 
 /*
- * Error classes that do NOT terminate the run - the version is recorded as
- * failed and the run continues. Every other exception is unexpected and
- * terminates immediately: discovering a systematic fault on the last
- * iteration of a long run is worse than failing on the first.
- *
- * 1. Space-dereference NPE: some page versions have no space row, and
- *    Confluence's own save path dereferences the space - the NPE comes from
- *    inside the product, not from this script.
- * 2. ExternalChangesException ("unreconciled page"): the collaborative-editing
- *    guard. The page has a Synchrony shared draft that was never published or
- *    discarded (common on production copies), and Confluence refuses
- *    programmatic saves to its CURRENT version until the draft is resolved -
- *    deliberately, so a script cannot clobber someone's in-flight edit.
- *    Normally classified as SKIPPED before this function is consulted (the
- *    retry loop detects it on first catch); kept here as a backstop so the
- *    same guard surfacing anywhere else can never terminate a run. Detected
- *    by class name/message, not import, so the script compiles on versions
- *    where the class moved packages.
- */
-boolean isTolerableError(Throwable t) {
-    Throwable c = t
-    while (c != null) {
-        if (c instanceof NullPointerException) {
-            String m = c.getMessage() == null ? '' : c.getMessage()
-            if (m.contains('confluence.spaces.Space') || m.contains('getSpace()')) return true
-        }
-        String cls = c.getClass().getName()
-        String msg = c.getMessage() == null ? '' : c.getMessage()
-        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) return true
-        c = c.getCause()
-    }
-    return false
-}
-
-/*
  * COLUMNS ARE DEFINED ONCE, HERE.
  *
  * TABLE and CSV previously each carried their own hand-written column list, so
@@ -2960,12 +2925,11 @@ try {
                             if (mdl != null) { mdl.occReplaced--; mdl.occSkipped++ }
                         }
                     }
-                } else if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
-                    throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
-                            ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retries: ' +
-                            werr, lastWriteEx)
-                }
-                if (werr != null) {
+                } else if (werr != null) {
+                    // FAILED, by definition: an unexpected exception, or the write
+                    // did not complete. Recorded on the row, run continues - a
+                    // write problem on one version never costs the rest of the
+                    // window its replacements.
                     vf.status = ReplacementStatus.Failed
                     String failText = werr
                     vf.message = failText
@@ -3004,13 +2968,21 @@ try {
                 }
                 vf.bodyBefore = before; vf.bodyAfter = after
             } catch (Exception ve) {
-                if (!isTolerableError(ve)) {
-                    throw new RuntimeException('page ' + pf.pageId + ' (' + pf.url + ') v' +
-                            vf.versionNumber + ' contentid ' + vf.contentId + ': ' + ve.getMessage(), ve)
-                }
+                // FAILED, by definition: an unexpected exception while processing
+                // this version. Recorded on the row with the exception as the
+                // reason; the run continues - one broken version never costs the
+                // rest of the window its replacements.
                 vf.status = ReplacementStatus.Failed
-                vf.message = 'no space on this version (tolerated): ' + ve.getMessage()
-                RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' - ' + vf.message)
+                vf.message = ve.getClass().getSimpleName() + ': ' + ve.getMessage()
+                RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' FAILED - ' + vf.message)
+                for (MatchedMacro mm : vf.matchedMacros) {
+                    if (mm.status == ReplacementStatus.Success) {
+                        mm.status = ReplacementStatus.Failed
+                        mm.message = vf.message
+                        MigrationDef mdx = byId.get(mm.migrationId)
+                        if (mdx != null) { mdx.occReplaced--; mdx.occFailed++ }
+                    }
+                }
             } finally {
             /*
              * finally, not straight-line code: the block above exits early with
