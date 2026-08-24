@@ -48,7 +48,6 @@ import com.atlassian.confluence.pages.PageManager
 import com.atlassian.confluence.setup.settings.SettingsManager
 import com.atlassian.confluence.spaces.Space
 import com.atlassian.confluence.spaces.SpaceManager
-import com.atlassian.confluence.api.model.Expansion
 import com.atlassian.confluence.api.model.content.Content
 import com.atlassian.confluence.api.model.content.ContentStatus
 import com.atlassian.confluence.api.model.content.id.ContentId
@@ -2206,9 +2205,13 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
 boolean discardSharedDraft(long pageId, List<String> notes) {
     try {
         ContentService cs = ComponentLocator.getComponent(ContentService)
-        Optional<Content> draft = cs.find(new Expansion[0])
-                .withId(ContentId.of(pageId))
+        // order matters for the finder's type chain: withStatus() lives on
+        // ContentFinder, withId() narrows it to a single-content fetcher -
+        // reversed, the chain loses its type and neither checker nor runtime
+        // can resolve fetch()
+        Optional<Content> draft = cs.find()
                 .withStatus(ContentStatus.DRAFT)
+                .withId(ContentId.of(pageId))
                 .fetch()
         if (!draft.isPresent()) {
             notes.add('page ' + pageId + ': unreconciled but no DRAFT-status content found - not forcing')
