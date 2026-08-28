@@ -99,6 +99,38 @@ try {
                       WHEN c.content_status = 'draft' THEN 1 ELSE 2 END,
                  c.contentid
     '''
+    /*
+     * Section 2: LOCKED pages - current pages holding an unpublished shared
+     * (collaborative-editing) draft, the state that rejects writeCurrentVersion
+     * with "unreconciled page". Detection: a draft-status row carrying the
+     * SAME title in the SAME space as a current page (shared drafts inherit
+     * the page title; the untitled draft groups are new-page drafts and
+     * correctly never match). Heuristic but checkable: the per-space locked
+     * count must reconcile with the APPLY run's locked-page failures
+     * (occurrences > pages when a page carries several macros).
+     */
+    String lockedQuery = '''
+        SELECT cur.title AS title,
+               cur.contentid AS pageid,
+               d.contentid AS draftid,
+               d.version AS version,
+               d.creationdate AS createdat,
+               COALESCE(um.username, d.creator) AS author
+        FROM content cur
+        JOIN spaces s ON s.spaceid = cur.spaceid
+        JOIN content d ON d.spaceid = cur.spaceid
+                      AND d.title = cur.title
+                      AND d.contenttype = 'PAGE'
+                      AND d.content_status = 'draft'
+                      AND d.prevver IS NULL
+        LEFT JOIN user_mapping um ON um.user_key = d.creator
+        WHERE s.spacekey = :sk
+          AND cur.contenttype = 'PAGE'
+          AND cur.prevver IS NULL
+          AND cur.content_status = 'current'
+          AND cur.title IS NOT NULL AND btrim(cur.title) <> ''
+        ORDER BY cur.title, d.contentid
+    '''
     String excludedQuery = '''
         SELECT COUNT(*) AS n
         FROM content c
@@ -109,8 +141,19 @@ try {
           AND (c.title IS NULL OR btrim(c.title) = '')
     '''
 
+    StringBuilder lockedTable = new StringBuilder()
+    lockedTable.append('<div style="max-height:').append(SCROLLBOX_MAX_HEIGHT_PX)
+         .append('px;overflow:auto;border:1px solid #ccc">')
+         .append('<table border="1" cellpadding="4" cellspacing="0" ')
+         .append('style="border-collapse:collapse;font-size:90%;white-space:nowrap">')
+         .append('<tr><th>Ref.Id</th><th>SpaceKey</th><th>Page Title</th><th>Page ID</th>')
+         .append('<th>ContentID</th><th>Version</th><th>Status</th><th>URL</th>')
+         .append('<th>CreatedAt</th><th>Author</th><th>Comments</th></tr>')
+    int totalLocked = 0
+
     for (String sk : SPACE_KEYS) {
         int refCounter = 0
+        int lockedCounter = 0
         int blocking = 0, contextRows = 0
         Map<String, Integer> currentPerTitle = new LinkedHashMap<String, Integer>()
         int excluded = 0
@@ -150,6 +193,27 @@ try {
             sql.eachRow(excludedQuery, [sk: sk]) { row ->
                 excluded = ((Number) row['n']).intValue()
             }
+            sql.eachRow(lockedQuery, [sk: sk]) { row ->
+                lockedCounter++
+                long pageId = ((Number) row['pageid']).longValue()
+                long draftId = ((Number) row['draftid']).longValue()
+                String createdAt = ''
+                Object ts = row['createdat']
+                if (ts instanceof java.util.Date) createdAt = fmt.format((java.util.Date) ts)
+                String url = baseUrl + '/pages/viewpage.action?pageId=' + pageId
+                lockedTable.append('<tr><td>').append(sk).append('-L').append(String.format('%03d', lockedCounter))
+                     .append('</td><td>').append(htmlEsc(sk))
+                     .append('</td><td>').append(htmlEsc(row['title']))
+                     .append('</td><td>').append(pageId)
+                     .append('</td><td>').append(draftId)
+                     .append('</td><td>').append(row['version'])
+                     .append('</td><td>Draft')
+                     .append('</td><td><a href="').append(url).append('" target="_blank">')
+                     .append(htmlEsc(url)).append('</a>')
+                     .append('</td><td>').append(createdAt)
+                     .append('</td><td>').append(htmlEsc(row['author']))
+                     .append('</td><td></td></tr>')
+            }
         }
 
         int groups = currentPerTitle.size()
@@ -160,17 +224,25 @@ try {
              .append('   blocking current pages: ').append(blocking)
              .append('   minimum retitles: ').append(retitles)
              .append('   context rows (drafts etc.): ').append(contextRows)
-             .append('   excluded empty/NULL-title rows: ').append(excluded).append('\n')
+             .append('   excluded empty/NULL-title rows: ').append(excluded)
+             .append('   LOCKED pages (unpublished drafts): ').append(lockedCounter).append('\n')
 
         totalGroups += groups; totalBlocking += blocking; totalRetitles += retitles
-        totalContext += contextRows; totalExcluded += excluded
+        totalContext += contextRows; totalExcluded += excluded; totalLocked += lockedCounter
     }
 
     table.append('</table></div>')
+    lockedTable.append('</table></div>')
 
     StringBuilder page = new StringBuilder()
     page.append('<h3>Duplicate-title write blockers (').append(SPACE_KEYS.join(', ')).append(')</h3>')
     page.append(table)
+    page.append('<h3>Locked pages - unpublished in-editor changes (').append(totalLocked).append(')</h3>')
+    page.append('<p style="font-size:90%">Current pages holding a shared collaborative-editing draft - ')
+        .append('the state that rejects writes with "unreconciled page". Author and CreatedAt are the ')
+        .append('DRAFT\'s - who left the unpublished edit and when. Publish or discard the draft in the ')
+        .append('editor, then re-run APPLY.</p>')
+    page.append(lockedTable)
     page.append('<pre style="font-size:90%">')
     page.append('SUMMARY\n')
     page.append(htmlEsc(stats.toString()))
@@ -178,7 +250,8 @@ try {
         .append('   blocking current pages: ').append(totalBlocking)
         .append('   minimum retitles: ').append(totalRetitles)
         .append('   context rows: ').append(totalContext)
-        .append('   excluded empty/NULL-title rows: ').append(totalExcluded).append('\n')
+        .append('   excluded empty/NULL-title rows: ').append(totalExcluded)
+        .append('   LOCKED pages: ').append(totalLocked).append('\n')
     page.append('</pre>')
     page.append('<p style="font-size:85%;color:#666">Legend: a title qualifies when two or more ')
         .append('CURRENT pages in the same space carry it - exactly the condition that rejects ')
