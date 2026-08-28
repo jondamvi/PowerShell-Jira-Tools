@@ -178,6 +178,13 @@ enum ReplacementStatus {
  * pasted back in.
  */
 @Field boolean EMIT_VERSION_MAP = true
+
+/*
+ * SCOPE mode: emit the affected page ids as a paste-ready
+ * PAGE_IDS_OVERRIDE = [...] block, one id per line (the console does not
+ * wrap text). Select all in the box, copy, paste over the field.
+ */
+@Field boolean EMIT_PAGE_IDS = true
 /*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
@@ -2105,19 +2112,56 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
     }
 }
 
-/** Flip this version's still-Success macros to the given status, adjusting counters. */
-void markMacros(VersionFinding vf, ReplacementStatus st, String text, Map<String, MigrationDef> byId) {
-    for (MatchedMacro mm : vf.matchedMacros) {
-        if (mm.status == ReplacementStatus.Success) {
-            mm.status = st
-            mm.message = text
-            MigrationDef md = byId.get(mm.migrationId)
-            if (md != null) {
-                md.occReplaced--
-                if (st == ReplacementStatus.Failed) md.occFailed++ else md.occSkipped++
-            }
+/*
+ * Error classes that do NOT terminate the run - the version is recorded as
+ * failed and the run continues. Every other exception is unexpected and
+ * terminates immediately: discovering a systematic fault on the last
+ * iteration of a long run is worse than failing on the first.
+ *
+ * 1. Space-dereference NPE: some page versions have no space row, and
+ *    Confluence's own save path dereferences the space - the NPE comes from
+ *    inside the product, not from this script.
+ * 2. ExternalChangesException ("unreconciled page"): the collaborative-editing
+ *    guard. The page has a Synchrony shared draft that was never published or
+ *    discarded (common on production copies), and Confluence refuses
+ *    programmatic saves to its CURRENT version until the draft is resolved -
+ *    deliberately, so a script cannot clobber someone's in-flight edit.
+ *    Retries cannot fix it (the draft persists). POLICY: drafts are never
+ *    touched by this migration - such pages are reported as Failed with the
+ *    reason in the Details column and the run continues. Detected by class
+ *    name/message, not import, so the script compiles on versions where the
+ *    class moved packages.
+ */
+boolean isTolerableError(Throwable t) {
+    Throwable c = t
+    while (c != null) {
+        if (c instanceof NullPointerException) {
+            String m = c.getMessage() == null ? '' : c.getMessage()
+            if (m.contains('confluence.spaces.Space') || m.contains('getSpace()')) return true
         }
+        String cls = c.getClass().getName()
+        String msg = c.getMessage() == null ? '' : c.getMessage()
+        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) return true
+        c = c.getCause()
     }
+    return false
+}
+
+/** Actionable failure text for the unreconciled-page case. */
+String tolerableErrorHint(Throwable t) {
+    Throwable c = t
+    while (c != null) {
+        String cls = c.getClass().getName()
+        String msg = c.getMessage() == null ? '' : c.getMessage()
+        if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) {
+            return ' | CAUSE: page is locked for writing - it holds unpublished in-editor ' +
+                   'changes (a collaborative-editing draft). By policy drafts are never touched; ' +
+                   'the current version was left as is and will migrate on a re-run once the ' +
+                   'draft is published or discarded.'
+        }
+        c = c.getCause()
+    }
+    return ''
 }
 
 void writeCurrentVersion(PageManager pm, AbstractPage page, String newBody) {
@@ -2644,6 +2688,21 @@ try {
                 .append('<textarea readonly rows="20" style="width:100%;font-family:monospace;font-size:85%">')
                 .append(htmlEsc(csv.toString())).append('</textarea>')
         }
+        if (EMIT_PAGE_IDS && !scopeRows.isEmpty()) {
+            StringBuilder ids = new StringBuilder()
+            ids.append('PAGE_IDS_OVERRIDE = [\n')
+            for (List<String> r : scopeRows) {
+                ids.append(r.get(1)).append('L,\n')
+            }
+            ids.append(']\n')
+            page.append('<h3>Affected page ids (').append(plural(scopeRows.size(), 'page'))
+                .append(') - paste over PAGE_IDS_OVERRIDE</h3>')
+                .append('<p style="font-size:90%">Click inside, <b>Ctrl+A</b>, <b>Ctrl+C</b>.</p>')
+                .append('<textarea readonly rows="14" style="width:100%;font-family:monospace;')
+                .append('font-size:85%;white-space:pre;resize:vertical">')
+                .append(htmlEsc(ids.toString()))
+                .append('</textarea>')
+        }
         page.append('<p style="font-size:85%;color:#666">Legend: one row per affected page; ')
             .append('a page is affected when any of its versions carries any source macro.</p>')
         log.warn("Macro engine v2 SCOPE: ${scopeRows.size()} affected page(s)")
@@ -2882,7 +2941,6 @@ try {
                 String werr = null
                 Exception lastWriteEx = null
                 int attempt = 0
-                boolean pageLocked = false
                 String bodyToWrite = after
                 long writeT0 = System.currentTimeMillis()
                 while (true) {
@@ -2902,11 +2960,6 @@ try {
                         lastWriteEx = we
                         String cn = we.getClass().getName()
                         String msg = we.getMessage() == null ? '' : we.getMessage()
-                        // collab-editing guard = expected lock, not a failure; no retry helps
-                        if (cn.contains('ExternalChangesException') || msg.contains('unreconciled')) {
-                            pageLocked = true
-                            break
-                        }
                         boolean stale = cn.contains('OptimisticLocking') || cn.contains('StaleObject') ||
                                         msg.contains('unexpected row count')
                         attempt++
@@ -2925,16 +2978,23 @@ try {
                 writeMsTotal += (writeT1 - writeT0)
                 if (writeT1 - writeT0 > writeMsMax) writeMsMax = writeT1 - writeT0
 
-                if (pageLocked) {
-                    // expected state, not a failure - see markMacros/catch comments
-                    vf.status = ReplacementStatus.Skipped
-                    vf.message = 'page locked from writing due to unpublished in-editor changes'
-                    markMacros(vf, ReplacementStatus.Skipped, vf.message, byId)
-                } else if (werr != null) {
-                    // unexpected exception or incomplete write = Failed row, run continues
+                if (werr != null && lastWriteEx != null && !isTolerableError(lastWriteEx)) {
+                    throw new RuntimeException('write failed for page ' + pf.pageId + ' (' + pf.url +
+                            ') v' + vf.versionNumber + ' after ' + WRITE_RETRIES + ' retries: ' +
+                            werr, lastWriteEx)
+                }
+                if (werr != null) {
                     vf.status = ReplacementStatus.Failed
-                    vf.message = werr
-                    markMacros(vf, ReplacementStatus.Failed, werr, byId)
+                    String failText = werr + (lastWriteEx == null ? '' : tolerableErrorHint(lastWriteEx))
+                    vf.message = failText
+                    for (MatchedMacro mm : vf.matchedMacros) {
+                        if (mm.status == ReplacementStatus.Success) {
+                            mm.status = ReplacementStatus.Failed
+                            mm.message = failText
+                            MigrationDef md = byId.get(mm.migrationId)
+                            if (md != null) { md.occReplaced--; md.occFailed++ }
+                        }
+                    }
                 } else if (VERIFY_AFTER_WRITE) {
                     long verifyT0 = System.currentTimeMillis()
                     ContentEntityObject check = pageManager.getAbstractPage(vf.contentId)
@@ -2962,11 +3022,13 @@ try {
                 }
                 vf.bodyBefore = before; vf.bodyAfter = after
             } catch (Exception ve) {
-                // unexpected exception = Failed row, run continues
+                if (!isTolerableError(ve)) {
+                    throw new RuntimeException('page ' + pf.pageId + ' (' + pf.url + ') v' +
+                            vf.versionNumber + ' contentid ' + vf.contentId + ': ' + ve.getMessage(), ve)
+                }
                 vf.status = ReplacementStatus.Failed
-                vf.message = ve.getClass().getSimpleName() + ': ' + ve.getMessage()
-                RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' FAILED - ' + vf.message)
-                markMacros(vf, ReplacementStatus.Failed, vf.message, byId)
+                vf.message = 'no space on this version (tolerated): ' + ve.getMessage()
+                RUN_LOG.add('page ' + pf.pageId + ' v' + vf.versionNumber + ' - ' + vf.message)
             } finally {
             /*
              * finally, not straight-line code: the block above exits early with
