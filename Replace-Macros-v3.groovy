@@ -2222,6 +2222,10 @@ boolean isTolerableError(Throwable t) {
         String cls = c.getClass().getName()
         String msg = c.getMessage() == null ? '' : c.getMessage()
         if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) return true
+        // 3. duplicate title: two CURRENT pages share a title in the space -
+        //    pre-existing data defect; Confluence refuses to save either
+        //    until one is retitled. Expected on production copies.
+        if (msg.contains('already exists with the title')) return true
         c = c.getCause()
     }
     return false
@@ -2233,6 +2237,11 @@ String tolerableErrorHint(Throwable t) {
     while (c != null) {
         String cls = c.getClass().getName()
         String msg = c.getMessage() == null ? '' : c.getMessage()
+        if (msg.contains('already exists with the title')) {
+            return ' | CAUSE: duplicate page title - another current page in this space has the ' +
+                   'same title, so Confluence refuses to save this one. Retitle one of the pair, ' +
+                   'then re-run.'
+        }
         if (cls.contains('ExternalChangesException') || msg.contains('unreconciled page')) {
             return ' | CAUSE: page is locked for writing - it holds unpublished in-editor ' +
                    'changes (a collaborative-editing draft). By policy drafts are never touched; ' +
