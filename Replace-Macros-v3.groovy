@@ -187,6 +187,14 @@ enum ReplacementStatus {
  * wrap text). Select all in the box, copy, paste over the field.
  */
 @Field boolean EMIT_PAGE_IDS = true
+
+/*
+ * SCOPE mode: explain WHY each page is in scope - which source token (macro
+ * name or EDD set-id literal) matched, and in which version (current or the
+ * first history version carrying it). Costs one body query per affected
+ * page; answers "why is this page here" without a second tool.
+ */
+@Field boolean SCOPE_EXPLAIN = true
 /*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
@@ -1363,6 +1371,41 @@ List<Integer> spaceIdsFor(List<String> spaceKeys) {
  * the SQL fragment. The clause is used twice per query (current-body probe and
  * history probe), so parameter names carry a tag to stay distinct.
  */
+/**
+ * v3: why is this page in scope? Checks the current body first, then history
+ * (newest first), and reports the first version that carries any discovery
+ * token, with the tokens found in it. Name tokens are checked as
+ * ac:name="<name>", literal tokens as plain substrings - the same tests the
+ * SQL discovery makes, applied in Groovy per page.
+ */
+String explainScopeHit(long pageId, Set<String> tokens) {
+    String q = '''
+        SELECT c.contentid, c.version, c.prevver, b.body
+        FROM content c JOIN bodycontent b ON b.contentid = c.contentid
+        WHERE c.contentid = :pid OR c.prevver = :pid
+        ORDER BY (c.prevver IS NULL) DESC, c.version DESC
+    '''
+    String result = null
+    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+        sql.eachRow(q, [pid: pageId]) { row ->
+            if (result != null) return
+            String body = row['body'] as String
+            if (body == null) return
+            List<String> hits = new ArrayList<String>()
+            for (String t : tokens) {
+                boolean literal = t.startsWith('literal:')
+                String needle = literal ? t.substring('literal:'.length()) : ('ac:name="' + t + '"')
+                if (body.contains(needle)) hits.add(literal ? 'set-id ' + needle : t)
+            }
+            if (!hits.isEmpty()) {
+                result = 'v' + row['version'] + (row['prevver'] == null ? ' (current)' : ' (history)') +
+                         ': ' + hits.join('; ')
+            }
+        }
+    }
+    return result == null ? '(no token found in any version body - discovery/parser disagree)' : result
+}
+
 /**
  * v3: discovery tokens per migration. Ordinary sources are found by macro
  * NAME (matched as ac:name="..."); an EDD source is found by its SET-ID GUID,
@@ -2725,6 +2768,11 @@ try {
         // Assembly order: run log FIRST (mode, migrations, validation, chunk log),
         // THEN the results block - the results describe what the log explains.
         List<String> scopeHeaders = ['Space Key', 'Page ID', 'Page URL', 'Title']
+        if (SCOPE_EXPLAIN) scopeHeaders.add('Matched by')
+        List<String> scopeWhy = new ArrayList<String>()
+        if (SCOPE_EXPLAIN) {
+            for (List<String> r : scopeRows) scopeWhy.add(explainScopeHit(Long.parseLong(r.get(1)), names))
+        }
         StringBuilder page = new StringBuilder()
         page.append('<pre>').append(htmlEsc(outp.toString())).append('</pre>')
 
@@ -2744,12 +2792,15 @@ try {
                 .append('<table border="1" cellpadding="4" cellspacing="0" style="font-size:90%"><tr>')
             for (String h : scopeHeaders) page.append('<th>').append(htmlEsc(h)).append('</th>')
             page.append('</tr>')
-            for (List<String> r : scopeRows) {
+            for (int ri = 0; ri < scopeRows.size(); ri++) {
+                List<String> r = scopeRows.get(ri)
                 String url = baseUrl + '/pages/viewpage.action?pageId=' + r.get(1)
                 page.append('<tr><td>').append(htmlEsc(r.get(0)))
                     .append('</td><td>').append(htmlEsc(r.get(1)))
                     .append('</td><td><a href="').append(url).append('" target="_blank">open</a>')
-                    .append('</td><td>').append(htmlEsc(r.get(2))).append('</td></tr>')
+                    .append('</td><td>').append(htmlEsc(r.get(2))).append('</td>')
+                if (SCOPE_EXPLAIN) page.append('<td>').append(htmlEsc(scopeWhy.get(ri))).append('</td>')
+                page.append('</tr>')
             }
             page.append('</table></div>')
 
@@ -2764,10 +2815,12 @@ try {
 
         } else if (RESULT_FORMAT == 'CSV') {
             StringBuilder csv = new StringBuilder()
-            csv.append('space_key,page_id,page_url,title\n')
-            for (List<String> r : scopeRows) {
+            csv.append(SCOPE_EXPLAIN ? 'space_key,page_id,page_url,title,matched_by\n' : 'space_key,page_id,page_url,title\n')
+            for (int ri = 0; ri < scopeRows.size(); ri++) {
+                List<String> r = scopeRows.get(ri)
                 List<String> f = [r.get(0), r.get(1),
                                   baseUrl + '/pages/viewpage.action?pageId=' + r.get(1), r.get(2)]
+                if (SCOPE_EXPLAIN) f.add(scopeWhy.get(ri))
                 List<String> q = new ArrayList<String>()
                 for (String v : f) q.add('"' + (v == null ? '' : v.replace('"', '""')) + '"')
                 csv.append(q.join(',')).append('\n')
@@ -2846,6 +2899,7 @@ try {
     }
 
     List<PageFinding> findings = new ArrayList<PageFinding>()
+    int skippedByMap = 0
     int batchCount = 0, pagesDone = 0
     for (Long pid : scope) {
         // getAbstractPage, not getPage: discovery scope includes BLOGPOST rows
@@ -2870,7 +2924,7 @@ try {
         List<Long> versionIds
         if (!versionMap.isEmpty()) {
             List<Long> mapped = versionMap.get(pid.longValue())
-            if (mapped == null) continue      // page has no affected versions per mapping
+            if (mapped == null) { skippedByMap++; continue }   // not in VERSION_MAP_OVERRIDE
             versionIds = mapped
         } else {
             versionIds = versionContentIds(pageManager, page)
@@ -2909,6 +2963,16 @@ try {
     outp.append('  pages with matches: ').append(findings.size())
         .append('   versions with matches: ').append(totalVersions)
         .append('   occurrences: ').append(totalOcc).append('\n')
+    if (skippedByMap > 0) {
+        outp.append('  !! ').append(plural(skippedByMap, 'scoped page'))
+            .append(' skipped: not present in VERSION_MAP_OVERRIDE - a stale mapping from ')
+            .append('another scope hides pages silently; empty the mapping to walk them\n')
+    }
+    if (!scope.isEmpty() && findings.isEmpty() && skippedByMap == 0) {
+        outp.append('  !! discovery found pages but the parser matched NO occurrence - a source ')
+            .append('name in Migrations does not equal the ac:name in storage. For an EDD source ')
+            .append('the name is the TARGET name that wrote those macros (v2 config), not a guess.\n')
+    }
     outp.append('  session flush: ').append(FLUSH_NOTE).append('\n')
     if (RESULT_FORMAT == 'TABLE' && RESULT_GRANULARITY == 'MACRO' &&
         RESULT_TABLE_WARN_ROWS > 0 && totalOcc > RESULT_TABLE_WARN_ROWS) {
