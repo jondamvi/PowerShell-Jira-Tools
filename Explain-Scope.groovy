@@ -10,21 +10,29 @@
  * verbatim (name + all parameters) - exactly what Stage-1's parser is asked to
  * recognize. A hit that sits outside any structured-macro element is flagged.
  *
- * Fill PAGE_IDS from SCOPE's "Affected page ids" box. SOURCE_NAMES = the source
- * macro names of your Migrations (or just the ones you suspect); SET_IDS = the
- * set-id GUIDs of EDD-source migrations.
+ * Fill PAGE_IDS from SCOPE's "Affected page ids" box, and paste the FULL
+ * MIGRATIONS block from the replace script over the one below, verbatim - the
+ * tokens are derived from it the same way the engine derives them (source
+ * name, or set-id for an EDD source); everything else in the entries is
+ * ignored. The MacroType enum below exists only so the paste compiles.
  */
 import com.onresolve.scriptrunner.db.DatabaseUtil
 import groovy.sql.Sql
 import groovy.transform.Field
 
+enum MacroType {
+    UserMacro, ScriptRunnerMacro, EddStatusMacro, AuraLinkButton, Static_QualificationTable
+}
+
 // ============================== CONFIG =======================================
 
 @Field List<Long> PAGE_IDS = []                   // e.g. [274932982L, 88993388L]
-@Field List<String> SOURCE_NAMES = []             // e.g. ['process-status', 'easy-dropdown-menu-status']
-@Field List<String> SET_IDS = []                  // e.g. ['0b7c...-guid']
 @Field String DB_RESOURCE = 'ConfluenceDB'
 @Field int SNIPPET_MAX = 900
+
+// paste the replace script's whole MIGRATIONS block over this, unchanged
+@Field List MIGRATIONS = [
+]
 
 // =============================================================================
 
@@ -46,10 +54,23 @@ String elementAround(String body, int at) {
 }
 
 try {
+    // tokens derived from MIGRATIONS exactly as the engine's discoveryTokens()
     List<String> needles = new ArrayList<String>()     // parallel lists: needle text, label
     List<String> labels = new ArrayList<String>()
-    for (String n : SOURCE_NAMES) { needles.add('ac:name="' + n + '"'); labels.add('macro ' + n) }
-    for (String g : SET_IDS)      { needles.add(g);                       labels.add('set-id ' + g) }
+    for (Object entry : MIGRATIONS) {
+        Map cfg = (Map) entry
+        Map srcBlock = (Map) cfg.get('source')
+        if (srcBlock == null) continue
+        String id = cfg.get('id') as String
+        String name = srcBlock.get('name') as String
+        Object type = srcBlock.get('type')
+        if (type == MacroType.EddStatusMacro) {
+            String setId = srcBlock.get('setId') as String
+            if (setId != null && !setId.isEmpty()) { needles.add(setId); labels.add('set-id ' + setId + ' [' + id + ']') }
+        } else if (name != null) {
+            needles.add('ac:name="' + name + '"'); labels.add('macro ' + name + ' [' + id + ']')
+        }
+    }
 
     String versionsQuery = '''
         SELECT c.contentid, c.version, c.content_status, c.prevver, b.body
@@ -59,7 +80,8 @@ try {
     '''
 
     StringBuilder out = new StringBuilder('<pre style="font-size:88%">')
-    if (needles.isEmpty()) return '<pre>Fill SOURCE_NAMES and/or SET_IDS first.</pre>'
+    if (needles.isEmpty()) return '<pre>MIGRATIONS is empty - paste the replace script block.</pre>'
+    out.append('tokens in play: ').append(needles.size()).append('\n\n')
 
     DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
         for (Long pid : PAGE_IDS) {
@@ -85,7 +107,7 @@ try {
             }
             if (hitsOnPage == 0) {
                 out.append('   no configured name or set-id found in ANY version body\n')
-                   .append('   -> discovery matched something not in SOURCE_NAMES/SET_IDS; add the rest of the Migrations names\n\n')
+                   .append('   -> discovery/parser disagree on this page; report this page id\n\n')
             }
         }
     }
