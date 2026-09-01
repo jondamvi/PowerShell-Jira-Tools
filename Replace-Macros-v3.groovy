@@ -45,6 +45,7 @@ import com.atlassian.confluence.core.Modification
 import com.atlassian.confluence.core.VersionHistorySummary
 import com.atlassian.confluence.core.SpaceContentEntityObject
 import com.atlassian.confluence.pages.AbstractPage
+import com.atlassian.confluence.pages.BlogPost
 import com.atlassian.confluence.pages.Page
 import com.atlassian.confluence.pages.PageManager
 import com.atlassian.confluence.setup.settings.SettingsManager
@@ -187,6 +188,19 @@ enum ReplacementStatus {
  * wrap text). Select all in the box, copy, paste over the field.
  */
 @Field boolean EMIT_PAGE_IDS = true
+
+/*
+ * Draft visibility (v3). Confluence's macro-usage admin page counts macros in
+ * DRAFT rows too, so hiding drafts makes the engine's numbers impossible to
+ * reconcile against it. INCLUDE_DRAFT_PAGES lists macro-bearing draft rows of
+ * scoped pages in the results (PageType "... (draft)"); SKIP_DRAFT_PAGES keeps
+ * them out of writes - Skipped rows with the reason, per the never-touch-
+ * drafts policy. Excel: filter PageType = "(draft)" to explain the admin
+ * count. Note: a page whose ONLY macro-bearing row is a shared draft still
+ * cannot enter scope through it; version-chain drafts are discovered fully.
+ */
+@Field boolean INCLUDE_DRAFT_PAGES = true
+@Field boolean SKIP_DRAFT_PAGES = true
 /*
  * Body-match strategy for discovery.
  *   true  = one regex alternation:    body ~ 'ac:name="(a|b|...)"'
@@ -526,6 +540,7 @@ class VersionFinding {
     long contentId
     int versionNumber
     boolean isCurrent
+    boolean isDraft
     boolean hasMatchedMacros
     List<MatchedMacro> matchedMacros = new ArrayList<MatchedMacro>()
     // execution results
@@ -536,6 +551,7 @@ class VersionFinding {
 
 class PageFinding {
     long pageId
+    String kind = 'page'          // 'page' | 'blogpost' ('template' reserved)
     String pageName = '', spaceKey = '', url = ''
     List<VersionFinding> versions = new ArrayList<VersionFinding>()
 }
@@ -1364,6 +1380,50 @@ List<Integer> spaceIdsFor(List<String> spaceKeys) {
  * history probe), so parameter names carry a tag to stay distinct.
  */
 /**
+ * v3: macro-bearing DRAFT rows of one scoped page - version-chain drafts
+ * (prevver) and the shared collaborative draft (draftpageid). Bodies come
+ * from SQL because the page API does not serve draft rows. Matched drafts
+ * join pf.versions like any version; Stage-3 skips them from writes when
+ * SKIP_DRAFT_PAGES is set.
+ */
+void addDraftVersions(PageFinding pf, Map<String, MigrationDef> bySource) {
+    String q = '''
+        SELECT DISTINCT c.contentid AS cid, c.version AS v, b.body AS body
+        FROM content c JOIN bodycontent b ON b.contentid = c.contentid
+        WHERE c.content_status = 'draft'
+          AND (c.prevver = :pid OR c.draftpageid = :pidStr)
+    '''
+    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+        sql.eachRow(q, [pid: pf.pageId, pidStr: String.valueOf(pf.pageId)]) { row ->
+            long cid = ((Number) row['cid']).longValue()
+            boolean seen = false
+            for (VersionFinding known : pf.versions) if (known.contentId == cid) seen = true
+            if (seen) return
+            VersionFinding vf = new VersionFinding()
+            vf.contentId = cid
+            vf.versionNumber = row['v'] == null ? 0 : ((Number) row['v']).intValue()
+            vf.isCurrent = false
+            vf.isDraft = true
+            vf.matchedMacros = scanBody(row['body'] as String, bySource)
+            vf.hasMatchedMacros = !vf.matchedMacros.isEmpty()
+            if (vf.hasMatchedMacros) pf.versions.add(vf)
+        }
+    }
+}
+
+/** Draft version in Stage-3: never written; everything found is Skipped. */
+void markDraftSkipped(VersionFinding vf, Map<String, MigrationDef> byId) {
+    vf.status = ReplacementStatus.Skipped
+    vf.message = 'page draft - not replaced by policy (SKIP_DRAFT_PAGES)'
+    for (MatchedMacro mm : vf.matchedMacros) {
+        mm.status = ReplacementStatus.Skipped
+        mm.message = vf.message
+        MigrationDef md = byId.get(mm.migrationId)
+        if (md != null) md.occSkipped++
+    }
+}
+
+/**
  * v3: discovery tokens per migration. Ordinary sources are found by macro
  * NAME (matched as ac:name="..."); an EDD source is found by its SET-ID GUID,
  * matched as a literal substring - globally unique, present verbatim in the
@@ -1606,7 +1666,8 @@ List<Long> resolveScope(Set<String> sourceNames, int candidateOffset, int candid
                 for (int i = 0; i < rest.size(); i += ID_LIST_MAX) {
                     List<Long> part = rest.subList(i, Math.min(i + ID_LIST_MAX, rest.size()))
                     String q = 'SELECT v.contentid AS vid, v.prevver AS pid FROM content v ' +
-                               'WHERE v.prevver IN (' + joinIds(part) + ')'
+                               'WHERE v.prevver IN (' + joinIds(part) + ') ' +
+                               (INCLUDE_DRAFT_PAGES ? '' : "AND v.content_status <> 'draft'")
                     sql.eachRow(q, [:]) { row ->
                         versionToPage.put(((Number) row['vid']).longValue(),
                                 ((Number) row['pid']).longValue())
@@ -2324,7 +2385,7 @@ void writeHistoricalVersion(PageManager pm, ContentEntityObject hist, String new
 
 List<String> resultHeaders(boolean perMacro, boolean showMigration) {
     List<String> h = new ArrayList<String>()
-    h.addAll(['Space Key', 'Page ID', 'Page Name', 'Page URL', 'Page V.', 'Current'])
+    h.addAll(['Space Key', 'Page ID', 'Page Name', 'Page URL', 'Page V.', 'PageType'])
     if (perMacro) {
         h.add('Macro #')
         if (showMigration) h.add('Migration')
@@ -2346,7 +2407,7 @@ List<String> resultRow(boolean perMacro, boolean showMigration, boolean apply,
     c.add(pf.pageName)
     c.add(pf.url)
     c.add(vf.versionNumber as String)
-    c.add(vf.isCurrent ? 'yes' : '')          // blank, not "-", for historical
+    c.add(pf.kind + ' (' + (vf.isDraft ? 'draft' : (vf.isCurrent ? 'current' : 'history')) + ')')
     if (perMacro) {
         c.add(mm.macroIndex as String)
         if (showMigration) c.add(mm.migrationId)
@@ -2857,6 +2918,7 @@ try {
 
         PageFinding pf = new PageFinding()
         pf.pageId = pid.longValue()
+        pf.kind = (page instanceof BlogPost) ? 'blogpost' : 'page'
         pf.pageName = page.getTitle() == null ? '' : page.getTitle()
         // space is read ONCE from the current version; version rows never carry it
         pf.spaceKey = (page.getSpace() == null) ? '' : page.getSpace().getKey()
@@ -2886,6 +2948,7 @@ try {
             vf.hasMatchedMacros = !vf.matchedMacros.isEmpty()
             if (vf.hasMatchedMacros) pf.versions.add(vf)
         }
+        if (INCLUDE_DRAFT_PAGES) addDraftVersions(pf, bySource)
         if (!pf.versions.isEmpty()) findings.add(pf)
 
         pagesDone++; batchCount++
@@ -2971,6 +3034,7 @@ try {
         }
         for (VersionFinding vf : pf.versions) {
             try {
+                if (SKIP_DRAFT_PAGES && vf.isDraft) { markDraftSkipped(vf, byId); continue }
                 ContentEntityObject ceo = pageManager.getAbstractPage(vf.contentId)
                 if (ceo == null) {
                     vf.status = ReplacementStatus.Failed
