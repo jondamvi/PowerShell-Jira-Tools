@@ -2846,7 +2846,6 @@ try {
     }
 
     List<PageFinding> findings = new ArrayList<PageFinding>()
-    int skippedByMap = 0
     int batchCount = 0, pagesDone = 0
     for (Long pid : scope) {
         // getAbstractPage, not getPage: discovery scope includes BLOGPOST rows
@@ -2871,7 +2870,7 @@ try {
         List<Long> versionIds
         if (!versionMap.isEmpty()) {
             List<Long> mapped = versionMap.get(pid.longValue())
-            if (mapped == null) { skippedByMap++; continue }   // not in VERSION_MAP_OVERRIDE
+            if (mapped == null) continue      // page has no affected versions per mapping
             versionIds = mapped
         } else {
             versionIds = versionContentIds(pageManager, page)
@@ -2910,16 +2909,6 @@ try {
     outp.append('  pages with matches: ').append(findings.size())
         .append('   versions with matches: ').append(totalVersions)
         .append('   occurrences: ').append(totalOcc).append('\n')
-    if (skippedByMap > 0) {
-        outp.append('  !! ').append(plural(skippedByMap, 'scoped page'))
-            .append(' skipped: not present in VERSION_MAP_OVERRIDE - a stale mapping from ')
-            .append('another scope hides pages silently; empty the mapping to walk them\n')
-    }
-    if (!scope.isEmpty() && findings.isEmpty() && skippedByMap == 0) {
-        outp.append('  !! discovery found pages but the parser matched NO occurrence - a source ')
-            .append('name in Migrations does not equal the ac:name in storage. For an EDD source ')
-            .append('the name is the TARGET name that wrote those macros (v2 config), not a guess.\n')
-    }
     outp.append('  session flush: ').append(FLUSH_NOTE).append('\n')
     if (RESULT_FORMAT == 'TABLE' && RESULT_GRANULARITY == 'MACRO' &&
         RESULT_TABLE_WARN_ROWS > 0 && totalOcc > RESULT_TABLE_WARN_ROWS) {
