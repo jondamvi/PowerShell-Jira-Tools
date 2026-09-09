@@ -2,10 +2,10 @@
  * Reconcile-MacroUsage.groovy                                    (READ ONLY)
  * -----------------------------------------------------------------------------
  * Explains the leftover counts on the admin "Macro Usage" page after the
- * migration. For each macro name you still see there, it finds the pages the
- * index counts (same CQL the admin page and dosearchsite use: macro="<name>",
- * which sees CURRENT + DRAFT content, not history), then classifies each page
- * against the database:
+ * migration. For each macro name you still see there, it finds the pages that
+ * carry it by scanning CURRENT + DRAFT bodies in the database (the same two row
+ * kinds the admin index counts; history is not counted) - no dependency on any
+ * version-specific search API - then classifies each page:
  *
  *   State:
  *     current still has macro  - a genuine miss; re-run the engine on it
@@ -28,9 +28,6 @@
  * running the CQL search.
  */
 import com.atlassian.confluence.setup.settings.SettingsManager
-import com.atlassian.confluence.search.v2.SearchManager
-import com.atlassian.confluence.search.v2.searchfilter.SpacePermissionsSearchFilter
-import com.atlassian.confluence.search.v2.query.ContentTypeQuery
 import com.atlassian.sal.api.component.ComponentLocator
 import com.onresolve.scriptrunner.db.DatabaseUtil
 import groovy.sql.Sql
@@ -59,33 +56,37 @@ String spaceCategory(String key) {
     return ''
 }
 
-/** CQL page ids for one macro name, via the index (same view as the admin page). */
-List<Long> cqlPageIds(String macroName) {
-    List<Long> ids = new ArrayList<Long>()
-    try {
-        // CQL search through the REST-equivalent service; macro = "<name>"
-        def cqlSearch = ComponentLocator.getComponent(
-                Class.forName('com.atlassian.confluence.api.service.search.CQLSearchService'))
-        def limit = com.atlassian.confluence.api.model.pagination.LimitedRequestImpl.create(100, 100)
-        String cql = 'macro = "' + macroName.replace('"', '') + '"'
-        def resp = cqlSearch.searchContent(cql, limit, new com.atlassian.confluence.api.model.Expansion[0])
-        boolean more = true
-        while (more) {
-            resp.getResults().each { c ->
-                try { ids.add(Long.parseLong(c.getId().serialise())) } catch (Exception ignore) {}
-            }
-            if (resp.getPageResponse() != null && resp.getPageResponse().hasMore()) {
-                def next = com.atlassian.confluence.api.model.pagination.LimitedRequestImpl.create(
-                        (int) (ids.size()), 100)
-                resp = cqlSearch.searchContent(cql, next, new com.atlassian.confluence.api.model.Expansion[0])
-            } else {
-                more = false
-            }
+/*
+ * Page ids carrying a macro - found by SQL over CURRENT + DRAFT bodies (the two
+ * row kinds the admin "Macro Usage" index counts; history is not counted).
+ * This is the DB equivalent of the admin page's CQL macro="<name>" search, with
+ * no dependency on any version-specific search API. Returns page ids: for a
+ * draft hit the OWNING page id (draftpageid) is returned so classification and
+ * the draft lookup line up.
+ */
+List<Long> pagesWithMacro(String macroName) {
+    String needle = '%ac:name="' + macroName.replace('%', '') + '"%'
+    LinkedHashSet<Long> ids = new LinkedHashSet<Long>()
+    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
+        // current pages whose live body carries the macro
+        sql.eachRow('''
+            SELECT c.contentid AS id
+            FROM content c JOIN bodycontent b ON b.contentid = c.contentid
+            WHERE c.contenttype = 'PAGE' AND c.content_status = 'current'
+              AND b.body LIKE :needle''', [needle: needle]) { row ->
+            ids.add(((Number) row['id']).longValue())
         }
-    } catch (Exception e) {
-        throw new RuntimeException('CQL search failed for "' + macroName + '": ' + e.getMessage(), e)
+        // draft rows carrying the macro -> report the owning page id
+        sql.eachRow('''
+            SELECT c.draftpageid AS id
+            FROM content c JOIN bodycontent b ON b.contentid = c.contentid
+            WHERE c.contenttype = 'PAGE' AND c.content_status = 'draft'
+              AND c.draftpageid IS NOT NULL
+              AND b.body LIKE :needle''', [needle: needle]) { row ->
+            try { ids.add(Long.parseLong(row['id'] as String)) } catch (Exception ignore) {}
+        }
     }
-    return ids
+    return new ArrayList<Long>(ids)
 }
 
 try {
@@ -126,7 +127,7 @@ try {
 
     for (String macro : MACRO_NAMES) {
         String needle = 'ac:name="' + macro + '"'
-        List<Long> pageIds = PAGE_IDS_OVERRIDE.isEmpty() ? cqlPageIds(macro) : PAGE_IDS_OVERRIDE
+        List<Long> pageIds = PAGE_IDS_OVERRIDE.isEmpty() ? pagesWithMacro(macro) : PAGE_IDS_OVERRIDE
         int refCounter = 0
         int mTotal = 0, mCurrent = 0, mDraft = 0, mStale = 0, mPersonal = 0, mDelete = 0
 
