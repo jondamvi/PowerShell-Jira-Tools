@@ -23,12 +23,9 @@
  * Every hit is reported (nothing excluded), so the row count reconciles with
  * the admin figure. A footer breaks the totals down.
  *
- * Input: MACRO_NAMES (what you see in Macro Usage). PAGE_IDS_OVERRIDE optional -
- * when non-empty, those pages are classified for every listed macro instead of
- * running the CQL search.
+ * Input: MACRO_PAGES - per macro name, the page ids from its CQL search page.
+ * Read-only; needs only DatabaseUtil and a hardcoded BASE_URL.
  */
-import com.atlassian.confluence.setup.settings.SettingsManager
-import com.atlassian.sal.api.component.ComponentLocator
 import com.onresolve.scriptrunner.db.DatabaseUtil
 import groovy.sql.Sql
 import groovy.transform.Field
@@ -36,8 +33,19 @@ import java.text.SimpleDateFormat
 
 // ============================== CONFIG =======================================
 
-@Field List<String> MACRO_NAMES = []              // e.g. ['last-modified', 'priority-status']
-@Field List<Long> PAGE_IDS_OVERRIDE = []          // optional: classify these instead of CQL
+/*
+ * Paste, per macro, the page ids from that macro's CQL search page
+ * (dosearchsite.action?cql=macro="<name>"). Each search opens in a second and
+ * lists exactly the pages the admin Macro Usage counts; this script then
+ * classifies each id against the database. No in-script search, no table scan.
+ */
+@Field Map<String, List<Long>> MACRO_PAGES = [
+    'last-modified': [
+        // 123456L, 234567L, ...
+    ],
+    // 'priority-status': [ ... ],
+]
+@Field String BASE_URL = 'https://confluencesite.local'   // your Confluence base URL
 @Field String DB_RESOURCE = 'ConfluenceDB'
 @Field int SCROLLBOX_MAX_HEIGHT_PX = 600
 
@@ -56,44 +64,10 @@ String spaceCategory(String key) {
     return ''
 }
 
-/*
- * Page ids carrying a macro - found by SQL over CURRENT + DRAFT bodies (the two
- * row kinds the admin "Macro Usage" index counts; history is not counted).
- * This is the DB equivalent of the admin page's CQL macro="<name>" search, with
- * no dependency on any version-specific search API. Returns page ids: for a
- * draft hit the OWNING page id (draftpageid) is returned so classification and
- * the draft lookup line up.
- */
-List<Long> pagesWithMacro(String macroName) {
-    String needle = '%ac:name="' + macroName.replace('%', '') + '"%'
-    LinkedHashSet<Long> ids = new LinkedHashSet<Long>()
-    DatabaseUtil.withSql(DB_RESOURCE) { Sql sql ->
-        // current pages whose live body carries the macro
-        sql.eachRow('''
-            SELECT c.contentid AS id
-            FROM content c JOIN bodycontent b ON b.contentid = c.contentid
-            WHERE c.contenttype = 'PAGE' AND c.content_status = 'current'
-              AND b.body LIKE :needle''', [needle: needle]) { row ->
-            ids.add(((Number) row['id']).longValue())
-        }
-        // draft rows carrying the macro -> report the owning page id
-        sql.eachRow('''
-            SELECT c.draftpageid AS id
-            FROM content c JOIN bodycontent b ON b.contentid = c.contentid
-            WHERE c.contenttype = 'PAGE' AND c.content_status = 'draft'
-              AND c.draftpageid IS NOT NULL
-              AND b.body LIKE :needle''', [needle: needle]) { row ->
-            try { ids.add(Long.parseLong(row['id'] as String)) } catch (Exception ignore) {}
-        }
-    }
-    return new ArrayList<Long>(ids)
-}
-
 try {
-    if (MACRO_NAMES.isEmpty()) return '<pre>Set MACRO_NAMES first.</pre>'
+    if (MACRO_PAGES.isEmpty()) return '<pre>Fill MACRO_PAGES with page ids per macro first.</pre>'
 
-    SettingsManager settingsManager = ComponentLocator.getComponent(SettingsManager)
-    String baseUrl = settingsManager.getGlobalSettings().getBaseUrl()
+    String baseUrl = BASE_URL
     SimpleDateFormat fmt = new SimpleDateFormat('yyyy-MM-dd HH:mm')
 
     // per-page classification queries (built outside the withSql closure)
@@ -125,9 +99,10 @@ try {
     StringBuilder footer = new StringBuilder()
     int gTotal = 0, gCurrent = 0, gDraft = 0, gStale = 0, gPersonal = 0, gDelete = 0
 
-    for (String macro : MACRO_NAMES) {
+    for (Map.Entry<String, List<Long>> me : MACRO_PAGES.entrySet()) {
+        String macro = me.getKey()
+        List<Long> pageIds = me.getValue() == null ? new ArrayList<Long>() : me.getValue()
         String needle = 'ac:name="' + macro + '"'
-        List<Long> pageIds = PAGE_IDS_OVERRIDE.isEmpty() ? pagesWithMacro(macro) : PAGE_IDS_OVERRIDE
         int refCounter = 0
         int mTotal = 0, mCurrent = 0, mDraft = 0, mStale = 0, mPersonal = 0, mDelete = 0
 
@@ -197,11 +172,7 @@ try {
     table.append('</table></div>')
 
     StringBuilder page = new StringBuilder()
-    page.append('<h3>Macro Usage reconciliation (').append(htmlEsc(MACRO_NAMES.join(', '))).append(')</h3>')
-    if (!PAGE_IDS_OVERRIDE.isEmpty()) {
-        page.append('<p style="font-size:90%">Using PAGE_IDS_OVERRIDE (')
-            .append(PAGE_IDS_OVERRIDE.size()).append(' ids) instead of CQL search.</p>')
-    }
+    page.append('<h3>Macro Usage reconciliation (').append(htmlEsc(MACRO_PAGES.keySet().join(', '))).append(')</h3>')
     page.append(table)
     page.append('<pre style="font-size:90%">SUMMARY\n').append(htmlEsc(footer.toString()))
         .append('  TOTAL:  ').append(gTotal).append('  =  ').append(gCurrent)
