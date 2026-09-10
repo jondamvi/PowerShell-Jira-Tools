@@ -1,0 +1,9 @@
+=VSTACK(AllFilters_Prod[#Headers];
+  FILTER(IF(AllFilters_Prod="";"";SUBSTITUTE(AllFilters_Prod;CHAR(13);CHAR(10)));
+    MMULT(--ISNUMBER(SEARCH(TRANSPOSE(AssetKeywords!$A$1:$A$6); AllFilters_Prod[Filter JQL]));
+          SEQUENCE(ROWS(AssetKeywords!$A$1:$A$6);1;1;0))>0))
+		  
+=VSTACK(AllFilters_Prod[#Headers],
+  FILTER(IF(AllFilters_Prod="","",SUBSTITUTE(AllFilters_Prod,CHAR(13),CHAR(10))),
+    MMULT(--ISNUMBER(SEARCH(TRANSPOSE(AssetKeywords!A1:A10), AllFilters_Prod[JQL])),
+          SEQUENCE(ROWS(AssetKeywords!A1:A10),1,1,0))>0))
