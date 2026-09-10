@@ -83,6 +83,11 @@ param (
     # aqlFunction("\"Legacy-Key\" = CMDB-1"). Use if AQL rejects the bare name.
     [switch]$QuoteAqlAttribute,
 
+    # Match asset keys case-insensitively (catches lowercase usage like
+    # "iam-8238") and normalize them to canonical uppercase in the generated
+    # AQL. Enabled by default; disable with -CaseInsensitiveKeys:$false.
+    [switch]$CaseInsensitiveKeys = $true,
+
     # Process exactly these Cloud filter IDs — no search calls, no name matching.
     # Takes precedence over -Filters. Filter names are NOT unique across owners;
     # IDs are. Source of truth: Find-FiltersWithAssetKeys CSV.
@@ -178,13 +183,23 @@ $script:AqlAttr = if ($QuoteAqlAttribute) { '\"{0}\"' -f $AqlAttributeName } els
 # --- Regexes ---
 $prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }) -join '|'
 $keyPattern = "(?:$prefixAlt)-\d+"
-$tokenRegex = [regex]"\b$keyPattern\b"
+$ciPrefix   = if ($CaseInsensitiveKeys) { '(?i)' } else { '' }
+$tokenRegex = [regex]"$ciPrefix\b$keyPattern\b"
+# Bare-key branch of the scalar regex honors the same case sensitivity setting
+$bareKeyPattern = if ($CaseInsensitiveKeys) { "(?i:$keyPattern)" } else { $keyPattern }
 
 function Get-KeyFromValue {
     param([string]$Value)
     $v = $Value.Trim()
-    if ($v -match "^(?<k>$keyPattern)$")        { return $Matches['k'] }
-    if ($v -match "\((?<k>$keyPattern)\)\s*$")  { return $Matches['k'] }
+    if ($CaseInsensitiveKeys) {
+        # -match is case-insensitive; normalize extracted keys to canonical uppercase
+        if ($v -match "^(?<k>$keyPattern)$")        { return $Matches['k'].ToUpper() }
+        if ($v -match "\((?<k>$keyPattern)\)\s*$")  { return $Matches['k'].ToUpper() }
+    }
+    else {
+        if ($v -cmatch "^(?<k>$keyPattern)$")       { return $Matches['k'] }
+        if ($v -cmatch "\((?<k>$keyPattern)\)\s*$") { return $Matches['k'] }
+    }
     return $null
 }
 
@@ -206,10 +221,10 @@ $arrayEvaluator = {
         $keys += $k
     }
     if ($keys.Count -eq 0) { return $m.Value }
-    '{0} aqlFunction("{1} IN ({2})")' -f $op, $script:AqlAttr, ($keys -join ', ')
+    '{0} aqlFunction("{1} IN ({2})")' -f $op, $script:AqlAttr, (($keys | Select-Object -Unique) -join ', ')
 }
 
-$scalarRegex = [regex]"((?i:\bnot\s+in\b|\bin\b)|!=|=)\s*(?:""([^""]*)""|'([^']*)'|($keyPattern)\b)"
+$scalarRegex = [regex]"((?i:\bnot\s+in\b|\bin\b)|!=|=)\s*(?:""([^""]*)""|'([^']*)'|($bareKeyPattern)\b)"
 
 $scalarEvaluator = {
     param($m)
@@ -562,6 +577,7 @@ function Invoke-FilterProcessing {
 # --- Startup info ---
 Write-Host "Detection pattern : $($tokenRegex.ToString())" -ForegroundColor Cyan
 Write-Host "AQL attribute     : $AqlAttributeName"          -ForegroundColor Cyan
+Write-Host "Key matching      : $(if ($CaseInsensitiveKeys) { 'case-insensitive (normalized to UPPERCASE)' } else { 'case-sensitive' })" -ForegroundColor Cyan
 if ($FilterIds)     { Write-Host "Filter ID scope   : $(@($FilterIds).Count) ids" -ForegroundColor Cyan }
 elseif ($Filters)   { Write-Host "Filter name scope : $($Filters -join ', ')"     -ForegroundColor Cyan }
 if ($Commit) {
