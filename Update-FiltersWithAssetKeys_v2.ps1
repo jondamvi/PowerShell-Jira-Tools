@@ -181,7 +181,9 @@ function Backup-Filter {
 $script:AqlAttr = if ($QuoteAqlAttribute) { '\"{0}\"' -f $AqlAttributeName } else { $AqlAttributeName }
 
 # --- Regexes ---
-$prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }) -join '|'
+# Accept prefixes with or without a trailing dash ("CMDB" and "CMDB-" both work;
+# the dash is appended by the pattern itself, so it is stripped from input here).
+$prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim().TrimEnd('-')) }) -join '|'
 $keyPattern = "(?:$prefixAlt)-\d+"
 $ciPrefix   = if ($CaseInsensitiveKeys) { '(?i)' } else { '' }
 $tokenRegex = [regex]"$ciPrefix\b$keyPattern\b"

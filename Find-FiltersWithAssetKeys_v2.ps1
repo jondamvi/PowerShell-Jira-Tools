@@ -70,7 +70,9 @@ if (-not $me.accountId) {
 Write-Host "Authenticated as  : $($me.displayName) [$($me.accountId)]" -ForegroundColor Cyan
 
 # --- Detection regex ---
-$prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim()) }) -join '|'
+# Accept prefixes with or without a trailing dash ("CMDB" and "CMDB-" both work;
+# the dash is appended by the pattern itself, so it is stripped from input here).
+$prefixAlt  = ($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim().TrimEnd('-')) }) -join '|'
 $ciPrefix   = if ($CaseInsensitiveKeys) { '(?i)' } else { '' }
 $tokenRegex = [regex]"$ciPrefix\b(?:$prefixAlt)-\d+\b"
 Write-Host "Detection pattern : $($tokenRegex.ToString())" -ForegroundColor Cyan
