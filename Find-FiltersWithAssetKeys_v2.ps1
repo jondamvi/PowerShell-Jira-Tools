@@ -29,6 +29,12 @@ param (
     # Enabled by default; disable with -CaseInsensitiveKeys:$false.
     [switch]$CaseInsensitiveKeys = $true,
 
+    # Filters whose asset keys occur ONLY inside ~ / !~ text-search operands are
+    # free-text content matches, not remediation targets, and are excluded from
+    # the output by default. Set this to include them, marked in the
+    # 'Match Context' column as 'Body content only'.
+    [switch]$IncludeTextOnlyMatches,
+
     [string]$ExportCsv,
 
     # Requires Administer Jira global permission (experimental API param).
@@ -78,10 +84,27 @@ $tokenRegex = [regex]"$ciPrefix\b(?:$prefixAlt)-\d+\b"
 Write-Host "Detection pattern : $($tokenRegex.ToString())" -ForegroundColor Cyan
 Write-Host "Key matching      : $(if ($CaseInsensitiveKeys) { 'case-insensitive (reported as UPPERCASE)' } else { 'case-sensitive' })" -ForegroundColor Cyan
 
+# Text-search operands: values after ~ or !~ are free-text CONTENT searches, not
+# Assets field references. They are masked before detection so keys inside them
+# never count as remediation targets.
+$textOpRegex = [regex]'(!~|~)\s*("[^"]*"|''[^'']*''|[^\s()"'']+)'
+
+function Get-TextMaskedJql {
+    param([string]$Jql)
+    $out   = $Jql
+    $found = $textOpRegex.Matches($Jql)
+    for ($i = $found.Count - 1; $i -ge 0; $i--) {
+        $g   = $found[$i].Groups[2]
+        $out = $out.Remove($g.Index, $g.Length).Insert($g.Index, "%%TXT$i%%")
+    }
+    return $out
+}
+
 # --- Walk all filters (paginated) ---
 $startAt      = 0
-$totalScanned = 0
-$flagged      = New-Object System.Collections.Generic.List[object]
+$totalScanned  = 0
+$textOnlyCount = 0
+$flagged       = New-Object System.Collections.Generic.List[object]
 
 do {
     $uri = "$JiraBaseUrl/rest/api/3/filter/search?startAt=$startAt&maxResults=$PageSize&expand=jql"
@@ -100,26 +123,52 @@ do {
         $totalScanned++
         if ([string]::IsNullOrWhiteSpace($filter.jql)) { continue }
 
-        $found = $tokenRegex.Matches($filter.jql)
-        if ($found.Count -gt 0) {
-            $rawKeys = $found | ForEach-Object { if ($CaseInsensitiveKeys) { $_.Value.ToUpper() } else { $_.Value } }
-            $keys    = ($rawKeys | Sort-Object -Unique) -join ', '
-            $flagged.Add([PSCustomObject]([ordered]@{
-                'Filter Name'  = $filter.name
-                'Filter ID'    = $filter.id
-                'Owner Name'   = $filter.owner.displayName
-                'Owner Email'  = "$($filter.owner.emailAddress)"
-                'Owner ID'     = $filter.owner.accountId
-                'Matched Keys' = $keys
-                'JQL'          = $filter.jql
-            }))
-            Write-Host ("=" * 70) -ForegroundColor Yellow
-            Write-Host "Filter ID    : $($filter.id)"
-            Write-Host "Filter Name  : $($filter.name)"
-            Write-Host "Owner        : $($filter.owner.displayName)"
-            Write-Host "Matched Keys : $keys" -ForegroundColor Green
-            Write-Host "JQL          : $($filter.jql)"
+        # Detect against the masked JQL: keys inside ~ text operands don't count.
+        $maskedJql = Get-TextMaskedJql -Jql $filter.jql
+        $found     = $tokenRegex.Matches($maskedJql)
+
+        if ($found.Count -eq 0) {
+            if ($tokenRegex.IsMatch($filter.jql)) {
+                $textOnlyCount++
+                if ($IncludeTextOnlyMatches) {
+                    $rawKeys = $tokenRegex.Matches($filter.jql) | ForEach-Object { if ($CaseInsensitiveKeys) { $_.Value.ToUpper() } else { $_.Value } }
+                    $flagged.Add([PSCustomObject]([ordered]@{
+                        'Filter Name'   = $filter.name
+                        'Filter ID'     = $filter.id
+                        'Owner Name'    = $filter.owner.displayName
+                        'Owner Email'   = "$($filter.owner.emailAddress)"
+                        'Owner ID'      = $filter.owner.accountId
+                        'Matched Keys'  = (($rawKeys | Sort-Object -Unique) -join ', ')
+                        'Match Context' = 'Body content only'
+                        'JQL'           = $filter.jql
+                    }))
+                    Write-Host "[$($filter.name)] keys only inside ~ text-search operands — included as 'Body content only'" -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host "[$($filter.name)] excluded — asset keys only inside ~ text-search operands (content match)" -ForegroundColor DarkGray
+                }
+            }
+            continue
         }
+
+        $rawKeys = $found | ForEach-Object { if ($CaseInsensitiveKeys) { $_.Value.ToUpper() } else { $_.Value } }
+        $keys    = ($rawKeys | Sort-Object -Unique) -join ', '
+        $flagged.Add([PSCustomObject]([ordered]@{
+            'Filter Name'   = $filter.name
+            'Filter ID'     = $filter.id
+            'Owner Name'    = $filter.owner.displayName
+            'Owner Email'   = "$($filter.owner.emailAddress)"
+            'Owner ID'      = $filter.owner.accountId
+            'Matched Keys'  = $keys
+            'Match Context' = 'JQL clause'
+            'JQL'           = $filter.jql
+        }))
+        Write-Host ("=" * 70) -ForegroundColor Yellow
+        Write-Host "Filter ID    : $($filter.id)"
+        Write-Host "Filter Name  : $($filter.name)"
+        Write-Host "Owner        : $($filter.owner.displayName)"
+        Write-Host "Matched Keys : $keys" -ForegroundColor Green
+        Write-Host "JQL          : $($filter.jql)"
     }
 
     $startAt += @($page.values).Count
@@ -132,6 +181,7 @@ Write-Host ""
 Write-Host ("-" * 50)
 Write-Host "Scanned : $totalScanned filters" -ForegroundColor Cyan
 Write-Host "Flagged : $($flagged.Count) filters containing asset key references" -ForegroundColor Cyan
+Write-Host "$(if ($IncludeTextOnlyMatches) { 'Included' } else { 'Excluded' }) : $textOnlyCount filters with keys only in ~ text-search operands (body content matches)" -ForegroundColor Cyan
 if (-not $OverrideSharePermissions) {
     Write-Host "Note: only filters visible to this account were scanned. Use -OverrideSharePermissions (admin) to include private filters." -ForegroundColor DarkYellow
 }
