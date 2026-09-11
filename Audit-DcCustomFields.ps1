@@ -1,4 +1,4 @@
-<#
+﻿<#
 .SYNOPSIS
     Audits the fate of custom fields referenced as cf[NNNNN] in migrated filter
     JQLs by traversing the DC advanced audit log history. Read-only.
@@ -38,8 +38,12 @@ param (
     [Parameter(Mandatory)]
     [string[]]$FieldIds,               # numeric ids or customfield_NNNNN
 
-    # Audit event types to traverse (comma-separated, exactly as Jira names them)
-    [string]$Actions = 'Custom field created,Custom field updated,Custom field deleted',
+    # Audit event types to traverse (comma-separated, exactly as Jira names them).
+    # Mixed English/German: action names changed with DC upgrades and locale.
+    [string]$Actions = 'Custom field created,Custom field updated,Custom field deleted,' +
+                       'Benutzerdefiniertes Feld erstellt,Benutzerdefiniertes Feld geändert,' +
+                       'Benutzerdefiniertes Feld aktualisiert,Benutzerdefiniertes Feld gelöscht,' +
+                       'Benutzerdefiniertes Feld archiviert',
 
     [int]$PageSize = 100,
 
@@ -99,6 +103,7 @@ foreach ($raw in $FieldIds) {
         Created   = $null
         Renames   = New-Object System.Collections.Generic.List[string]
         Deleted   = $null
+        Archived  = $null
         Events    = 0
     }
 }
@@ -118,10 +123,15 @@ foreach ($t in $targets.Values) {
 
 # Ids still needing a deletion event to be considered resolved
 $pendingDeletion = @($targets.Values | Where-Object { -not $_.DcActive } | ForEach-Object { $_.Id })
-Write-Host "Awaiting deletion events for: $(if ($pendingDeletion) { $pendingDeletion -join ', ' } else { '(none — all active)' })" -ForegroundColor Cyan
+Write-Host "Awaiting deletion/archive events for: $(if ($pendingDeletion) { $pendingDeletion -join ', ' } else { '(none — all active)' })" -ForegroundColor Cyan
 
 # --- Traverse audit history ---
-$actionsParam = ($Actions -replace ' ', '+')
+# Encode each action separately (umlauts -> %C3%A4 etc.), keep commas literal so
+# the server sees the list, and spaces as '+' exactly like the tested query form.
+$actionsParam = (($Actions -split ',') | ForEach-Object {
+    ([uri]::EscapeDataString($_.Trim())) -replace '%20', '+'
+}) -join ','
+Write-Host "Actions filter     : $actionsParam" -ForegroundColor DarkGray
 $uri   = "$DcBaseUrl/rest/auditing/1.0/events?search=&actions=$actionsParam&limit=$PageSize"
 $page  = 0
 $scanned = 0
@@ -148,20 +158,27 @@ while ($uri) {
             $when   = $e.timestamp
             if ($obj.name -and -not $t.Name) { $t.Name = $obj.name }   # latest known name (history is newest-first)
 
+            # Stems with wildcards tolerate umlauts in any encoding (gelöscht / gel?scht)
             switch -Regex ($action) {
-                'created' {
+                'archived|archiviert' {
+                    $t.Archived = "$when by $who"
+                    Write-Host "[$($t.Id)] ARCHIVED $when by $who — '$($obj.name)'" -ForegroundColor DarkYellow
+                    $pendingDeletion = @($pendingDeletion | Where-Object { $_ -ne $t.Id })
+                    break
+                }
+                'created|erstellt' {
                     $t.Created = "$when by $who"
                     $nameAtCreate = ($e.changedValues | Where-Object { $_.key -eq 'Name' } | Select-Object -First 1).to
                     Write-Host "[$($t.Id)] CREATED  $when by $who — '$nameAtCreate'" -ForegroundColor DarkGray
                 }
-                'updated' {
+                'updated|ge.ndert|aktualisiert' {
                     $nameChange = $e.changedValues | Where-Object { $_.key -eq 'Name' -and $_.from -ne $_.to } | Select-Object -First 1
                     if ($nameChange) {
                         $t.Renames.Add("$when '$($nameChange.from)' -> '$($nameChange.to)' by $who")
                         Write-Host "[$($t.Id)] RENAMED  $when '$($nameChange.from)' -> '$($nameChange.to)' by $who" -ForegroundColor DarkYellow
                     }
                 }
-                'deleted' {
+                'deleted|gel.scht' {
                     $src = if ($e.source) { " from $($e.source)" } else { '' }
                     $t.Deleted = "$when by $who$src"
                     Write-Host "[$($t.Id)] DELETED  $when by $who$src — '$($obj.name)'" -ForegroundColor Red
@@ -211,6 +228,8 @@ foreach ($t in $targets.Values) {
         if     ($cloudStatus -like 'ACTIVE*') { 'ActiveInCloud — reference resolves; error is permission/context' }
         elseif ($t.Deleted -and $mapping)     { "DeletedInDc ($($t.Deleted)) — but a same-named Cloud field exists; mapping possible: $mapping" }
         elseif ($t.Deleted)                   { "DeletedInDc ($($t.Deleted)) — referencing filters were broken pre-migration (Obsolete)" }
+        elseif ($t.Archived -and $mapping)    { "ArchivedInDc ($($t.Archived)) — archived fields are not migrated; same-named Cloud field exists, mapping possible: $mapping" }
+        elseif ($t.Archived)                  { "ArchivedInDc ($($t.Archived)) — archived fields are not migrated to Cloud; unarchive in DC + re-migrate, or map to a Cloud successor" }
         elseif ($t.DcActive -and $mapping)    { "OrphanedId — alive in DC as '$($t.Name)', ID not preserved by migration; map: $mapping" }
         elseif ($t.DcActive)                  { "OrphanedId — alive in DC as '$($t.Name)'; resolve Cloud successor by name" }
         elseif ($t.Events -gt 0)              { "HistoryOnly — events found but no deletion within traversed range (last name '$($t.Name)')" }
@@ -221,6 +240,7 @@ foreach ($t in $targets.Values) {
     Write-Host "  created   : $(if ($t.Created) { $t.Created } else { 'not in traversed history' })"
     Write-Host "  renames   : $(if ($t.Renames.Count) { $t.Renames.Count } else { 'none' })"
     foreach ($rn in $t.Renames) { Write-Host "              $rn" }
+    Write-Host "  archived  : $(if ($t.Archived) { $t.Archived } else { 'no archive event' })" -ForegroundColor $(if ($t.Archived) { 'DarkYellow' } else { 'Gray' })
     Write-Host "  deleted   : $(if ($t.Deleted) { $t.Deleted } else { 'no deletion event' })" -ForegroundColor $(if ($t.Deleted) { 'Red' } else { 'Gray' })
     if ($cloudH) { Write-Host "  cloud     : $cloudStatus$(if ($successor) { "; successor by name: $successor" })" }
     Write-Host "  VERDICT   : $verdict" -ForegroundColor Magenta
@@ -232,6 +252,7 @@ foreach ($t in $targets.Values) {
         'DC Active'         = $t.DcActive
         'Created'           = "$($t.Created)"
         'Renames'           = ($t.Renames -join "`n")
+        'Archived'          = "$($t.Archived)"
         'Deleted'           = "$($t.Deleted)"
         'Audit Events'      = $t.Events
         'Cloud Status'      = $cloudStatus
