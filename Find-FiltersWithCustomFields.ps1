@@ -2,7 +2,8 @@
 <#
 .SYNOPSIS
     Cross-references a Jira filter inventory CSV against a custom field CSV and reports
-    every filter whose JQL references one of those custom fields (by id or by name).
+    every filter whose JQL references one of those custom fields (by id or by name),
+    together with the DC -> Cloud remap for each reference.
 
 .DESCRIPTION
     Detects three JQL reference forms:
@@ -17,7 +18,7 @@
     Path to the filter inventory CSV. Must contain a "Filter JQL" column.
 
 .PARAMETER CustomFieldsCsv
-    Path to the custom field CSV. Must contain "DcId" (e.g. customfield_82822) and "DcName".
+    Path to the custom field CSV. Must contain "DcId", "DcName", "CloudId", "CloudName".
 
 .PARAMETER OutputCsv
     Path of the report to write.
@@ -55,6 +56,8 @@ param(
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
+$ARROW = [char]0x2192   # U+2192 RIGHTWARDS ARROW
+
 # ---------------------------------------------------------------- helpers ----
 
 function Get-Val {
@@ -82,7 +85,7 @@ foreach ($p in @($FilterInventoryCsv, $CustomFieldsCsv)) {
 Write-Verbose "Reading custom fields: $CustomFieldsCsv"
 $cfRows = @(Import-Csv -LiteralPath $CustomFieldsCsv -Delimiter $Delimiter -Encoding UTF8)
 if (-not $cfRows.Count) { throw "Custom field CSV contains no rows: $CustomFieldsCsv" }
-Assert-Column -Row $cfRows[0] -Required @('DcId', 'DcName') -FileLabel 'Custom field CSV'
+Assert-Column -Row $cfRows[0] -Required @('DcId', 'DcName', 'CloudId', 'CloudName') -FileLabel 'Custom field CSV'
 
 Write-Verbose "Reading filter inventory: $FilterInventoryCsv"
 $filterRows = @(Import-Csv -LiteralPath $FilterInventoryCsv -Delimiter $Delimiter -Encoding UTF8)
@@ -91,56 +94,62 @@ Assert-Column -Row $filterRows[0] -Required @('Filter JQL') -FileLabel 'Filter i
 
 # ------------------------------------------------- build the lookup tables ----
 
-# numericId -> canonical "customfield_NNNNN"
-$idToCanonical = @{}
-# numericId -> display name (first one wins; collisions recorded)
-$idToName      = @{}
-# lowercase name -> [ordered list of canonical ids]
-$nameToIds     = @{}
-# lowercase name -> canonical (original-cased) name
+# dcNum -> field record
+$cfByNum   = @{}
+# lowercase DcName -> list of dcNum
+$nameToNum = @{}
+# lowercase DcName -> original-cased DcName
 $nameCanonical = @{}
 
 $skippedShort = New-Object System.Collections.Generic.List[string]
-$badIdRows    = 0
 
 foreach ($cf in $cfRows) {
-    $rawId   = (Get-Val $cf 'DcId').Trim()
-    $rawName = (Get-Val $cf 'DcName').Trim()
+    $rawDcId    = (Get-Val $cf 'DcId').Trim()
+    $rawDcName  = (Get-Val $cf 'DcName').Trim()
+    $rawCloudId = (Get-Val $cf 'CloudId').Trim()
+    $rawCloudNm = (Get-Val $cf 'CloudName').Trim()
 
-    if ($rawId -notmatch '(\d+)') { $badIdRows++; continue }
-    $num       = $Matches[1]
-    $canonical = "customfield_$num"
+    if ($rawDcId -notmatch '(\d+)') { continue }
+    $dcNum = $Matches[1]
 
-    $idToCanonical[$num] = $canonical
-    if ($rawName -and -not $idToName.ContainsKey($num)) { $idToName[$num] = $rawName }
+    $cloudNum = ''
+    if ($rawCloudId -match '(\d+)') { $cloudNum = $Matches[1] }
 
-    if ($rawName) {
-        $key = $rawName.ToLowerInvariant()
-        if ($rawName.Length -lt $MinNameLength) {
-            if ($skippedShort -notcontains $rawName) { $skippedShort.Add($rawName) }
+    if (-not $cfByNum.ContainsKey($dcNum)) {
+        $cfByNum[$dcNum] = [pscustomobject]@{
+            DcNum     = $dcNum
+            DcName    = $rawDcName
+            CloudNum  = $cloudNum
+            CloudName = $rawCloudNm
+        }
+    }
+
+    if ($rawDcName) {
+        if ($rawDcName.Length -lt $MinNameLength) {
+            if ($skippedShort -notcontains $rawDcName) { $skippedShort.Add($rawDcName) }
             continue
         }
-        if (-not $nameToIds.ContainsKey($key)) {
-            $nameToIds[$key]     = New-Object System.Collections.Generic.List[string]
-            $nameCanonical[$key] = $rawName
+        $key = $rawDcName.ToLowerInvariant()
+        if (-not $nameToNum.ContainsKey($key)) {
+            $nameToNum[$key]     = New-Object System.Collections.Generic.List[string]
+            $nameCanonical[$key] = $rawDcName
         }
-        if (-not $nameToIds[$key].Contains($canonical)) { $nameToIds[$key].Add($canonical) }
+        if (-not $nameToNum[$key].Contains($dcNum)) { $nameToNum[$key].Add($dcNum) }
     }
 }
 
-if ($badIdRows) { Write-Warning "$badIdRows custom field row(s) had no numeric id in 'DcId' and were skipped." }
 if ($skippedShort.Count) {
     Write-Warning ("Name matching skipped for {0} name(s) shorter than {1} chars: {2}" -f `
         $skippedShort.Count, $MinNameLength, ($skippedShort -join ', '))
 }
-Write-Verbose "Loaded $($idToCanonical.Count) custom field id(s), $($nameToIds.Count) distinct name(s)."
+Write-Verbose "Loaded $($cfByNum.Count) custom field id(s), $($nameToNum.Count) distinct name(s)."
 
 # One combined, case-insensitive alternation for names. Longest first so that
 # "Team Name" wins over "Team" when both exist.
 $nameRegex = $null
-if (-not $SkipNameMatching -and $nameToIds.Count) {
+if (-not $SkipNameMatching -and $nameToNum.Count) {
     $alts = @(
-        $nameToIds.Keys |
+        $nameToNum.Keys |
             Sort-Object -Property @{ Expression = { $_.Length } } -Descending |
             ForEach-Object { [regex]::Escape($nameCanonical[$_]) }
     )
@@ -151,7 +160,7 @@ if (-not $SkipNameMatching -and $nameToIds.Count) {
         [System.Text.RegularExpressions.RegexOptions]::Compiled)
 }
 
-$idRegex     = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
+$idRegex      = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
     [System.Text.RegularExpressions.RegexOptions]::Compiled)
 $bracketRegex = [regex]::new('(?<!\w)cf\s*\[\s*(\d+)\s*\]',
@@ -162,7 +171,7 @@ $bracketRegex = [regex]::new('(?<!\w)cf\s*\[\s*(\d+)\s*\]',
 
 $passThroughColumns = @(
     'Filter Name', 'Filter Id', 'Filter Type', 'Filter Status', 'Filter Errors',
-    'Inventory Log', 'Filter JQL', 'OwnerName', 'Owner Id', 'Owner Key', 'Owner Status'
+    'Inventory Log', 'Filter JQL', 'Owner Name', 'Owner Id', 'Owner Key', 'Owner Status'
 )
 
 $absent = @($passThroughColumns | Where-Object { -not $filterRows[0].PSObject.Properties[$_] })
@@ -170,79 +179,99 @@ if ($absent.Count) {
     Write-Warning "Filter inventory has no column(s): $($absent -join ', '). They will be blank in the report."
 }
 
-$report  = New-Object System.Collections.Generic.List[object]
-$scanned = 0
+$report          = New-Object System.Collections.Generic.List[object]
+$missingCloudNm  = New-Object System.Collections.Generic.List[string]
+$missingCloudId  = New-Object System.Collections.Generic.List[string]
+$scanned         = 0
 
 foreach ($row in $filterRows) {
     $scanned++
     $jql = Get-Val $row 'Filter JQL'
     if ([string]::IsNullOrWhiteSpace($jql)) { continue }
 
-    $hitIds       = [ordered]@{}   # canonical id -> $true
-    $hitNames     = [ordered]@{}   # canonical name -> $true
-    $viaIdSyntax  = $false
-    $viaCfSyntax  = $false
-    $viaName      = $false
-    $unknownIds   = New-Object System.Collections.Generic.List[string]
+    $hitNums = [ordered]@{}   # dcNum -> $true, insertion ordered
 
     foreach ($m in $idRegex.Matches($jql)) {
-        $num = $m.Groups[1].Value
-        if ($idToCanonical.ContainsKey($num)) {
-            $hitIds["customfield_$num"] = $true
-            $viaIdSyntax = $true
-            if ($idToName.ContainsKey($num)) { $hitNames[$idToName[$num]] = $true }
-        }
+        $n = $m.Groups[1].Value
+        if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true }
     }
-
     foreach ($m in $bracketRegex.Matches($jql)) {
-        $num = $m.Groups[1].Value
-        if ($idToCanonical.ContainsKey($num)) {
-            $hitIds["customfield_$num"] = $true
-            $viaCfSyntax = $true
-            if ($idToName.ContainsKey($num)) { $hitNames[$idToName[$num]] = $true }
-        }
+        $n = $m.Groups[1].Value
+        if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true }
     }
-
     if ($nameRegex) {
         foreach ($m in $nameRegex.Matches($jql)) {
             $key = $m.Groups[1].Value.ToLowerInvariant()
-            if ($nameToIds.ContainsKey($key)) {
-                $viaName = $true
-                $hitNames[$nameCanonical[$key]] = $true
-                foreach ($cid in $nameToIds[$key]) { $hitIds[$cid] = $true }
+            if ($nameToNum.ContainsKey($key)) {
+                foreach ($n in $nameToNum[$key]) { $hitNums[$n] = $true }
             }
         }
     }
 
-    if ($hitIds.Count -eq 0 -and $hitNames.Count -eq 0) { continue }
+    if ($hitNums.Count -eq 0) { continue }
 
-    # --- comments -------------------------------------------------------------
-    $notes = New-Object System.Collections.Generic.List[string]
-    $forms = @()
-    if ($viaIdSyntax) { $forms += 'customfield_NNN' }
-    if ($viaCfSyntax) { $forms += 'cf[NNN]' }
-    if ($viaName)     { $forms += 'display name' }
-    $notes.Add("Referenced via: $($forms -join ', ')")
+    $ids     = New-Object System.Collections.Generic.List[string]
+    $names   = New-Object System.Collections.Generic.List[string]
+    $changes = New-Object System.Collections.Generic.List[string]
+    $notes   = New-Object System.Collections.Generic.List[string]
 
-    if ($viaName -and -not ($viaIdSyntax -or $viaCfSyntax)) {
-        $notes.Add('Name-only reference - remap depends on the Cloud field name, verify for homonyms')
-    }
-    foreach ($n in $hitNames.Keys) {
-        $key = $n.ToLowerInvariant()
-        if ($nameToIds.ContainsKey($key) -and $nameToIds[$key].Count -gt 1) {
-            $notes.Add("Ambiguous name '$n' maps to $($nameToIds[$key].Count) ids: $($nameToIds[$key] -join ' / ')")
+    foreach ($n in $hitNums.Keys) {
+        $f = $cfByNum[$n]
+
+        $ids.Add("customfield_$($f.DcNum)")
+        if ($f.DcName -and -not $names.Contains($f.DcName)) { $names.Add($f.DcName) }
+
+        # --- id remap: always a change ---------------------------------------
+        if ($f.CloudNum) {
+            $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
+        }
+        else {
+            $changes.Add("cf[$($f.DcNum)] $ARROW ???")
+            $label = "$($f.DcName) (customfield_$($f.DcNum))"
+            $notes.Add("No matching Cloud Id for DC CustomField ""$($f.DcName)""")
+            if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+        }
+
+        # --- name remap ------------------------------------------------------
+        if ($f.DcName) {
+            if (-not $f.CloudName) {
+                $changes.Add("$($f.DcName) $ARROW ???")
+                $notes.Add("No matching Cloud Name for DC CustomField ""$($f.DcName)""")
+                if (-not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
+            }
+            elseif ($f.DcName -cne $f.CloudName) {
+                $changes.Add("$($f.DcName) $ARROW $($f.CloudName)")
+            }
+            else {
+                $notes.Add("DC custom field ""$($f.DcName)"" is also ""$($f.CloudName)"" in Cloud")
+            }
+        }
+
+        # --- ambiguity: same DC name behind more than one DC id --------------
+        if ($f.DcName) {
+            $key = $f.DcName.ToLowerInvariant()
+            if ($nameToNum.ContainsKey($key) -and $nameToNum[$key].Count -gt 1) {
+                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to customfield_$($nameToNum[$key] -join ' / customfield_')"
+                if (-not $notes.Contains($dupe)) { $notes.Add($dupe) }
+            }
         }
     }
-    if ($hitIds.Count -gt 1) { $notes.Add("$($hitIds.Count) custom fields referenced in one JQL") }
 
-    # --- emit -----------------------------------------------------------------
     $out = [ordered]@{}
     foreach ($c in $passThroughColumns) { $out[$c] = Get-Val $row $c }
-    $out['CustomField Ids']   = ($hitIds.Keys   -join ', ')
-    $out['CustomField Names'] = ($hitNames.Keys -join ', ')
-    $out['Comments']          = ($notes -join '; ')
+    $out['CustomField Ids']     = ($ids     -join ', ')
+    $out['CustomField Names']   = ($names   -join ', ')
+    $out['CustomField Changes'] = ($changes -join ', ')
+    $out['Comments']            = ($notes   -join '; ')
 
     $report.Add([pscustomobject]$out)
+}
+
+foreach ($nm in $missingCloudNm) {
+    Write-Warning "No matching Cloud Name for DC CustomField ""$nm"" - referenced by at least one filter."
+}
+foreach ($nm in $missingCloudId) {
+    Write-Warning "No matching Cloud Id for DC CustomField $nm - referenced by at least one filter."
 }
 
 # ----------------------------------------------------------------- output ----
@@ -263,12 +292,11 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
 if ($report.Count) {
     $report | Export-Csv -LiteralPath $OutputCsv -Delimiter $Delimiter -Encoding $enc -NoTypeInformation
 } else {
-    # still produce a well-formed, empty report with headers
     $header = [ordered]@{}
     foreach ($c in $passThroughColumns) { $header[$c] = '' }
-    $header['CustomField Ids'] = ''; $header['CustomField Names'] = ''; $header['Comments'] = ''
+    $header['CustomField Ids'] = ''; $header['CustomField Names'] = ''
+    $header['CustomField Changes'] = ''; $header['Comments'] = ''
     ([pscustomobject]$header) | Export-Csv -LiteralPath $OutputCsv -Delimiter $Delimiter -Encoding $enc -NoTypeInformation
-    # drop the placeholder data row, keep the header line
     $lines = Get-Content -LiteralPath $OutputCsv -Encoding UTF8
     Set-Content -LiteralPath $OutputCsv -Value $lines[0] -Encoding $enc
 }
