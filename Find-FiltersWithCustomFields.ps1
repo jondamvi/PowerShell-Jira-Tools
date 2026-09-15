@@ -1,56 +1,55 @@
 ﻿#requires -Version 5.1
 <#
 .SYNOPSIS
-    Cross-references a Jira filter inventory CSV against a custom field CSV and reports
-    every filter whose JQL references one of those custom fields (by id or by name),
-    together with the DC -> Cloud remap for each reference.
+    Reads every filter from Jira Cloud, runs custom field discovery against the
+    Cloud JQL, aligns each filter to the DC inventory CSV by filter name, and
+    writes a remediation report.
 
 .DESCRIPTION
-    Detects three JQL reference forms:
-        customfield_82822        (explicit id syntax)
-        cf[82822]                (bracket syntax, whitespace tolerant)
-        "Field Display Name"     (name syntax, quoted or bare, word-boundary anchored)
+    Filters are read from /rest/api/3/filter/search with overrideSharePermissions=true
+    so private filters are included. That parameter requires the Administer Jira
+    global permission.
 
-    When CloudName is empty, a built-in system field mapping table is consulted before
-    the field is reported as unresolved. "Filter Errors" is parsed for known error
-    patterns; fields reported as non-existent are excluded from the remap output.
+    All Cloud responses are decoded as UTF-8 explicitly, so German characters
+    survive on Windows PowerShell 5.1 as well as PowerShell 7.
 
-    Only filters with at least one match are written to the output report.
-    All IO is UTF-8 (BOM on output by default so Excel renders German characters correctly).
-    The script source itself is pure ASCII - non-ASCII literals are built with [char]
-    escapes so it behaves identically whether PowerShell reads it as UTF-8 or ANSI.
+.PARAMETER CloudBaseUrl
+    e.g. https://yoursite.atlassian.net
+
+.PARAMETER CloudEmail
+    Atlassian account e-mail used for Basic auth.
+
+.PARAMETER CloudApiToken
+    API token for that account (id.atlassian.com > Security > API tokens).
+
+.PARAMETER CloudFiltersCacheJson
+    Optional. If the file exists it is read instead of calling the API; if it does
+    not exist, the fetched filters are written there. Saves re-fetching while
+    iterating on the report.
 
 .PARAMETER FilterInventoryCsv
-    Path to the filter inventory CSV. Must contain a "Filter JQL" column.
+    DC inventory CSV. Must contain "Filter Name".
 
 .PARAMETER CustomFieldsCsv
-    Path to the custom field CSV. Must contain "DcId", "DcName", "CloudId", "CloudName".
-
-.PARAMETER OutputCsv
-    Path of the report to write.
-
-.PARAMETER Delimiter
-    Delimiter for both input and output. Default ','. Use ';' for German-locale Excel exports.
-
-.PARAMETER MinNameLength
-    Custom field names shorter than this are not name-matched (avoids noise from names
-    like "ID" or "Typ" colliding with JQL keywords). Default 3. Their ids are still matched.
-
-.PARAMETER SkipNameMatching
-    Match ids only.
-
-.PARAMETER NoBom
-    Write UTF-8 without BOM.
+    Custom field CSV. Must contain "DcId", "DcName", "CloudId", "CloudName";
+    "NameNormalized" is used when present to rejoin rows split over two lines.
 
 .EXAMPLE
-    .\Find-AffectedFilters.ps1 -FilterInventoryCsv .\filters.csv -CustomFieldsCsv .\cf.csv -OutputCsv .\affected.csv
+    .\Find-AffectedFilters.ps1 -CloudBaseUrl https://acme.atlassian.net `
+        -CloudEmail me@acme.com -CloudApiToken $tok `
+        -FilterInventoryCsv .\FilterInventory.csv -CustomFieldsCsv .\CustomFields.csv `
+        -OutputCsv .\affected-fields.csv -StatusOutputCsv .\affected-statuses.csv
 #>
 [CmdletBinding()]
 param(
+    [Parameter(Mandatory = $true)][string]$CloudBaseUrl,
+    [Parameter(Mandatory = $true)][string]$CloudEmail,
+    [Parameter(Mandatory = $true)][string]$CloudApiToken,
     [Parameter(Mandatory = $true)][string]$FilterInventoryCsv,
     [Parameter(Mandatory = $true)][string]$CustomFieldsCsv,
     [Parameter(Mandatory = $true)][string]$OutputCsv,
     [string]$StatusOutputCsv,
+    [string]$CloudFiltersCacheJson,
     [string]$Delimiter = ',',
     [int]$MinNameLength = 3,
     [switch]$SkipNameMatching,
@@ -61,15 +60,16 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
 $ARROW = [char]0x2192   # U+2192 RIGHTWARDS ARROW
-$UE    = [char]0x00FC   # u-umlaut, used so this file stays ASCII-only on disk
-$AE    = [char]0x00E4   # a-umlaut
 $DASH  = [char]0x2014   # U+2014 EM DASH
-$NL    = "`n"           # in-cell line break for the Comments column
+$UE    = [char]0x00FC   # u-umlaut
+$AE    = [char]0x00E4   # a-umlaut
+$OE    = [char]0x00F6   # o-umlaut
+$NL    = "`n"           # in-cell line break
 
 # ============================================================================
 #  Pre-defined DC (German) -> Cloud (English) names for Jira built-in fields.
-#  Consulted only when CloudName is empty. Keys are lower-case DC names.
-#  Add to this table as you confirm more against the Cloud instance.
+#  Also used as the join key when the custom field CSV splits a field over two
+#  lines. Keys are lower-case DC names.
 # ============================================================================
 $SystemFieldNameMap = @{}
 $SystemFieldNameMap['rang']                     = 'Rank'
@@ -89,12 +89,10 @@ $SystemFieldNameMap['entwicklung']              = 'Development'
 $SystemFieldNameMap["gesch${AE}ftswert"]        = 'Business Value'
 
 # ============================================================================
-#  Deprecated fields and fields that always need a human decision, even when
-#  a Cloud name exists. Reported in Comments whenever the field is referenced.
-#  Keys are lower-case DC names; the value is appended to Comments verbatim.
+#  One-sentence notes for deprecated fields. Keys are lower-case DC names.
 # ============================================================================
 $ReviewFieldNotes = @{}
-$ReviewFieldNotes['epic-verkn' + $UE + 'pfung'] = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.'
+$ReviewFieldNotes["epic-verkn${UE}pfung"]  = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.'
 $ReviewFieldNotes['epic link']             = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.'
 $ReviewFieldNotes['epic-name']             = 'Custom field "Epic Name" is deprecated in Cloud.'
 $ReviewFieldNotes['epic name']             = 'Custom field "Epic Name" is deprecated in Cloud.'
@@ -110,16 +108,16 @@ foreach ($u in @('issueFunction', 'Original story points', 'Gruppen', 'Groups'))
 }
 
 # ============================================================================
-#  Clause names that are deprecated in Cloud, matched against the raw JQL so
-#  they are caught even when the filter references the field by id.
+#  Clause names deprecated in Cloud, matched against the raw JQL so they are
+#  caught even when the filter references the field by id.
 # ============================================================================
 $DeprecatedJqlTerms = @(
-    [pscustomobject]@{ Term = 'Epic Link';                    Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
-    [pscustomobject]@{ Term = 'Epic-Verkn' + $UE + 'pfung';   Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
-    [pscustomobject]@{ Term = 'Epic Name';                    Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
-    [pscustomobject]@{ Term = 'Epic-Name';                    Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
-    [pscustomobject]@{ Term = 'Parent Link';                  Note = 'Custom field "Parent Link" is deprecated in Cloud, use "parent" instead.' }
-    [pscustomobject]@{ Term = 'parentEpic';                   Note = 'JQL function "parentEpic" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'Epic Link';                  Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = "Epic-Verkn${UE}pfung";       Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'Epic Name';                  Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
+    [pscustomobject]@{ Term = 'Epic-Name';                  Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
+    [pscustomobject]@{ Term = 'Parent Link';                Note = 'Custom field "Parent Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'parentEpic';                 Note = 'JQL function "parentEpic" is deprecated in Cloud, use "parent" instead.' }
 )
 foreach ($d in $DeprecatedJqlTerms) {
     $d | Add-Member -NotePropertyName Regex -NotePropertyValue ([regex]::new(
@@ -129,31 +127,33 @@ foreach ($d in $DeprecatedJqlTerms) {
 }
 
 # ============================================================================
-#  Jira out-of-the-box statuses (Software / Core / Service Management), in the
-#  English and German spellings. Anything in a filter that is NOT in this list
-#  is reported as a custom status. Comparison is case-insensitive.
-#  Extend this list to match your own instance's definition of "standard".
+#  Jira out-of-the-box statuses, English and German. Anything else is reported
+#  as a custom status. Case-insensitive. Extend to match your own instance.
 # ============================================================================
 $BuiltInStatuses = @(
-    # Jira Software / Core - English
     'Open', 'In Progress', 'Reopened', 'Resolved', 'Closed',
     'To Do', 'In Review', 'Under Review', 'Done', 'Backlog',
     'Selected for Development', 'Approved', 'Rejected', 'Cancelled', 'Canceled',
-    # Jira Service Management - English
     'Waiting for support', 'Waiting for customer', 'Pending', 'Escalated',
     'Work in progress', 'Under investigation', 'Declined', 'Completed',
-    # Jira Software / Core - German
-    'Offen', 'In Arbeit', 'Wiedereröffnet', 'Erledigt', 'Geschlossen',
-    'Zu erledigen', 'Fertig', 'In Prüfung', 'Rückstand',
-    'Zur Entwicklung ausgewählt', 'Genehmigt', 'Abgelehnt', 'Storniert',
-    # Jira Service Management - German
+    'Offen', 'In Arbeit', "Wiederer" + $OE + "ffnet", 'Erledigt', 'Geschlossen',
+    'Zu erledigen', 'Fertig', "In Pr${UE}fung", "R${UE}ckstand",
+    "Zur Entwicklung ausgew${AE}hlt", 'Genehmigt', 'Abgelehnt', 'Storniert',
     'Warten auf Support', 'Warten auf Kunde', 'Ausstehend', 'Eskaliert',
     'In Bearbeitung', 'Wird untersucht', 'Abgeschlossen'
 )
 $BuiltInStatusSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($s in $BuiltInStatuses) { [void]$BuiltInStatusSet.Add($s) }
 
-# JQL status clauses. "(?!\w)" after the field name keeps statusCategory out.
+# ---------------------------------------------------------------- regexes ----
+
+$idRegex      = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+    [System.Text.RegularExpressions.RegexOptions]::Compiled)
+$bracketRegex = [regex]::new('(?<!\w)cf\s*\[\s*(\d+)\s*\]',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+    [System.Text.RegularExpressions.RegexOptions]::Compiled)
+
 $statusSingleRegex = [regex]::new(
     '(?<!\w)"?status"?(?!\w)\s*(?:=|!=|~|!~|was\s+not(?!\s+in)|was(?!\s+(?:not\s+)?in)|changed\s+(?:to|from))\s*(?:"([^"]*)"|''([^'']*)''|([^\s()"'',]+))',
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
@@ -163,6 +163,32 @@ $statusListRegex = [regex]::new(
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
     [System.Text.RegularExpressions.RegexOptions]::Compiled)
 $listItemRegex = [regex]::new('"([^"]*)"|''([^'']*)''|([^,\s][^,]*)')
+
+$errLineRegex  = [regex]::new('^\s*ERROR\s*\d+\s*:\s*(.*?)\s*$',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$errFieldRegex = [regex]::new("^Field\s+'(.+?)'\s+does not exist or you do not have permission to view it\.?$",
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$errValueRegex = [regex]::new("^The value\s+'(.+?)'\s+does not exist for the field\s+'(.+?)'\.?$",
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+
+# ---------------------------------------------------------------- helpers ----
+
+function Get-Val {
+    param($Row, [string]$Name)
+    if ($null -eq $Row) { return '' }
+    $p = $Row.PSObject.Properties[$Name]
+    if ($null -eq $p -or $null -eq $p.Value) { return '' }
+    return [string]$p.Value
+}
+
+function Assert-Column {
+    param($Row, [string[]]$Required, [string]$FileLabel)
+    $have = @($Row.PSObject.Properties.Name)
+    $missing = @($Required | Where-Object { $have -notcontains $_ })
+    if ($missing.Count) {
+        throw "$FileLabel is missing required column(s): $($missing -join ', '). Found: $($have -join ', ')"
+    }
+}
 
 function Get-StatusesFromJql {
     param([string]$Jql)
@@ -195,51 +221,110 @@ function Get-StatusesFromJql {
     return ,$found
 }
 
-# ---------------------------------------------------------------- helpers ----
+function ConvertFrom-FilterErrors {
+    param([string]$Text)
+    $notes = New-Object System.Collections.Generic.List[string]
+    if ([string]::IsNullOrWhiteSpace($Text)) { return ,$notes }
+    foreach ($line in ($Text -split "`r?`n")) {
+        $m = $errLineRegex.Match($line)
+        if (-not $m.Success) { continue }
+        $bodyTxt = $m.Groups[1].Value.Trim().Trim('"').Trim()
+        if (-not $bodyTxt) { continue }
 
-function Get-Val {
-    param($Row, [string]$Name)
-    $p = $Row.PSObject.Properties[$Name]
-    if ($null -eq $p -or $null -eq $p.Value) { return '' }
-    return [string]$p.Value
+        $mf = $errFieldRegex.Match($bodyTxt)
+        if ($mf.Success) { $notes.Add("Error: Custom field '$($mf.Groups[1].Value)' does not exist."); continue }
+        $mv = $errValueRegex.Match($bodyTxt)
+        if ($mv.Success) { $notes.Add("Error: Value '$($mv.Groups[1].Value)' does not exist for field '$($mv.Groups[2].Value)'."); continue }
+        $notes.Add("Error: $bodyTxt")
+    }
+    if ($notes.Count -gt 0) { $notes.Insert(0, 'Filter was not working in DC due to errors.') }
+    return ,$notes
 }
 
-function Assert-Column {
-    param($Row, [string[]]$Required, [string]$FileLabel)
-    $have = @($Row.PSObject.Properties.Name)
-    $missing = @($Required | Where-Object { $have -notcontains $_ })
-    if ($missing.Count) {
-        throw "$FileLabel is missing required column(s): $($missing -join ', '). Found: $($have -join ', ')"
+# ------------------------------------------------------------ Jira Cloud -----
+
+if ($PSVersionTable.PSVersion.Major -lt 6) {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+}
+
+$script:JiraBase = $CloudBaseUrl.TrimEnd('/')
+$script:JiraHeaders = @{
+    Authorization = 'Basic ' + [Convert]::ToBase64String(
+        [Text.Encoding]::UTF8.GetBytes("${CloudEmail}:${CloudApiToken}"))
+    Accept        = 'application/json'
+}
+
+function Invoke-JiraGet {
+    param([string]$Uri)
+    $resp = Invoke-WebRequest -Uri $Uri -Headers $script:JiraHeaders -Method Get -UseBasicParsing
+    # decode explicitly as UTF-8: PS 5.1 otherwise falls back to the ANSI code page
+    $text = [System.Text.Encoding]::UTF8.GetString($resp.RawContentStream.ToArray())
+    return ($text | ConvertFrom-Json)
+}
+
+function Get-CloudFilters {
+    $all = New-Object System.Collections.Generic.List[object]
+    $startAt = 0
+    $pageSize = 50
+    do {
+        $uri = "$script:JiraBase/rest/api/3/filter/search" +
+               "?startAt=$startAt&maxResults=$pageSize" +
+               "&overrideSharePermissions=true" +
+               "&expand=jql,owner,sharePermissions"
+        Write-Verbose "GET $uri"
+        $page = Invoke-JiraGet -Uri $uri
+        if ($page.PSObject.Properties['values'] -and $page.values) {
+            foreach ($v in $page.values) { $all.Add($v) }
+        }
+        $isLast = $true
+        if ($page.PSObject.Properties['isLast']) { $isLast = [bool]$page.isLast }
+        $startAt += $pageSize
+        Write-Progress -Activity 'Reading filters from Jira Cloud' -Status "$($all.Count) fetched"
+    } while (-not $isLast)
+    Write-Progress -Activity 'Reading filters from Jira Cloud' -Completed
+    return ,$all
+}
+
+function Get-CloudFilterType {
+    param($Filter)
+    if (-not $Filter.PSObject.Properties['sharePermissions'] -or $null -eq $Filter.sharePermissions) { return 'Private' }
+    $types = @()
+    foreach ($p in $Filter.sharePermissions) {
+        if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
     }
+    $types = @($types | Sort-Object -Unique)
+    if (-not $types.Count) { return 'Private' }
+    return 'Shared (' + ($types -join ', ') + ')'
 }
 
 # ------------------------------------------------------------ load inputs ----
 
-foreach ($p in @($FilterInventoryCsv, $CustomFieldsCsv)) {
-    if (-not (Test-Path -LiteralPath $p)) { throw "Input file not found: $p" }
+foreach ($f in @($FilterInventoryCsv, $CustomFieldsCsv)) {
+    if (-not (Test-Path -LiteralPath $f)) { throw "Input file not found: $f" }
 }
 
-Write-Verbose "Reading custom fields: $CustomFieldsCsv"
 $cfRows = @(Import-Csv -LiteralPath $CustomFieldsCsv -Delimiter $Delimiter -Encoding UTF8)
 if (-not $cfRows.Count) { throw "Custom field CSV contains no rows: $CustomFieldsCsv" }
 Assert-Column -Row $cfRows[0] -Required @('DcId', 'DcName', 'CloudId', 'CloudName') -FileLabel 'Custom field CSV'
 
-Write-Verbose "Reading filter inventory: $FilterInventoryCsv"
-$filterRows = @(Import-Csv -LiteralPath $FilterInventoryCsv -Delimiter $Delimiter -Encoding UTF8)
-if (-not $filterRows.Count) { throw "Filter inventory CSV contains no rows: $FilterInventoryCsv" }
-Assert-Column -Row $filterRows[0] -Required @('Filter JQL') -FileLabel 'Filter inventory CSV'
+$dcRows = @(Import-Csv -LiteralPath $FilterInventoryCsv -Delimiter $Delimiter -Encoding UTF8)
+if (-not $dcRows.Count) { throw "Filter inventory CSV contains no rows: $FilterInventoryCsv" }
+Assert-Column -Row $dcRows[0] -Required @('Filter Name') -FileLabel 'Filter inventory CSV'
 
-# ------------------------------------------------- build the lookup tables ----
+# DC inventory indexed by filter name
+$dcByName = @{}
+foreach ($r in $dcRows) {
+    $nm = (Get-Val $r 'Filter Name').Trim()
+    if (-not $nm) { continue }
+    $k = $nm.ToLowerInvariant()
+    if (-not $dcByName.ContainsKey($k)) {
+        $dcByName[$k] = New-Object System.Collections.Generic.List[object]
+    }
+    $dcByName[$k].Add($r)
+}
 
-$cfByNum       = @{}   # dcNum -> field record
-$nameToNum     = @{}   # lower DcName -> list of dcNum
-$nameCanonical = @{}   # lower DcName -> original-cased DcName
+# --------------------------------------------------- custom field lookups ----
 
-$skippedShort = New-Object System.Collections.Generic.List[string]
-
-# Pass 1: index every row that carries Cloud data, keyed by NameNormalized.
-# The CSV splits some fields over two lines - the DC line has DcId/DcName only,
-# the Cloud line has CloudId/CloudName only - so the two halves are rejoined here.
 $cloudIndex = @{}
 foreach ($cf in $cfRows) {
     $cId = (Get-Val $cf 'CloudId').Trim()
@@ -252,9 +337,12 @@ foreach ($cf in $cfRows) {
         $cloudIndex[$key] = [pscustomobject]@{ CloudId = $cId; CloudName = $cNm }
     }
 }
-Write-Verbose "Indexed $($cloudIndex.Count) Cloud-side row(s) by normalized name."
 
-# Pass 2: the DC side.
+$cfByNum       = @{}
+$nameToNum     = @{}
+$nameCanonical = @{}
+$skippedShort  = New-Object System.Collections.Generic.List[string]
+
 foreach ($cf in $cfRows) {
     $rawDcId    = (Get-Val $cf 'DcId').Trim()
     $rawDcName  = (Get-Val $cf 'DcName').Trim()
@@ -271,11 +359,8 @@ foreach ($cf in $cfRows) {
     if ((-not $rawCloudNm -or -not $rawCloudId) -and $rawDcName) {
         $own = (Get-Val $cf 'NameNormalized').Trim().ToLowerInvariant()
         if (-not $own) { $own = $mk }
-
         $hit = $null
-        # a) a Cloud-only line carrying the same normalized name
         if ($cloudIndex.ContainsKey($own)) { $hit = $cloudIndex[$own] }
-        # b) the built-in mapping: "rang" -> "Rank" -> the line normalized as "rank"
         if ($null -eq $hit -and $hasMapping) {
             $tk = $SystemFieldNameMap[$mk].ToLowerInvariant()
             if ($cloudIndex.ContainsKey($tk)) { $hit = $cloudIndex[$tk] }
@@ -285,7 +370,6 @@ foreach ($cf in $cfRows) {
             if (-not $rawCloudId) { $rawCloudId = $hit.CloudId }
         }
     }
-    # last resort: the mapping table supplies the name even with no Cloud line
     if (-not $rawCloudNm -and $hasMapping) { $rawCloudNm = $SystemFieldNameMap[$mk] }
 
     $cloudNum = ''
@@ -319,16 +403,31 @@ if ($skippedShort.Count) {
     Write-Warning ("Name matching skipped for {0} name(s) shorter than {1} chars: {2}" -f `
         $skippedShort.Count, $MinNameLength, ($skippedShort -join ', '))
 }
-Write-Verbose "Loaded $($cfByNum.Count) custom field id(s), $($nameToNum.Count) distinct name(s)."
 
-# One combined, case-insensitive alternation for names. Longest first so that
-# "Team Name" wins over "Team" when both exist.
+# Cloud JQL references Cloud names, so match on those; fall back to the DC name
+# when the field has no Cloud name on file.
+$searchNameToNum = @{}
+$searchCanonical = @{}
+foreach ($k in $cfByNum.Keys) {
+    $f = $cfByNum[$k]
+    foreach ($cand in @($f.CloudName, $f.DcName)) {
+        if (-not $cand) { continue }
+        if ($cand.Length -lt $MinNameLength) { continue }
+        $ck = $cand.ToLowerInvariant()
+        if (-not $searchNameToNum.ContainsKey($ck)) {
+            $searchNameToNum[$ck] = New-Object System.Collections.Generic.List[string]
+            $searchCanonical[$ck] = $cand
+        }
+        if (-not $searchNameToNum[$ck].Contains($f.DcNum)) { $searchNameToNum[$ck].Add($f.DcNum) }
+    }
+}
+
 $nameRegex = $null
-if (-not $SkipNameMatching -and $nameToNum.Count) {
+if (-not $SkipNameMatching -and $searchNameToNum.Count) {
     $alts = @(
-        $nameToNum.Keys |
+        $searchNameToNum.Keys |
             Sort-Object -Property @{ Expression = { $_.Length } } -Descending |
-            ForEach-Object { [regex]::Escape($nameCanonical[$_]) }
+            ForEach-Object { [regex]::Escape($searchCanonical[$_]) }
     )
     $nameRegex = [regex]::new('(?<!\w)(' + ($alts -join '|') + ')(?!\w)',
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
@@ -336,112 +435,104 @@ if (-not $SkipNameMatching -and $nameToNum.Count) {
         [System.Text.RegularExpressions.RegexOptions]::Compiled)
 }
 
-$idRegex      = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-    [System.Text.RegularExpressions.RegexOptions]::Compiled)
-$bracketRegex = [regex]::new('(?<!\w)cf\s*\[\s*(\d+)\s*\]',
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
-    [System.Text.RegularExpressions.RegexOptions]::Compiled)
+# -------------------------------------------------------- fetch the filters --
 
-# --- "Filter Errors" parsing -------------------------------------------------
-# Line format: ERROR 1: "Field 'X' does not exist or you do not have permission to view it."
-$errLineRegex   = [regex]::new('^\s*ERROR\s*\d+\s*:\s*(.*?)\s*$',
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-$errFieldRegex  = [regex]::new("^Field\s+'(.+?)'\s+does not exist or you do not have permission to view it\.?$",
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-$errValueRegex  = [regex]::new("^The value\s+'(.+?)'\s+does not exist for the field\s+'(.+?)'\.?$",
-    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-
-function ConvertFrom-FilterErrors {
-    param([string]$Text)
-    $notes   = New-Object System.Collections.Generic.List[string]
-    $missing = New-Object System.Collections.Generic.List[string]
-    if ([string]::IsNullOrWhiteSpace($Text)) {
-        return [pscustomobject]@{ Notes = $notes; MissingFields = $missing }
-    }
-    foreach ($line in ($Text -split "`r?`n")) {
-        $m = $errLineRegex.Match($line)
-        if (-not $m.Success) { continue }          # skips the "error message count:" header
-        $body = $m.Groups[1].Value.Trim().Trim('"').Trim()
-        if (-not $body) { continue }
-
-        $mf = $errFieldRegex.Match($body)
-        if ($mf.Success) {
-            $fname = $mf.Groups[1].Value
-            $notes.Add("Error: Custom field '$fname' does not exist.")
-            if (-not $missing.Contains($fname)) { $missing.Add($fname) }
-            continue
-        }
-        $mv = $errValueRegex.Match($body)
-        if ($mv.Success) {
-            $notes.Add("Error: Value '$($mv.Groups[1].Value)' does not exist for field '$($mv.Groups[2].Value)'.")
-            continue
-        }
-        $notes.Add("Error: $body")
-    }
-    if ($notes.Count -gt 0) { $notes.Insert(0, 'Filter was not working in DC due to errors.') }
-    return [pscustomobject]@{ Notes = $notes; MissingFields = $missing }
+if ($CloudFiltersCacheJson -and (Test-Path -LiteralPath $CloudFiltersCacheJson)) {
+    Write-Host "Reading cached Cloud filters from $CloudFiltersCacheJson"
+    $raw = [System.IO.File]::ReadAllText($CloudFiltersCacheJson, [System.Text.Encoding]::UTF8)
+    $cloudFilters = @($raw | ConvertFrom-Json)
 }
+else {
+    $cloudFilters = @(Get-CloudFilters)
+    if ($CloudFiltersCacheJson) {
+        $json = $cloudFilters | ConvertTo-Json -Depth 8
+        [System.IO.File]::WriteAllText($CloudFiltersCacheJson, $json, (New-Object System.Text.UTF8Encoding $true))
+    }
+}
+Write-Host "Cloud filters read: $($cloudFilters.Count)"
 
-# ------------------------------------------------------------- scan filters --
+# --------------------------------------------------------------- reporting ---
 
-$passThroughColumns = @(
-    'Filter Name', 'Filter Id', 'Filter Type', 'Filter Status', 'Filter Errors',
-    'Inventory Log', 'Filter JQL', 'Owner Name', 'Owner Id', 'Owner Key', 'Owner Status'
+$cfColumns = @(
+    'Filter Name', 'Filter DC Id', 'Filter Cloud Id', 'Filter Type',
+    'Owner DC Name', 'Owner DC Id', 'Owner DC Status', 'Owner Cloud Name',
+    'Filter DC Status', 'Filter DC Errors', 'Inventory Log DC', 'Filter Cloud JQL',
+    'CustomField Ids', 'CustomField Names', 'CustomField Changes', 'Comments'
+)
+$stColumns = @(
+    'Filter Name', 'Filter DC Id', 'Filter Cloud Id', 'Filter Type',
+    'Owner DC Name', 'Owner DC Id', 'Owner DC Status', 'Owner Cloud Name',
+    'Filter DC Status', 'Filter DC Errors', 'Inventory Log DC', 'Filter Cloud JQL',
+    'Statuses', 'Custom Statuses', 'Comments'
 )
 
-$absent = @($passThroughColumns | Where-Object { -not $filterRows[0].PSObject.Properties[$_] })
-if ($absent.Count) {
-    Write-Warning "Filter inventory has no column(s): $($absent -join ', '). They will be blank in the report."
-}
-
-$statusColumns = @(
-    'Filter Name', 'Filter Id', 'Filter Type', 'Filter Status', 'Filter Errors',
-    'Inventory Log', 'Filter JQL', 'Owner Name', 'Owner Id', 'Owner Key', 'Owner Status'
-)
-
-$report         = New-Object System.Collections.Generic.List[object]
-$statusReport   = New-Object System.Collections.Generic.List[object]
+$report       = New-Object System.Collections.Generic.List[object]
+$statusReport = New-Object System.Collections.Generic.List[object]
+$noDcMatch    = New-Object System.Collections.Generic.List[string]
+$dupDcMatch   = New-Object System.Collections.Generic.List[string]
 $missingCloudNm = New-Object System.Collections.Generic.List[string]
 $missingCloudId = New-Object System.Collections.Generic.List[string]
-$scanned        = 0
 
-foreach ($row in $filterRows) {
-    $scanned++
-    $jql = Get-Val $row 'Filter JQL'
-    if ([string]::IsNullOrWhiteSpace($jql)) { continue }
+foreach ($cflt in $cloudFilters) {
+    $fName = [string]$cflt.name
+    $jql   = ''
+    if ($cflt.PSObject.Properties['jql'] -and $cflt.jql) { $jql = [string]$cflt.jql }
 
-    $hitNums     = [ordered]@{}
-    $matchedById = @{}
-    foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
-    foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
-    if ($nameRegex) {
-        foreach ($m in $nameRegex.Matches($jql)) {
-            $key = $m.Groups[1].Value.ToLowerInvariant()
-            if ($nameToNum.ContainsKey($key)) { foreach ($n in $nameToNum[$key]) { $hitNums[$n] = $true } }
-        }
+    # --- align to the DC inventory by filter name ----------------------------
+    $dc = $null
+    $dcMissing = $true
+    $k = $fName.Trim().ToLowerInvariant()
+    if ($dcByName.ContainsKey($k)) {
+        $dc = $dcByName[$k][0]
+        $dcMissing = $false
+        if ($dcByName[$k].Count -gt 1 -and -not $dupDcMatch.Contains($fName)) { $dupDcMatch.Add($fName) }
     }
 
-    $parsed = ConvertFrom-FilterErrors -Text (Get-Val $row 'Filter Errors')
+    $baseNotes = New-Object System.Collections.Generic.List[string]
+    if ($dcMissing) {
+        $baseNotes.Add('No matching filter found on DC.')
+        if (-not $noDcMatch.Contains($fName)) { $noDcMatch.Add($fName) }
+    }
+    foreach ($n in (ConvertFrom-FilterErrors -Text (Get-Val $dc 'Filter Errors'))) { $baseNotes.Add($n) }
 
-    # ---------------------------------------------------- status report ------
+    $ownerCloud = ''
+    if ($cflt.PSObject.Properties['owner'] -and $cflt.owner -and $cflt.owner.PSObject.Properties['displayName']) {
+        $ownerCloud = [string]$cflt.owner.displayName
+    }
+
+    $common = [ordered]@{
+        'Filter Name'      = $fName
+        'Filter DC Id'     = Get-Val $dc 'Filter Id'
+        'Filter Cloud Id'  = [string]$cflt.id
+        'Filter Type'      = Get-CloudFilterType -Filter $cflt
+        'Owner DC Name'    = Get-Val $dc 'Owner Name'
+        'Owner DC Id'      = Get-Val $dc 'Owner Id'
+        'Owner DC Status'  = Get-Val $dc 'Owner Status'
+        'Owner Cloud Name' = $ownerCloud
+        'Filter DC Status' = Get-Val $dc 'Filter Status'
+        'Filter DC Errors' = Get-Val $dc 'Filter Errors'
+        'Inventory Log DC' = Get-Val $dc 'Inventory Log'
+        'Filter Cloud JQL' = $jql
+    }
+
+    if ([string]::IsNullOrWhiteSpace($jql)) { continue }
+
+    # --- status report -------------------------------------------------------
     if ($StatusOutputCsv) {
         $statuses = @(Get-StatusesFromJql -Jql $jql)
         if ($statuses.Count) {
             $customStatuses = New-Object System.Collections.Generic.List[string]
-            $snotes         = New-Object System.Collections.Generic.List[string]
-            foreach ($n in $parsed.Notes) { $snotes.Add($n) }
-
+            $snotes = New-Object System.Collections.Generic.List[string]
+            foreach ($n in $baseNotes) { $snotes.Add($n) }
             foreach ($st in $statuses) {
                 if (-not $BuiltInStatusSet.Contains($st)) { $customStatuses.Add($st) }
                 if ($st -match '^\d+$') {
-                    $idNote = "Status referenced by numeric id '$st' - ids differ in Cloud, rewrite by name."
+                    $idNote = "Status referenced by numeric id '$st', rewrite it by name."
                     if (-not $snotes.Contains($idNote)) { $snotes.Add($idNote) }
                 }
             }
-
             $srow = [ordered]@{}
-            foreach ($c in $statusColumns) { $srow[$c] = Get-Val $row $c }
+            foreach ($c in $common.Keys) { $srow[$c] = $common[$c] }
             $srow['Statuses']        = ($statuses       -join ', ')
             $srow['Custom Statuses'] = ($customStatuses -join ', ')
             $srow['Comments']        = ($snotes         -join $NL)
@@ -449,27 +540,39 @@ foreach ($row in $filterRows) {
         }
     }
 
+    # --- custom field discovery on the Cloud JQL -----------------------------
+    $hitNums     = [ordered]@{}
+    $matchedById = @{}
+    foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
+    foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
+    if ($nameRegex) {
+        foreach ($m in $nameRegex.Matches($jql)) {
+            $ck = $m.Groups[1].Value.ToLowerInvariant()
+            if ($searchNameToNum.ContainsKey($ck)) {
+                foreach ($n in $searchNameToNum[$ck]) { $hitNums[$n] = $true }
+            }
+        }
+    }
     if ($hitNums.Count -eq 0) { continue }
 
     $ids     = New-Object System.Collections.Generic.List[string]
     $names   = New-Object System.Collections.Generic.List[string]
     $changes = New-Object System.Collections.Generic.List[string]
     $notes   = New-Object System.Collections.Generic.List[string]
-    foreach ($n in $parsed.Notes) { $notes.Add($n) }
+    foreach ($n in $baseNotes) { $notes.Add($n) }
     foreach ($d in $DeprecatedJqlTerms) {
         if ($d.Regex.IsMatch($jql) -and -not $notes.Contains($d.Note)) { $notes.Add($d.Note) }
     }
 
     foreach ($n in $hitNums.Keys) {
         $f = $cfByNum[$n]
-
         $ids.Add("customfield_$($f.DcNum)")
-        if ($f.DcName -and -not $names.Contains($f.DcName)) { $names.Add($f.DcName) }
+        $shown = if ($f.CloudName) { $f.CloudName } else { $f.DcName }
+        if ($shown -and -not $names.Contains($shown)) { $names.Add($shown) }
 
         $lk = ''
         if ($f.DcName) { $lk = $f.DcName.ToLowerInvariant() }
 
-        # --- no Cloud counterpart: state it, propose nothing -----------------
         if ($f.DcName -and $UnsupportedInCloudFields.Contains($f.DcName)) {
             if ($matchedById.ContainsKey($n)) {
                 $un = "Custom field cf[$($f.DcNum)] ($($f.DcName)) is not supported in Cloud, filter rewrite is needed."
@@ -486,38 +589,37 @@ foreach ($row in $filterRows) {
             if (-not $notes.Contains($rn)) { $notes.Add($rn) }
         }
 
-        # Field is reported non-existent by the filter itself - no remap to propose.
-        $isMissing = $false
-        if ($f.DcName) {
-            foreach ($mn in $parsed.MissingFields) { if ($mn -ieq $f.DcName) { $isMissing = $true; break } }
-        }
-        if ($isMissing) { continue }
-
         $dcLabel    = if ($f.DcName)    { " ($($f.DcName))" }    else { '' }
         $cloudLabel = if ($f.CloudName) { " ($($f.CloudName))" } else { '' }
 
-        # --- id remap: always a change ---------------------------------------
-        if ($f.CloudNum) {
-            $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
-            $notes.Add("Custom field reference Id fix needed $DASH cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel.")
-        }
-        else {
-            $notes.Add("No Cloud id found for cf[$($f.DcNum)]$dcLabel.")
-            if (-not $f.HasMapping) {
-                $label = "cf[$($f.DcNum)]$dcLabel"
-                if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+        # --- id: the Cloud JQL still carries the DC id ---------------------
+        if ($matchedById.ContainsKey($n)) {
+            if ($f.CloudNum) {
+                $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
+                $notes.Add("Custom field reference Id fix needed $DASH cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel.")
+            }
+            else {
+                $notes.Add("No Cloud id found for cf[$($f.DcNum)]$dcLabel.")
+                if (-not $f.HasMapping) {
+                    $label = "cf[$($f.DcNum)]$dcLabel"
+                    if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+                }
             }
         }
 
-        # --- name remap ------------------------------------------------------
+        # --- name: only a problem if the Cloud JQL still uses the DC name ---
         if ($f.DcName) {
-            if (-not $f.CloudName) {
-                $notes.Add("No Cloud name found for cf[$($f.DcNum)] ($($f.DcName)).")
-                if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
-            }
-            elseif ($f.DcName -cne $f.CloudName) {
-                $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
-                $notes.Add("Custom field reference Name fix needed $DASH ""$($f.DcName)"" $ARROW ""$($f.CloudName)"".")
+            $dcNameRe = [regex]::new('(?<!\w)' + [regex]::Escape($f.DcName) + '(?!\w)',
+                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+            if ($dcNameRe.IsMatch($jql)) {
+                if (-not $f.CloudName) {
+                    $notes.Add("No Cloud name found for cf[$($f.DcNum)] ($($f.DcName)).")
+                    if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
+                }
+                elseif ($f.DcName -cne $f.CloudName) {
+                    $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
+                    $notes.Add("Custom field reference Name fix needed $DASH ""$($f.DcName)"" $ARROW ""$($f.CloudName)"".")
+                }
             }
 
             if ($nameToNum.ContainsKey($lk) -and $nameToNum[$lk].Count -gt 1) {
@@ -527,29 +629,28 @@ foreach ($row in $filterRows) {
         }
     }
 
+    if ($changes.Count -eq 0 -and $notes.Count -eq 0) { continue }
+
     $out = [ordered]@{}
-    foreach ($c in $passThroughColumns) { $out[$c] = Get-Val $row $c }
+    foreach ($c in $common.Keys) { $out[$c] = $common[$c] }
     $out['CustomField Ids']     = ($ids     -join ', ')
     $out['CustomField Names']   = ($names   -join ', ')
     $out['CustomField Changes'] = ($changes -join (',' + $NL))
     $out['Comments']            = ($notes   -join $NL)
-
     $report.Add([pscustomobject]$out)
 }
 
-foreach ($nm in $missingCloudNm) {
-    Write-Warning "No matching Cloud Name for DC CustomField ""$nm"" - referenced by at least one filter."
-}
-foreach ($nm in $missingCloudId) {
-    Write-Warning "No matching Cloud Id for DC CustomField $nm - referenced by at least one filter."
-}
+foreach ($nm in $noDcMatch)      { Write-Warning "No matching DC inventory entry for Cloud filter ""$nm""." }
+foreach ($nm in $dupDcMatch)     { Write-Warning "DC inventory has more than one entry named ""$nm""; the first was used." }
+foreach ($nm in $missingCloudNm) { Write-Warning "No Cloud name on file for DC custom field ""$nm""." }
+foreach ($nm in $missingCloudId) { Write-Warning "No Cloud id on file for DC custom field $nm." }
 
 # ----------------------------------------------------------------- output ----
 
 if ($PSVersionTable.PSVersion.Major -ge 6) {
     $enc = if ($NoBom) { 'utf8NoBOM' } else { 'utf8BOM' }
 } else {
-    $enc = 'UTF8'   # Windows PowerShell 5.1 always writes a BOM
+    $enc = 'UTF8'
     if ($NoBom) { Write-Warning 'Windows PowerShell 5.1 cannot write UTF-8 without BOM via Export-Csv; BOM will be present.' }
 }
 
@@ -563,12 +664,10 @@ function Write-Report {
     )
     $dir = Split-Path -Parent $Path
     if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-
     if ($Rows.Count) {
         $Rows | Export-Csv -LiteralPath $Path -Delimiter $Delim -Encoding $Encoding -NoTypeInformation
     }
     else {
-        # header-only file so downstream tooling still gets a well-formed CSV
         $h = [ordered]@{}
         foreach ($c in $Columns) { $h[$c] = '' }
         ([pscustomobject]$h) | Export-Csv -LiteralPath $Path -Delimiter $Delim -Encoding $Encoding -NoTypeInformation
@@ -577,13 +676,9 @@ function Write-Report {
     }
 }
 
-$cfColumns = @($passThroughColumns) + @('CustomField Ids', 'CustomField Names', 'CustomField Changes', 'Comments')
 Write-Report -Rows $report -Columns $cfColumns -Path $OutputCsv -Delim $Delimiter -Encoding $enc
-
 if ($StatusOutputCsv) {
-    $stColumns = @($statusColumns) + @('Statuses', 'Custom Statuses', 'Comments')
     Write-Report -Rows $statusReport -Columns $stColumns -Path $StatusOutputCsv -Delim $Delimiter -Encoding $enc
     Write-Host ("Filters referencing statuses: {0}; written to {1}" -f $statusReport.Count, $StatusOutputCsv)
 }
-
-Write-Host ("Scanned {0} filter row(s); {1} affected; written to {2}" -f $scanned, $report.Count, $OutputCsv)
+Write-Host ("Cloud filters scanned: {0}; affected: {1}; written to {2}" -f $cloudFilters.Count, $report.Count, $OutputCsv)
