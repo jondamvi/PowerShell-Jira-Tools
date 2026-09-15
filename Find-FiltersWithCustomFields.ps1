@@ -63,6 +63,7 @@ Set-StrictMode -Version Latest
 $ARROW = [char]0x2192   # U+2192 RIGHTWARDS ARROW
 $UE    = [char]0x00FC   # u-umlaut, used so this file stays ASCII-only on disk
 $AE    = [char]0x00E4   # a-umlaut
+$DASH  = [char]0x2014   # U+2014 EM DASH
 $NL    = "`n"           # in-cell line break for the Comments column
 
 # ============================================================================
@@ -93,36 +94,32 @@ $SystemFieldNameMap["gesch${AE}ftswert"]        = 'Business Value'
 #  Keys are lower-case DC names; the value is appended to Comments verbatim.
 # ============================================================================
 $ReviewFieldNotes = @{}
-$ReviewFieldNotes['epic-verkn' + $UE + 'pfung']  = 'Deprecated: "Epic Link" is replaced by "parent" in Cloud. Rewrite the clause, a rename is not enough.'
-$ReviewFieldNotes['epic link']             = 'Deprecated: "Epic Link" is replaced by "parent" in Cloud. Rewrite the clause, a rename is not enough.'
-$ReviewFieldNotes['epic-name']             = 'Deprecated: "Epic Name" is not maintained in Cloud - check whether the clause is still meaningful.'
-$ReviewFieldNotes['epic name']             = 'Deprecated: "Epic Name" is not maintained in Cloud - check whether the clause is still meaningful.'
-$ReviewFieldNotes['parent link']           = 'Deprecated: "Parent Link" is replaced by "parent" in Cloud. Rewrite the clause.'
+$ReviewFieldNotes['epic-verkn' + $UE + 'pfung'] = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.'
+$ReviewFieldNotes['epic link']             = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.'
+$ReviewFieldNotes['epic-name']             = 'Custom field "Epic Name" is deprecated in Cloud.'
+$ReviewFieldNotes['epic name']             = 'Custom field "Epic Name" is deprecated in Cloud.'
+$ReviewFieldNotes['parent link']           = 'Custom field "Parent Link" is deprecated in Cloud, use "parent" instead.'
 
 # ============================================================================
-#  Fields with no Cloud counterpart at all. No remap is proposed for these and
-#  no "missing Cloud id/name" warning is raised - the filter has to be rewritten.
-#  Keys are lower-case DC names.
+#  Fields with no Cloud counterpart. No remap is proposed and no missing
+#  id/name warning is raised - the filter has to be rewritten. Case-insensitive.
 # ============================================================================
-$UnsupportedInCloudFields = @{}
-$UnsupportedInCloudFields['issuefunction']         = 'ScriptRunner JQL functions are not supported in native Cloud JQL - they run only on the ScriptRunner Enhanced Search page. JCMA deletes filters whose functions have no Enhanced Search equivalent.'
-$UnsupportedInCloudFields['original story points'] = 'No Cloud equivalent: company-managed projects use "Story Points", team-managed projects use "Story point estimate".'
-$UnsupportedInCloudFields['gruppen']               = 'Locked JSM field with no Cloud counterpart - verify actual usage, then drop the clause or recreate it as a Group picker.'
-$UnsupportedInCloudFields['groups']                = 'Locked JSM field with no Cloud counterpart - verify actual usage, then drop the clause or recreate it as a Group picker.'
-
+$UnsupportedInCloudFields = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($u in @('issueFunction', 'Original story points', 'Gruppen', 'Groups')) {
+    [void]$UnsupportedInCloudFields.Add($u)
+}
 
 # ============================================================================
 #  Clause names that are deprecated in Cloud, matched against the raw JQL so
 #  they are caught even when the filter references the field by id.
 # ============================================================================
 $DeprecatedJqlTerms = @(
-    [pscustomobject]@{ Term = 'Epic Link';            Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
-    [pscustomobject]@{ Term = 'Epic-Verkn' + $UE + 'pfung'; Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
-    [pscustomobject]@{ Term = 'epicLink';              Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
-    [pscustomobject]@{ Term = 'Epic Name';             Note = "Deprecated: ""Epic Name"" is not maintained in Cloud - check whether the clause is still meaningful." }
-    [pscustomobject]@{ Term = 'Epic-Name';             Note = "Deprecated: ""Epic Name"" is not maintained in Cloud - check whether the clause is still meaningful." }
-    [pscustomobject]@{ Term = 'Parent Link';           Note = "Deprecated: ""Parent Link"" is replaced by ""parent"" in Cloud. Rewrite the clause." }
-    [pscustomobject]@{ Term = 'parentEpic';            Note = "Deprecated: the ""parentEpic"" JQL function is folded into ""parent"" in Cloud. Note ""parent = X"" excludes X itself." }
+    [pscustomobject]@{ Term = 'Epic Link';                    Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'Epic-Verkn' + $UE + 'pfung';   Note = 'Custom field "Epic Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'Epic Name';                    Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
+    [pscustomobject]@{ Term = 'Epic-Name';                    Note = 'Custom field "Epic Name" is deprecated in Cloud.' }
+    [pscustomobject]@{ Term = 'Parent Link';                  Note = 'Custom field "Parent Link" is deprecated in Cloud, use "parent" instead.' }
+    [pscustomobject]@{ Term = 'parentEpic';                   Note = 'JQL function "parentEpic" is deprecated in Cloud, use "parent" instead.' }
 )
 foreach ($d in $DeprecatedJqlTerms) {
     $d | Add-Member -NotePropertyName Regex -NotePropertyValue ([regex]::new(
@@ -130,9 +127,6 @@ foreach ($d in $DeprecatedJqlTerms) {
         [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
         [System.Text.RegularExpressions.RegexOptions]::Compiled))
 }
-
-
-
 
 # ============================================================================
 #  Jira out-of-the-box statuses (Software / Core / Service Management), in the
@@ -475,8 +469,8 @@ foreach ($row in $filterRows) {
         $lk = ''
         if ($f.DcName) { $lk = $f.DcName.ToLowerInvariant() }
 
-        # --- no Cloud counterpart: report it, propose nothing ----------------
-        if ($lk -and $UnsupportedInCloudFields.ContainsKey($lk)) {
+        # --- no Cloud counterpart: state it, propose nothing -----------------
+        if ($f.DcName -and $UnsupportedInCloudFields.Contains($f.DcName)) {
             if ($matchedById.ContainsKey($n)) {
                 $un = "Custom field cf[$($f.DcNum)] ($($f.DcName)) is not supported in Cloud, filter rewrite is needed."
             }
@@ -484,8 +478,6 @@ foreach ($row in $filterRows) {
                 $un = "Custom field ""$($f.DcName)"" is not supported in Cloud, filter rewrite is needed."
             }
             if (-not $notes.Contains($un)) { $notes.Add($un) }
-            $ux = $UnsupportedInCloudFields[$lk]
-            if (-not $notes.Contains($ux)) { $notes.Add($ux) }
             continue
         }
 
@@ -506,16 +498,13 @@ foreach ($row in $filterRows) {
 
         # --- id remap: always a change ---------------------------------------
         if ($f.CloudNum) {
-            $changes.Add("cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel")
+            $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
+            $notes.Add("Custom field reference Id fix needed $DASH cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel.")
         }
         else {
-            $changes.Add("cf[$($f.DcNum)]$dcLabel $ARROW ???")
-            if ($f.HasMapping) {
-                $notes.Add("Built-in field cf[$($f.DcNum)] ($($f.DcName)) maps to ""$($f.CloudName)"" in Cloud, but no Cloud id was found in the custom field CSV - look the id up in Cloud.")
-            }
-            else {
-                $notes.Add("No matching Cloud Id for DC CustomField cf[$($f.DcNum)] ($($f.DcName))")
-                $label = "cf[$($f.DcNum)] ($($f.DcName))"
+            $notes.Add("No Cloud id found for cf[$($f.DcNum)]$dcLabel.")
+            if (-not $f.HasMapping) {
+                $label = "cf[$($f.DcNum)]$dcLabel"
                 if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
             }
         }
@@ -523,23 +512,16 @@ foreach ($row in $filterRows) {
         # --- name remap ------------------------------------------------------
         if ($f.DcName) {
             if (-not $f.CloudName) {
-                $changes.Add("""$($f.DcName)"" $ARROW ???")
-                $notes.Add("No matching Cloud Name for DC CustomField cf[$($f.DcNum)] ($($f.DcName))")
+                $notes.Add("No Cloud name found for cf[$($f.DcNum)] ($($f.DcName)).")
                 if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
             }
             elseif ($f.DcName -cne $f.CloudName) {
                 $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
-                if ($f.HasMapping) {
-                    $notes.Add("Built-in field: Cloud name resolved from the pre-defined mapping table.")
-                }
-            }
-            else {
-                $notes.Add("DC custom field ""$($f.DcName)"" is also ""$($f.CloudName)"" in Cloud")
+                $notes.Add("Custom field reference Name fix needed $DASH ""$($f.DcName)"" $ARROW ""$($f.CloudName)"".")
             }
 
             if ($nameToNum.ContainsKey($lk) -and $nameToNum[$lk].Count -gt 1) {
-                $dupeIds = @($nameToNum[$lk] | ForEach-Object { "cf[$_] ($($f.DcName))" }) -join ' / '
-                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to $dupeIds"
+                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to cf[$($nameToNum[$lk] -join '] / cf[')]."
                 if (-not $notes.Contains($dupe)) { $notes.Add($dupe) }
             }
         }
