@@ -38,7 +38,7 @@
     .\Find-AffectedFilters.ps1 -CloudBaseUrl https://acme.atlassian.net `
         -CloudEmail me@acme.com -CloudApiToken $tok `
         -FilterInventoryCsv .\FilterInventory.csv -CustomFieldsCsv .\CustomFields.csv `
-        -OutputCsv .\affected-fields.csv -StatusOutputCsv .\affected-statuses.csv
+        -OutputCsv .\affected-filters.csv
 #>
 [CmdletBinding()]
 param(
@@ -48,7 +48,6 @@ param(
     [Parameter(Mandatory = $true)][string]$FilterInventoryCsv,
     [Parameter(Mandatory = $true)][string]$CustomFieldsCsv,
     [Parameter(Mandatory = $true)][string]$OutputCsv,
-    [string]$StatusOutputCsv,
     [string]$CloudFiltersCacheJson,
     [ValidateSet('GlobalAndPrivate', 'All')]
     [string]$FilterScope = 'GlobalAndPrivate',
@@ -67,7 +66,7 @@ $UE    = [char]0x00FC   # u-umlaut
 $AE    = [char]0x00E4   # a-umlaut
 $OE    = [char]0x00F6   # o-umlaut
 $NL    = "`n"           # in-cell line break
-$NOTE_NO_DC = 'No matching filter found on DC.'   # informational only, never a reason to report
+$NOTE_NO_DC = 'No matching filter in DC inventory, this filter is new or was renamed.'   # informational only, never a reason to report
 
 # ============================================================================
 #  Pre-defined DC (German) -> Cloud (English) names for Jira built-in fields.
@@ -156,6 +155,16 @@ foreach ($s in @('InactiveDeactivated', 'InactiveAnonymized', 'InactiveUnknown')
     [void]$InactiveOwnerStatuses.Add($s)
 }
 
+# ============================================================================
+#  Asset object key prefixes, with or without the trailing dash. Keys with these
+#  prefixes in a JQL clause need rewriting as aqlFunction with Legacy-Key.
+#  ADD YOUR OWN PREFIXES HERE.
+# ============================================================================
+$AssetKeyPrefixes = @(
+    'CMDB-'
+    'JRSK-'
+)
+
 # ---------------------------------------------------------------- regexes ----
 
 $idRegex      = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
@@ -174,6 +183,27 @@ $statusListRegex = [regex]::new(
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
     [System.Text.RegularExpressions.RegexOptions]::Compiled)
 $listItemRegex = [regex]::new('"([^"]*)"|''([^'']*)''|([^,\s][^,]*)')
+
+# Asset keys: PREFIX-123, case-insensitive, reported uppercase.
+$assetKeyRegex = $null
+if ($AssetKeyPrefixes.Count) {
+    $prefixAlt = (@($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim().TrimEnd('-')) })) -join '|'
+    $assetKeyRegex = [regex]::new("(?<![\w-])(?:$prefixAlt)-\d+(?![\w-])",
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+        [System.Text.RegularExpressions.RegexOptions]::Compiled)
+}
+
+# Regions where an asset-looking key is NOT an Assets field reference:
+#   ~ / !~ operands are free-text content searches
+#   aqlFunction(...) is already the correct construction
+#   issueKey / key / issue operands are issue keys that share the prefix
+$maskTextOpRegex   = [regex]::new('(!~|~)\s*("[^"]*"|''[^'']*''|[^\s()"'']+)',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+$maskAqlRegex      = [regex]::new('\baqlFunction\s*\(([^()]*(?:\([^()]*\)[^()]*)*)\)',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+    [System.Text.RegularExpressions.RegexOptions]::Singleline)
+$maskIssueKeyRegex = [regex]::new('(?<!\w)(?:issuekey|issue|key)\s*(?:=|!=|(?:not\s+)?in)\s*(\([^)]*\)|"[^"]*"|''[^'']*''|[^\s()]+)',
+    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
 $errLineRegex  = [regex]::new('^\s*ERROR\s*\d+\s*:\s*(.*?)\s*$',
     [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
@@ -199,6 +229,34 @@ function Assert-Column {
     if ($missing.Count) {
         throw "$FileLabel is missing required column(s): $($missing -join ', '). Found: $($have -join ', ')"
     }
+}
+
+function Set-MaskedRegion {
+    # blanks one capture group everywhere it matches, preserving string length
+    param([string]$Text, [regex]$Re, [int]$Group)
+    $out = $Text
+    $ms = $Re.Matches($Text)
+    for ($i = $ms.Count - 1; $i -ge 0; $i--) {
+        $g = $ms[$i].Groups[$Group]
+        if (-not $g.Success -or $g.Length -eq 0) { continue }
+        $out = $out.Remove($g.Index, $g.Length).Insert($g.Index, ('#' * $g.Length))
+    }
+    return $out
+}
+
+function Get-AssetKeysNeedingRewrite {
+    param([string]$Jql)
+    if ($null -eq $assetKeyRegex -or [string]::IsNullOrWhiteSpace($Jql)) { return @() }
+    $m = $Jql
+    $m = Set-MaskedRegion -Text $m -Re $maskTextOpRegex   -Group 2
+    $m = Set-MaskedRegion -Text $m -Re $maskAqlRegex      -Group 1
+    $m = Set-MaskedRegion -Text $m -Re $maskIssueKeyRegex -Group 1
+    $hits = New-Object System.Collections.Generic.List[string]
+    foreach ($x in $assetKeyRegex.Matches($m)) {
+        $v = $x.Value.ToUpperInvariant()
+        if (-not $hits.Contains($v)) { $hits.Add($v) }
+    }
+    return $hits.ToArray()
 }
 
 function Get-NormalizedOwnerName {
@@ -524,74 +582,96 @@ Write-Host ("DC inventory rows: {0}; distinct DC filter names: {1}; Cloud filter
 
 # --------------------------------------------------------------- reporting ---
 
-$cfColumns = @(
+$outColumns = @(
     'Filter Name', 'Filter DC Id', 'Filter Cloud Id', 'Filter Type',
     'Owner DC Name', 'Owner DC Id', 'Owner DC Status', 'Owner Cloud Name',
     'Filter DC Status', 'Filter DC Errors', 'Inventory Log DC', 'Filter Cloud JQL',
+    'Statuses', 'Custom Statuses',
     'CustomField Ids', 'CustomField Names', 'CustomField Changes', 'Comments'
 )
-$stColumns = @(
-    'Filter Name', 'Filter DC Id', 'Filter Cloud Id', 'Filter Type',
-    'Owner DC Name', 'Owner DC Id', 'Owner DC Status', 'Owner Cloud Name',
-    'Filter DC Status', 'Filter DC Errors', 'Inventory Log DC', 'Filter Cloud JQL',
-    'Statuses', 'Custom Statuses', 'Comments'
-)
 
-$report       = New-Object System.Collections.Generic.List[object]
-$statusReport = New-Object System.Collections.Generic.List[object]
-$noDcMatch    = New-Object System.Collections.Generic.List[string]
-$dupDcMatch   = New-Object System.Collections.Generic.List[string]
+$report         = New-Object System.Collections.Generic.List[object]
+$noDcMatch      = New-Object System.Collections.Generic.List[string]
+$dupDcMatch     = New-Object System.Collections.Generic.List[string]
 $missingCloudNm = New-Object System.Collections.Generic.List[string]
 $missingCloudId = New-Object System.Collections.Generic.List[string]
 
+# --- work items: every Cloud filter, plus DC filters that are not in Cloud ---
+$workItems     = New-Object System.Collections.Generic.List[object]
+$matchedDcKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+
 foreach ($cflt in $cloudFilters) {
     $fName = [string]$cflt.name
-    $jql   = ''
-    if ($cflt.PSObject.Properties['jql'] -and $cflt.jql) { $jql = [string]$cflt.jql }
-
-    # --- align to the DC inventory by filter name ----------------------------
+    $k  = $fName.Trim().ToLowerInvariant()
     $dc = $null
-    $dcMissing = $true
-    $k = $fName.Trim().ToLowerInvariant()
     if ($dcByName.ContainsKey($k)) {
         $dc = $dcByName[$k][0]
-        $dcMissing = $false
+        [void]$matchedDcKeys.Add($k)
         if ($dcByName[$k].Count -gt 1 -and -not $dupDcMatch.Contains($fName)) { $dupDcMatch.Add($fName) }
     }
+    $cjql = ''
+    if ($cflt.PSObject.Properties['jql'] -and $cflt.jql) { $cjql = [string]$cflt.jql }
+    $workItems.Add([pscustomobject]@{ Name = $fName; Cloud = $cflt; Dc = $dc; Jql = $cjql; NotMigrated = $false })
+}
+
+foreach ($k in $dcByName.Keys) {
+    if ($matchedDcKeys.Contains($k)) { continue }
+    foreach ($r in $dcByName[$k]) {
+        $workItems.Add([pscustomobject]@{
+            Name        = (Get-Val $r 'Filter Name')
+            Cloud       = $null
+            Dc          = $r
+            Jql         = (Get-Val $r 'Filter JQL')
+            NotMigrated = $true
+        })
+    }
+}
+$notMigratedCount = @($workItems | Where-Object { $_.NotMigrated }).Count
+Write-Host ("Cloud filters: {0}; DC filters with no Cloud counterpart: {1}" -f $cloudFilters.Count, $notMigratedCount)
+
+foreach ($item in $workItems) {
+    $fName       = [string]$item.Name
+    $cflt        = $item.Cloud
+    $dc          = $item.Dc
+    $jql         = [string]$item.Jql
+    $notMigrated = [bool]$item.NotMigrated
+    $dcMissing   = ($null -eq $dc)
 
     $baseNotes = New-Object System.Collections.Generic.List[string]
+    if ($notMigrated) { $baseNotes.Add('Filter not migrated, manual re-create needed.') }
     if ($dcMissing) {
         $baseNotes.Add($NOTE_NO_DC)
         if (-not $noDcMatch.Contains($fName)) { $noDcMatch.Add($fName) }
     }
 
     $errNotes = @(ConvertFrom-FilterErrors -Text (Get-Val $dc 'Filter Errors'))
-    $hasDcErrors = ((-not $dcMissing) -and $errNotes.Count -gt 0)
     foreach ($n in $errNotes) { $baseNotes.Add($n) }
 
     $ownerCloud = ''
-    if ($cflt.PSObject.Properties['owner'] -and $cflt.owner -and $cflt.owner.PSObject.Properties['displayName']) {
+    if ($null -ne $cflt -and $cflt.PSObject.Properties['owner'] -and $cflt.owner -and $cflt.owner.PSObject.Properties['displayName']) {
         $ownerCloud = [string]$cflt.owner.displayName
     }
 
-    # owner still the same person, and that person was inactive on DC?
     $ownerDc       = Get-Val $dc 'Owner Name'
     $ownerStatusDc = (Get-Val $dc 'Owner Status').Trim()
-    $ownerInactive = $false
-    if (-not $dcMissing -and $ownerDc -and $ownerCloud) {
-        $a = Get-NormalizedOwnerName $ownerDc
-        $b = Get-NormalizedOwnerName $ownerCloud
-        if ($a -and $b -and ($a -ieq $b) -and $InactiveOwnerStatuses.Contains($ownerStatusDc)) {
-            $ownerInactive = $true
-            $baseNotes.Add('Filter owner was inactive on DC, re-assign ownership may be needed.')
+    if ($InactiveOwnerStatuses.Contains($ownerStatusDc)) {
+        $sameOwner = $notMigrated   # nothing in Cloud to compare against
+        if (-not $notMigrated -and $ownerDc -and $ownerCloud) {
+            $a = Get-NormalizedOwnerName $ownerDc
+            $b = Get-NormalizedOwnerName $ownerCloud
+            $sameOwner = ($a -and $b -and ($a -ieq $b))
         }
+        if ($sameOwner) { $baseNotes.Add('Filter owner was inactive on DC, re-assign ownership may be needed.') }
     }
+
+    $jqlCell = $jql
+    if ($notMigrated -and $jql) { $jqlCell = "[Filter DC JQL]:$NL$jql" }
 
     $common = [ordered]@{
         'Filter Name'      = $fName
         'Filter DC Id'     = Get-Val $dc 'Filter Id'
-        'Filter Cloud Id'  = [string]$cflt.id
-        'Filter Type'      = Get-CloudFilterType -Filter $cflt
+        'Filter Cloud Id'  = $(if ($null -ne $cflt) { [string]$cflt.id } else { '' })
+        'Filter Type'      = $(if ($null -ne $cflt) { Get-CloudFilterType -Filter $cflt } else { '' })
         'Owner DC Name'    = $ownerDc
         'Owner DC Id'      = Get-Val $dc 'Owner Id'
         'Owner DC Status'  = $ownerStatusDc
@@ -599,33 +679,11 @@ foreach ($cflt in $cloudFilters) {
         'Filter DC Status' = Get-Val $dc 'Filter Status'
         'Filter DC Errors' = Get-Val $dc 'Filter Errors'
         'Inventory Log DC' = Get-Val $dc 'Inventory Log'
-        'Filter Cloud JQL' = $jql
+        'Filter Cloud JQL' = $jqlCell
     }
 
-    # --- status report -------------------------------------------------------
-    if ($StatusOutputCsv -and -not [string]::IsNullOrWhiteSpace($jql)) {
-        $statuses = @(Get-StatusesFromJql -Jql $jql)
-        if ($statuses.Count) {
-            $customStatuses = New-Object System.Collections.Generic.List[string]
-            $snotes = New-Object System.Collections.Generic.List[string]
-            foreach ($n in $baseNotes) { $snotes.Add($n) }
-            foreach ($st in $statuses) {
-                if (-not $BuiltInStatusSet.Contains($st)) { $customStatuses.Add($st) }
-                if ($st -match '^\d+$') {
-                    $idNote = "Status referenced by numeric id '$st', rewrite it by name."
-                    if (-not $snotes.Contains($idNote)) { $snotes.Add($idNote) }
-                }
-            }
-            $srow = [ordered]@{}
-            foreach ($c in $common.Keys) { $srow[$c] = $common[$c] }
-            $srow['Statuses']        = ($statuses       -join ', ')
-            $srow['Custom Statuses'] = ($customStatuses -join ', ')
-            $srow['Comments']        = ($snotes         -join $NL)
-            $statusReport.Add([pscustomobject]$srow)
-        }
-    }
-
-    # --- custom field discovery on the Cloud JQL -----------------------------
+    $statuses       = @()
+    $customStatuses = New-Object System.Collections.Generic.List[string]
     $ids     = New-Object System.Collections.Generic.List[string]
     $names   = New-Object System.Collections.Generic.List[string]
     $changes = New-Object System.Collections.Generic.List[string]
@@ -633,10 +691,29 @@ foreach ($cflt in $cloudFilters) {
     foreach ($n in $baseNotes) { $notes.Add($n) }
 
     if (-not [string]::IsNullOrWhiteSpace($jql)) {
+
+        # --- statuses --------------------------------------------------------
+        $statuses = @(Get-StatusesFromJql -Jql $jql)
+        foreach ($st in $statuses) {
+            if (-not $BuiltInStatusSet.Contains($st)) { $customStatuses.Add($st) }
+            if ($st -match '^\d+$') {
+                $idNote = "Status referenced by numeric id '$st', rewrite it by name."
+                if (-not $notes.Contains($idNote)) { $notes.Add($idNote) }
+            }
+        }
+
+        # --- asset keys ------------------------------------------------------
+        $assetKeys = @(Get-AssetKeysNeedingRewrite -Jql $jql)
+        if ($assetKeys.Count) {
+            $notes.Add("Filter contains asset keys, which need rewrite with aqlFunction and Legacy-Key attribute $DASH $($assetKeys -join ', ').")
+        }
+
+        # --- deprecated clause names ----------------------------------------
         foreach ($d in $DeprecatedJqlTerms) {
             if ($d.Regex.IsMatch($jql) -and -not $notes.Contains($d.Note)) { $notes.Add($d.Note) }
         }
 
+        # --- custom fields ---------------------------------------------------
         $hitNums     = [ordered]@{}
         $matchedById = @{}
         foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
@@ -721,6 +798,8 @@ foreach ($cflt in $cloudFilters) {
 
     $out = [ordered]@{}
     foreach ($c in $common.Keys) { $out[$c] = $common[$c] }
+    $out['Statuses']            = ($statuses       -join ', ')
+    $out['Custom Statuses']     = ($customStatuses -join ', ')
     $out['CustomField Ids']     = ($ids     -join ', ')
     $out['CustomField Names']   = ($names   -join ', ')
     $out['CustomField Changes'] = ($changes -join (',' + $NL))
@@ -730,14 +809,9 @@ foreach ($cflt in $cloudFilters) {
 
 if ($noDcMatch.Count) {
     Write-Warning "$($noDcMatch.Count) Cloud filter(s) have no DC inventory entry matching by name."
-    $shownCap = 50
-    foreach ($nm in ($noDcMatch | Select-Object -First $shownCap)) {
-        Write-Warning "  no DC match: ""$nm"""
-    }
-    if ($noDcMatch.Count -gt $shownCap) {
-        Write-Warning "  ... and $($noDcMatch.Count - $shownCap) more (re-run with -Verbose for the full list)."
-        foreach ($nm in ($noDcMatch | Select-Object -Skip $shownCap)) { Write-Verbose "  no DC match: $nm" }
-    }
+}
+if ($notMigratedCount) {
+    Write-Warning "$notMigratedCount DC filter(s) have no Cloud counterpart - reported as not migrated."
 }
 foreach ($nm in $dupDcMatch)     { Write-Warning "DC inventory has more than one entry named ""$nm""; the first was used." }
 foreach ($nm in $missingCloudNm) { Write-Warning "No Cloud name on file for DC custom field ""$nm""." }
@@ -752,31 +826,18 @@ if ($PSVersionTable.PSVersion.Major -ge 6) {
     if ($NoBom) { Write-Warning 'Windows PowerShell 5.1 cannot write UTF-8 without BOM via Export-Csv; BOM will be present.' }
 }
 
-function Write-Report {
-    param(
-        [System.Collections.Generic.List[object]]$Rows,
-        [string[]]$Columns,
-        [string]$Path,
-        [string]$Delim,
-        [string]$Encoding
-    )
-    $dir = Split-Path -Parent $Path
-    if ($dir -and -not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
-    if ($Rows.Count) {
-        $Rows | Export-Csv -LiteralPath $Path -Delimiter $Delim -Encoding $Encoding -NoTypeInformation
-    }
-    else {
-        $h = [ordered]@{}
-        foreach ($c in $Columns) { $h[$c] = '' }
-        ([pscustomobject]$h) | Export-Csv -LiteralPath $Path -Delimiter $Delim -Encoding $Encoding -NoTypeInformation
-        $lines = Get-Content -LiteralPath $Path -Encoding UTF8
-        Set-Content -LiteralPath $Path -Value $lines[0] -Encoding $Encoding
-    }
+$outDir = Split-Path -Parent $OutputCsv
+if ($outDir -and -not (Test-Path -LiteralPath $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+if ($report.Count) {
+    $report | Export-Csv -LiteralPath $OutputCsv -Delimiter $Delimiter -Encoding $enc -NoTypeInformation
+}
+else {
+    $h = [ordered]@{}
+    foreach ($c in $outColumns) { $h[$c] = '' }
+    ([pscustomobject]$h) | Export-Csv -LiteralPath $OutputCsv -Delimiter $Delimiter -Encoding $enc -NoTypeInformation
+    $lines = Get-Content -LiteralPath $OutputCsv -Encoding UTF8
+    Set-Content -LiteralPath $OutputCsv -Value $lines[0] -Encoding $enc
 }
 
-Write-Report -Rows $report -Columns $cfColumns -Path $OutputCsv -Delim $Delimiter -Encoding $enc
-if ($StatusOutputCsv) {
-    Write-Report -Rows $statusReport -Columns $stColumns -Path $StatusOutputCsv -Delim $Delimiter -Encoding $enc
-    Write-Host ("Filters referencing statuses: {0}; written to {1}" -f $statusReport.Count, $StatusOutputCsv)
-}
-Write-Host ("Cloud filters scanned: {0}; affected: {1}; written to {2}" -f $cloudFilters.Count, $report.Count, $OutputCsv)
+Write-Host ("Filters evaluated: {0}; affected: {1}; written to {2}" -f $workItems.Count, $report.Count, $OutputCsv)
