@@ -143,7 +143,7 @@ $listItemRegex = [regex]::new('"([^"]*)"|''([^'']*)''|([^,\s][^,]*)')
 function Get-StatusesFromJql {
     param([string]$Jql)
     $found = New-Object System.Collections.Generic.List[string]
-    if ([string]::IsNullOrWhiteSpace($Jql)) { return $found }
+    if ([string]::IsNullOrWhiteSpace($Jql)) { return ,$found }
 
     $add = {
         param([string]$v)
@@ -168,7 +168,7 @@ function Get-StatusesFromJql {
                else { $m.Groups[3].Value }
         & $add $val
     }
-    return $found
+    return ,$found
 }
 
 # ---------------------------------------------------------------- helpers ----
@@ -369,7 +369,7 @@ foreach ($row in $filterRows) {
 
     # ---------------------------------------------------- status report ------
     if ($StatusOutputCsv) {
-        $statuses = Get-StatusesFromJql -Jql $jql
+        $statuses = @(Get-StatusesFromJql -Jql $jql)
         if ($statuses.Count) {
             $customStatuses = New-Object System.Collections.Generic.List[string]
             $snotes         = New-Object System.Collections.Generic.List[string]
