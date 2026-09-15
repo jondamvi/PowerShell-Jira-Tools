@@ -67,6 +67,7 @@ $UE    = [char]0x00FC   # u-umlaut
 $AE    = [char]0x00E4   # a-umlaut
 $OE    = [char]0x00F6   # o-umlaut
 $NL    = "`n"           # in-cell line break
+$NOTE_NO_DC = 'No matching filter found on DC.'   # informational only, never a reason to report
 
 # ============================================================================
 #  Pre-defined DC (German) -> Cloud (English) names for Jira built-in fields.
@@ -147,6 +148,14 @@ $BuiltInStatuses = @(
 $BuiltInStatusSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($s in $BuiltInStatuses) { [void]$BuiltInStatusSet.Add($s) }
 
+# ============================================================================
+#  DC owner statuses that mean the account was not usable at inventory time.
+# ============================================================================
+$InactiveOwnerStatuses = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
+foreach ($s in @('InactiveDeactivated', 'InactiveAnonymized', 'InactiveUnknown')) {
+    [void]$InactiveOwnerStatuses.Add($s)
+}
+
 # ---------------------------------------------------------------- regexes ----
 
 $idRegex      = [regex]::new('(?<!\w)customfield[_\s]*(\d+)(?!\d)',
@@ -190,6 +199,16 @@ function Assert-Column {
     if ($missing.Count) {
         throw "$FileLabel is missing required column(s): $($missing -join ', '). Found: $($have -join ', ')"
     }
+}
+
+function Get-NormalizedOwnerName {
+    # "Name Surname - Contoso" -> "Name Surname"
+    param([string]$Name)
+    if (-not $Name) { return '' }
+    $n = $Name.Trim()
+    $i = $n.IndexOf(' - ')
+    if ($i -gt 0) { $n = $n.Substring(0, $i) }
+    return (($n -replace '\s+', ' ').Trim())
 }
 
 function Get-StatusesFromJql {
@@ -542,14 +561,30 @@ foreach ($cflt in $cloudFilters) {
 
     $baseNotes = New-Object System.Collections.Generic.List[string]
     if ($dcMissing) {
-        $baseNotes.Add('No matching filter found on DC.')
+        $baseNotes.Add($NOTE_NO_DC)
         if (-not $noDcMatch.Contains($fName)) { $noDcMatch.Add($fName) }
     }
-    foreach ($n in (ConvertFrom-FilterErrors -Text (Get-Val $dc 'Filter Errors'))) { $baseNotes.Add($n) }
+
+    $errNotes = @(ConvertFrom-FilterErrors -Text (Get-Val $dc 'Filter Errors'))
+    $hasDcErrors = ((-not $dcMissing) -and $errNotes.Count -gt 0)
+    foreach ($n in $errNotes) { $baseNotes.Add($n) }
 
     $ownerCloud = ''
     if ($cflt.PSObject.Properties['owner'] -and $cflt.owner -and $cflt.owner.PSObject.Properties['displayName']) {
         $ownerCloud = [string]$cflt.owner.displayName
+    }
+
+    # owner still the same person, and that person was inactive on DC?
+    $ownerDc       = Get-Val $dc 'Owner Name'
+    $ownerStatusDc = (Get-Val $dc 'Owner Status').Trim()
+    $ownerInactive = $false
+    if (-not $dcMissing -and $ownerDc -and $ownerCloud) {
+        $a = Get-NormalizedOwnerName $ownerDc
+        $b = Get-NormalizedOwnerName $ownerCloud
+        if ($a -and $b -and ($a -ieq $b) -and $InactiveOwnerStatuses.Contains($ownerStatusDc)) {
+            $ownerInactive = $true
+            $baseNotes.Add('Filter owner was inactive on DC, re-assign ownership may be needed.')
+        }
     }
 
     $common = [ordered]@{
@@ -557,9 +592,9 @@ foreach ($cflt in $cloudFilters) {
         'Filter DC Id'     = Get-Val $dc 'Filter Id'
         'Filter Cloud Id'  = [string]$cflt.id
         'Filter Type'      = Get-CloudFilterType -Filter $cflt
-        'Owner DC Name'    = Get-Val $dc 'Owner Name'
+        'Owner DC Name'    = $ownerDc
         'Owner DC Id'      = Get-Val $dc 'Owner Id'
-        'Owner DC Status'  = Get-Val $dc 'Owner Status'
+        'Owner DC Status'  = $ownerStatusDc
         'Owner Cloud Name' = $ownerCloud
         'Filter DC Status' = Get-Val $dc 'Filter Status'
         'Filter DC Errors' = Get-Val $dc 'Filter Errors'
@@ -567,10 +602,8 @@ foreach ($cflt in $cloudFilters) {
         'Filter Cloud JQL' = $jql
     }
 
-    if ([string]::IsNullOrWhiteSpace($jql)) { continue }
-
     # --- status report -------------------------------------------------------
-    if ($StatusOutputCsv) {
+    if ($StatusOutputCsv -and -not [string]::IsNullOrWhiteSpace($jql)) {
         $statuses = @(Get-StatusesFromJql -Jql $jql)
         if ($statuses.Count) {
             $customStatuses = New-Object System.Collections.Generic.List[string]
@@ -593,95 +626,98 @@ foreach ($cflt in $cloudFilters) {
     }
 
     # --- custom field discovery on the Cloud JQL -----------------------------
-    $hitNums     = [ordered]@{}
-    $matchedById = @{}
-    foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
-    foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
-    if ($nameRegex) {
-        foreach ($m in $nameRegex.Matches($jql)) {
-            $ck = $m.Groups[1].Value.ToLowerInvariant()
-            if ($searchNameToNum.ContainsKey($ck)) {
-                foreach ($n in $searchNameToNum[$ck]) { $hitNums[$n] = $true }
-            }
-        }
-    }
-    if ($hitNums.Count -eq 0) { continue }
-
     $ids     = New-Object System.Collections.Generic.List[string]
     $names   = New-Object System.Collections.Generic.List[string]
     $changes = New-Object System.Collections.Generic.List[string]
     $notes   = New-Object System.Collections.Generic.List[string]
     foreach ($n in $baseNotes) { $notes.Add($n) }
-    foreach ($d in $DeprecatedJqlTerms) {
-        if ($d.Regex.IsMatch($jql) -and -not $notes.Contains($d.Note)) { $notes.Add($d.Note) }
-    }
 
-    foreach ($n in $hitNums.Keys) {
-        $f = $cfByNum[$n]
-        $ids.Add("customfield_$($f.DcNum)")
-        $shown = if ($f.CloudName) { $f.CloudName } else { $f.DcName }
-        if ($shown -and -not $names.Contains($shown)) { $names.Add($shown) }
+    if (-not [string]::IsNullOrWhiteSpace($jql)) {
+        foreach ($d in $DeprecatedJqlTerms) {
+            if ($d.Regex.IsMatch($jql) -and -not $notes.Contains($d.Note)) { $notes.Add($d.Note) }
+        }
 
-        $lk = ''
-        if ($f.DcName) { $lk = $f.DcName.ToLowerInvariant() }
+        $hitNums     = [ordered]@{}
+        $matchedById = @{}
+        foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
+        foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
+        if ($nameRegex) {
+            foreach ($m in $nameRegex.Matches($jql)) {
+                $ck = $m.Groups[1].Value.ToLowerInvariant()
+                if ($searchNameToNum.ContainsKey($ck)) {
+                    foreach ($n in $searchNameToNum[$ck]) { $hitNums[$n] = $true }
+                }
+            }
+        }
 
-        if ($f.DcName -and $UnsupportedInCloudFields.Contains($f.DcName)) {
+        foreach ($n in $hitNums.Keys) {
+            $f = $cfByNum[$n]
+            $ids.Add("customfield_$($f.DcNum)")
+            $shown = if ($f.CloudName) { $f.CloudName } else { $f.DcName }
+            if ($shown -and -not $names.Contains($shown)) { $names.Add($shown) }
+
+            $lk = ''
+            if ($f.DcName) { $lk = $f.DcName.ToLowerInvariant() }
+
+            if ($f.DcName -and $UnsupportedInCloudFields.Contains($f.DcName)) {
+                if ($matchedById.ContainsKey($n)) {
+                    $un = "Custom field cf[$($f.DcNum)] ($($f.DcName)) is not supported in Cloud, filter rewrite is needed."
+                }
+                else {
+                    $un = "Custom field ""$($f.DcName)"" is not supported in Cloud, filter rewrite is needed."
+                }
+                if (-not $notes.Contains($un)) { $notes.Add($un) }
+                continue
+            }
+
+            if ($lk -and $ReviewFieldNotes.ContainsKey($lk)) {
+                $rn = $ReviewFieldNotes[$lk]
+                if (-not $notes.Contains($rn)) { $notes.Add($rn) }
+            }
+
+            $dcLabel    = if ($f.DcName)    { " ($($f.DcName))" }    else { '' }
+            $cloudLabel = if ($f.CloudName) { " ($($f.CloudName))" } else { '' }
+
             if ($matchedById.ContainsKey($n)) {
-                $un = "Custom field cf[$($f.DcNum)] ($($f.DcName)) is not supported in Cloud, filter rewrite is needed."
-            }
-            else {
-                $un = "Custom field ""$($f.DcName)"" is not supported in Cloud, filter rewrite is needed."
-            }
-            if (-not $notes.Contains($un)) { $notes.Add($un) }
-            continue
-        }
-
-        if ($lk -and $ReviewFieldNotes.ContainsKey($lk)) {
-            $rn = $ReviewFieldNotes[$lk]
-            if (-not $notes.Contains($rn)) { $notes.Add($rn) }
-        }
-
-        $dcLabel    = if ($f.DcName)    { " ($($f.DcName))" }    else { '' }
-        $cloudLabel = if ($f.CloudName) { " ($($f.CloudName))" } else { '' }
-
-        # --- id: the Cloud JQL still carries the DC id ---------------------
-        if ($matchedById.ContainsKey($n)) {
-            if ($f.CloudNum) {
-                $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
-                $notes.Add("Custom field reference Id fix needed $DASH cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel.")
-            }
-            else {
-                $notes.Add("No Cloud id found for cf[$($f.DcNum)]$dcLabel.")
-                if (-not $f.HasMapping) {
-                    $label = "cf[$($f.DcNum)]$dcLabel"
-                    if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+                if ($f.CloudNum) {
+                    $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
+                    $notes.Add("Custom field reference Id fix needed $DASH cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel.")
                 }
-            }
-        }
-
-        # --- name: only a problem if the Cloud JQL still uses the DC name ---
-        if ($f.DcName) {
-            $dcNameRe = [regex]::new('(?<!\w)' + [regex]::Escape($f.DcName) + '(?!\w)',
-                [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
-            if ($dcNameRe.IsMatch($jql)) {
-                if (-not $f.CloudName) {
-                    $notes.Add("No Cloud name found for cf[$($f.DcNum)] ($($f.DcName)).")
-                    if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
-                }
-                elseif ($f.DcName -cne $f.CloudName) {
-                    $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
-                    $notes.Add("Custom field reference Name fix needed $DASH ""$($f.DcName)"" $ARROW ""$($f.CloudName)"".")
+                else {
+                    $notes.Add("No Cloud id found for cf[$($f.DcNum)]$dcLabel.")
+                    if (-not $f.HasMapping) {
+                        $label = "cf[$($f.DcNum)]$dcLabel"
+                        if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+                    }
                 }
             }
 
-            if ($nameToNum.ContainsKey($lk) -and $nameToNum[$lk].Count -gt 1) {
-                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to cf[$($nameToNum[$lk] -join '] / cf[')]."
-                if (-not $notes.Contains($dupe)) { $notes.Add($dupe) }
+            if ($f.DcName) {
+                $dcNameRe = [regex]::new('(?<!\w)' + [regex]::Escape($f.DcName) + '(?!\w)',
+                    [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
+                if ($dcNameRe.IsMatch($jql)) {
+                    if (-not $f.CloudName) {
+                        $notes.Add("No Cloud name found for cf[$($f.DcNum)] ($($f.DcName)).")
+                        if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
+                    }
+                    elseif ($f.DcName -cne $f.CloudName) {
+                        $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
+                        $notes.Add("Custom field reference Name fix needed $DASH ""$($f.DcName)"" $ARROW ""$($f.CloudName)"".")
+                    }
+                }
+
+                if ($nameToNum.ContainsKey($lk) -and $nameToNum[$lk].Count -gt 1) {
+                    $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to cf[$($nameToNum[$lk] -join '] / cf[')]."
+                    if (-not $notes.Contains($dupe)) { $notes.Add($dupe) }
+                }
             }
         }
     }
 
-    if ($changes.Count -eq 0 -and $notes.Count -eq 0) { continue }
+    # --- inclusion: anything actionable. The "no DC match" line on its own
+    #     is informational and never enough to report a filter.
+    $actionable = @($notes | Where-Object { $_ -ne $NOTE_NO_DC })
+    if ($changes.Count -eq 0 -and $actionable.Count -eq 0) { continue }
 
     $out = [ordered]@{}
     foreach ($c in $common.Keys) { $out[$c] = $common[$c] }
