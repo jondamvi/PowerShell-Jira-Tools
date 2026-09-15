@@ -102,6 +102,27 @@ $ReviewFieldNotes['parent link']           = 'Deprecated: "Parent Link" is repla
 $ReviewFieldNotes['gruppen']               = 'Locked JSM field on DC with no Cloud counterpart - verify actual usage, then either drop the clause or recreate as a Group picker and rewrite against the new cf id.'
 $ReviewFieldNotes['groups']                = 'Locked JSM field on DC with no Cloud counterpart - verify actual usage, then either drop the clause or recreate as a Group picker and rewrite against the new cf id.'
 
+# ============================================================================
+#  Clause names that are deprecated in Cloud, matched against the raw JQL so
+#  they are caught even when the filter references the field by id.
+# ============================================================================
+$DeprecatedJqlTerms = @(
+    [pscustomobject]@{ Term = 'Epic Link';            Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
+    [pscustomobject]@{ Term = 'Epic-Verkn' + $UE + 'pfung'; Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
+    [pscustomobject]@{ Term = 'epicLink';              Note = "Deprecated: ""Epic Link"" is replaced by ""parent"" in Cloud. Rewrite the clause, a rename is not enough." }
+    [pscustomobject]@{ Term = 'Epic Name';             Note = "Deprecated: ""Epic Name"" is not maintained in Cloud - check whether the clause is still meaningful." }
+    [pscustomobject]@{ Term = 'Epic-Name';             Note = "Deprecated: ""Epic Name"" is not maintained in Cloud - check whether the clause is still meaningful." }
+    [pscustomobject]@{ Term = 'Parent Link';           Note = "Deprecated: ""Parent Link"" is replaced by ""parent"" in Cloud. Rewrite the clause." }
+    [pscustomobject]@{ Term = 'parentEpic';            Note = "Deprecated: the ""parentEpic"" JQL function is folded into ""parent"" in Cloud. Note ""parent = X"" excludes X itself." }
+)
+foreach ($d in $DeprecatedJqlTerms) {
+    $d | Add-Member -NotePropertyName Regex -NotePropertyValue ([regex]::new(
+        '(?<!\w)' + [regex]::Escape($d.Term) + '(?!\w)',
+        [System.Text.RegularExpressions.RegexOptions]::IgnoreCase -bor
+        [System.Text.RegularExpressions.RegexOptions]::Compiled))
+}
+
+
 
 
 # ============================================================================
@@ -213,6 +234,24 @@ $nameCanonical = @{}   # lower DcName -> original-cased DcName
 
 $skippedShort = New-Object System.Collections.Generic.List[string]
 
+# Pass 1: index every row that carries Cloud data, keyed by NameNormalized.
+# The CSV splits some fields over two lines - the DC line has DcId/DcName only,
+# the Cloud line has CloudId/CloudName only - so the two halves are rejoined here.
+$cloudIndex = @{}
+foreach ($cf in $cfRows) {
+    $cId = (Get-Val $cf 'CloudId').Trim()
+    $cNm = (Get-Val $cf 'CloudName').Trim()
+    if (-not $cId -and -not $cNm) { continue }
+    $key = (Get-Val $cf 'NameNormalized').Trim().ToLowerInvariant()
+    if (-not $key) { $key = $cNm.ToLowerInvariant() }
+    if (-not $key) { continue }
+    if (-not $cloudIndex.ContainsKey($key)) {
+        $cloudIndex[$key] = [pscustomobject]@{ CloudId = $cId; CloudName = $cNm }
+    }
+}
+Write-Verbose "Indexed $($cloudIndex.Count) Cloud-side row(s) by normalized name."
+
+# Pass 2: the DC side.
 foreach ($cf in $cfRows) {
     $rawDcId    = (Get-Val $cf 'DcId').Trim()
     $rawDcName  = (Get-Val $cf 'DcName').Trim()
@@ -222,26 +261,40 @@ foreach ($cf in $cfRows) {
     if ($rawDcId -notmatch '(\d+)') { continue }
     $dcNum = $Matches[1]
 
+    $mk = ''
+    if ($rawDcName) { $mk = $rawDcName.ToLowerInvariant() }
+    $hasMapping = ($mk -and $SystemFieldNameMap.ContainsKey($mk))
+
+    if ((-not $rawCloudNm -or -not $rawCloudId) -and $rawDcName) {
+        $own = (Get-Val $cf 'NameNormalized').Trim().ToLowerInvariant()
+        if (-not $own) { $own = $mk }
+
+        $hit = $null
+        # a) a Cloud-only line carrying the same normalized name
+        if ($cloudIndex.ContainsKey($own)) { $hit = $cloudIndex[$own] }
+        # b) the built-in mapping: "rang" -> "Rank" -> the line normalized as "rank"
+        if ($null -eq $hit -and $hasMapping) {
+            $tk = $SystemFieldNameMap[$mk].ToLowerInvariant()
+            if ($cloudIndex.ContainsKey($tk)) { $hit = $cloudIndex[$tk] }
+        }
+        if ($null -ne $hit) {
+            if (-not $rawCloudNm) { $rawCloudNm = $hit.CloudName }
+            if (-not $rawCloudId) { $rawCloudId = $hit.CloudId }
+        }
+    }
+    # last resort: the mapping table supplies the name even with no Cloud line
+    if (-not $rawCloudNm -and $hasMapping) { $rawCloudNm = $SystemFieldNameMap[$mk] }
+
     $cloudNum = ''
     if ($rawCloudId -match '(\d+)') { $cloudNum = $Matches[1] }
 
-    # Fall back to the built-in system field table when the CSV has no Cloud name.
-    $mapped = $false
-    if (-not $rawCloudNm -and $rawDcName) {
-        $mk = $rawDcName.ToLowerInvariant()
-        if ($SystemFieldNameMap.ContainsKey($mk)) {
-            $rawCloudNm = $SystemFieldNameMap[$mk]
-            $mapped = $true
-        }
-    }
-
     if (-not $cfByNum.ContainsKey($dcNum)) {
         $cfByNum[$dcNum] = [pscustomobject]@{
-            DcNum     = $dcNum
-            DcName    = $rawDcName
-            CloudNum  = $cloudNum
-            CloudName = $rawCloudNm
-            Mapped    = $mapped
+            DcNum      = $dcNum
+            DcName     = $rawDcName
+            CloudNum   = $cloudNum
+            CloudName  = $rawCloudNm
+            HasMapping = $hasMapping
         }
     }
 
@@ -399,6 +452,9 @@ foreach ($row in $filterRows) {
     $changes = New-Object System.Collections.Generic.List[string]
     $notes   = New-Object System.Collections.Generic.List[string]
     foreach ($n in $parsed.Notes) { $notes.Add($n) }
+    foreach ($d in $DeprecatedJqlTerms) {
+        if ($d.Regex.IsMatch($jql) -and -not $notes.Contains($d.Note)) { $notes.Add($d.Note) }
+    }
 
     foreach ($n in $hitNums.Keys) {
         $f = $cfByNum[$n]
@@ -427,9 +483,14 @@ foreach ($row in $filterRows) {
         }
         else {
             $changes.Add("cf[$($f.DcNum)] $ARROW ???")
-            $notes.Add("No matching Cloud Id for DC CustomField ""$($f.DcName)""")
-            $label = "$($f.DcName) (customfield_$($f.DcNum))"
-            if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+            if ($f.HasMapping) {
+                $notes.Add("Built-in field ""$($f.DcName)"" maps to ""$($f.CloudName)"" in Cloud, but no Cloud id was found in the custom field CSV - look the id up in Cloud.")
+            }
+            else {
+                $notes.Add("No matching Cloud Id for DC CustomField ""$($f.DcName)""")
+                $label = "$($f.DcName) (customfield_$($f.DcNum))"
+                if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
+            }
         }
 
         # --- name remap ------------------------------------------------------
@@ -437,12 +498,12 @@ foreach ($row in $filterRows) {
             if (-not $f.CloudName) {
                 $changes.Add("$($f.DcName) $ARROW ???")
                 $notes.Add("No matching Cloud Name for DC CustomField ""$($f.DcName)""")
-                if (-not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
+                if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
             }
             elseif ($f.DcName -cne $f.CloudName) {
                 $changes.Add("$($f.DcName) $ARROW $($f.CloudName)")
-                if ($f.Mapped) {
-                    $notes.Add("Built-in field: Cloud name taken from the pre-defined mapping table.")
+                if ($f.HasMapping) {
+                    $notes.Add("Built-in field: Cloud name resolved from the pre-defined mapping table.")
                 }
             }
             else {
