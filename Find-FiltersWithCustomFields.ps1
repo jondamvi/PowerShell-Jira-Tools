@@ -353,7 +353,7 @@ function Get-CloudFilters {
         $uri = "$script:JiraBase/rest/api/3/filter/search" +
                "?startAt=$startAt&maxResults=$pageSize" +
                "&overrideSharePermissions=true" +
-               "&expand=jql,owner,sharePermissions"
+               "&expand=jql,owner,sharePermissions,editPermissions"
         Write-Verbose "GET $uri"
         $page = Invoke-JiraGet -Uri $uri
 
@@ -414,16 +414,81 @@ function Test-FilterInScope {
     return $false
 }
 
-function Get-CloudFilterType {
+function Get-FilterEditTypes {
     param($Filter)
-    if (-not $Filter.PSObject.Properties['sharePermissions'] -or $null -eq $Filter.sharePermissions) { return 'Private' }
     $types = @()
-    foreach ($p in $Filter.sharePermissions) {
-        if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
+    if ($Filter.PSObject.Properties['editPermissions'] -and $null -ne $Filter.editPermissions) {
+        foreach ($p in $Filter.editPermissions) {
+            if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
+        }
     }
-    $types = @($types | Sort-Object -Unique)
-    if (-not $types.Count) { return 'Private' }
-    return 'Shared (' + ($types -join ', ') + ')'
+    return ,@($types)
+}
+
+function Get-CloudFilterType {
+    # Jira has no Shared/Private flag - the GUI derives it. With no share or edit
+    # permissions the filter is visible only to the owner and Jira admins: Private.
+    # Anything granted to anyone else makes it Shared.
+    param($Filter)
+    $v = @(Get-FilterShareTypes -Filter $Filter)
+    $e = @(Get-FilterEditTypes  -Filter $Filter)
+    if ($v.Count -eq 0 -and $e.Count -eq 0) { return 'Private' }
+    return 'Shared'
+}
+
+function Get-SharePermissionLabel {
+    param($P)
+    $t = ''
+    if ($P.PSObject.Properties['type'] -and $P.type) { $t = [string]$P.type }
+    switch -Regex ($t) {
+        '^(loggedin|authenticated)$' { return 'Any logged-in user' }
+        '^(global|public)$'          { return 'Public' }
+        '^group$' {
+            if ($P.PSObject.Properties['group'] -and $P.group -and $P.group.PSObject.Properties['name']) {
+                return [string]$P.group.name
+            }
+            return 'group'
+        }
+        '^user$' {
+            if ($P.PSObject.Properties['user'] -and $P.user) {
+                if ($P.user.PSObject.Properties['displayName'] -and $P.user.displayName) { return [string]$P.user.displayName }
+                if ($P.user.PSObject.Properties['accountId'])  { return [string]$P.user.accountId }
+            }
+            return 'user'
+        }
+        '^project$' {
+            if ($P.PSObject.Properties['project'] -and $P.project -and $P.project.PSObject.Properties['name']) {
+                return [string]$P.project.name
+            }
+            return 'project'
+        }
+        '^projectRole$' {
+            $pn = 'project'
+            $rn = 'role'
+            if ($P.PSObject.Properties['project'] -and $P.project -and $P.project.PSObject.Properties['name']) { $pn = [string]$P.project.name }
+            if ($P.PSObject.Properties['role']    -and $P.role    -and $P.role.PSObject.Properties['name'])    { $rn = [string]$P.role.name }
+            return "$pn / $rn"
+        }
+        default { if ($t) { return $t } else { return 'unknown' } }
+    }
+}
+
+function Get-CloudSharedWith {
+    param($Filter)
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($Filter.PSObject.Properties['sharePermissions'] -and $null -ne $Filter.sharePermissions) {
+        foreach ($p in $Filter.sharePermissions) {
+            $l = "'" + (Get-SharePermissionLabel -P $p) + "' (VIEW)"
+            if (-not $lines.Contains($l)) { $lines.Add($l) }
+        }
+    }
+    if ($Filter.PSObject.Properties['editPermissions'] -and $null -ne $Filter.editPermissions) {
+        foreach ($p in $Filter.editPermissions) {
+            $l = "'" + (Get-SharePermissionLabel -P $p) + "' (EDIT)"
+            if (-not $lines.Contains($l)) { $lines.Add($l) }
+        }
+    }
+    return ($lines -join $NL)
 }
 
 # ------------------------------------------------------------ load inputs ----
@@ -584,6 +649,7 @@ Write-Host ("DC inventory rows: {0}; distinct DC filter names: {1}; Cloud filter
 
 $outColumns = @(
     'Filter Name', 'Filter DC Id', 'Filter Cloud Id', 'Filter Type',
+    'DC SharedWith', 'Cloud SharedWith',
     'Owner DC Name', 'Owner DC Id', 'Owner DC Status', 'Owner Cloud Name',
     'Filter DC Status', 'Filter DC Errors', 'Inventory Log DC', 'Filter Cloud JQL',
     'Statuses', 'Custom Statuses',
@@ -672,6 +738,8 @@ foreach ($item in $workItems) {
         'Filter DC Id'     = Get-Val $dc 'Filter Id'
         'Filter Cloud Id'  = $(if ($null -ne $cflt) { [string]$cflt.id } else { '' })
         'Filter Type'      = $(if ($null -ne $cflt) { Get-CloudFilterType -Filter $cflt } else { '' })
+        'DC SharedWith'    = Get-Val $dc 'Shared Groups'
+        'Cloud SharedWith' = $(if ($null -ne $cflt) { Get-CloudSharedWith -Filter $cflt } else { '' })
         'Owner DC Name'    = $ownerDc
         'Owner DC Id'      = Get-Val $dc 'Owner Id'
         'Owner DC Status'  = $ownerStatusDc
