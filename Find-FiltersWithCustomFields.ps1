@@ -400,7 +400,7 @@ function Get-FilterShareTypes {
             if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
         }
     }
-    return ,@($types | Sort-Object -Unique)
+    return @($types | Sort-Object -Unique)
 }
 
 function Test-FilterInScope {
@@ -422,7 +422,7 @@ function Get-FilterEditTypes {
             if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
         }
     }
-    return ,@($types)
+    return @($types)
 }
 
 function Get-CloudFilterType {
