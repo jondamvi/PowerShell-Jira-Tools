@@ -186,6 +186,7 @@ $listItemRegex = [regex]::new('"([^"]*)"|''([^'']*)''|([^,\s][^,]*)')
 
 # Asset keys: PREFIX-123, case-insensitive, reported uppercase.
 $assetKeyRegex = $null
+$AssetKeyPrefixes = @($AssetKeyPrefixes | Where-Object { $_ -and $_.Trim().TrimEnd('-') })
 if ($AssetKeyPrefixes.Count) {
     $prefixAlt = (@($AssetKeyPrefixes | ForEach-Object { [regex]::Escape($_.Trim().TrimEnd('-')) })) -join '|'
     $assetKeyRegex = [regex]::new("(?<![\w-])(?:$prefixAlt)-\d+(?![\w-])",
@@ -360,7 +361,10 @@ function Get-CloudFilters {
         $batch = @()
         if ($page.PSObject.Properties['values'] -and $page.values) { $batch = @($page.values) }
         foreach ($v in $batch) {
-            if (-not $seen.Add([string]$v.id)) { $dupes++; continue }
+            $vid = ''
+            if ($v.PSObject.Properties['id']) { $vid = [string]$v.id }
+            if (-not $vid) { Write-Warning 'A filter was returned without an id and was skipped.'; continue }
+            if (-not $seen.Add($vid)) { $dupes++; continue }
 
             $tKey = (@(Get-FilterShareTypes -Filter $v) -join ', ')
             if (-not $tKey) { $tKey = '(private)' }
@@ -667,7 +671,8 @@ $workItems     = New-Object System.Collections.Generic.List[object]
 $matchedDcKeys = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 
 foreach ($cflt in $cloudFilters) {
-    $fName = [string]$cflt.name
+    $fName = ''
+    if ($cflt.PSObject.Properties['name'] -and $cflt.name) { $fName = [string]$cflt.name }
     $k  = $fName.Trim().ToLowerInvariant()
     $dc = $null
     if ($dcByName.ContainsKey($k)) {
@@ -736,7 +741,7 @@ foreach ($item in $workItems) {
     $common = [ordered]@{
         'Filter Name'      = $fName
         'Filter DC Id'     = Get-Val $dc 'Filter Id'
-        'Filter Cloud Id'  = $(if ($null -ne $cflt) { [string]$cflt.id } else { '' })
+        'Filter Cloud Id'  = $(if ($null -ne $cflt -and $cflt.PSObject.Properties['id']) { [string]$cflt.id } else { '' })
         'Filter Type'      = $(if ($null -ne $cflt) { Get-CloudFilterType -Filter $cflt } else { '' })
         'DC SharedWith'    = Get-Val $dc 'Shared Groups'
         'Cloud SharedWith' = $(if ($null -ne $cflt) { Get-CloudSharedWith -Filter $cflt } else { '' })
