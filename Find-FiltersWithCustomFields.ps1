@@ -93,14 +93,23 @@ $SystemFieldNameMap["gesch${AE}ftswert"]        = 'Business Value'
 #  Keys are lower-case DC names; the value is appended to Comments verbatim.
 # ============================================================================
 $ReviewFieldNotes = @{}
-$ReviewFieldNotes['original story points'] = 'Deprecated: "Original story points" has no direct Cloud equivalent - company-managed uses "Story Points", team-managed uses "Story point estimate". Filter must be rewritten.'
 $ReviewFieldNotes['epic-verkn' + $UE + 'pfung']  = 'Deprecated: "Epic Link" is replaced by "parent" in Cloud. Rewrite the clause, a rename is not enough.'
 $ReviewFieldNotes['epic link']             = 'Deprecated: "Epic Link" is replaced by "parent" in Cloud. Rewrite the clause, a rename is not enough.'
 $ReviewFieldNotes['epic-name']             = 'Deprecated: "Epic Name" is not maintained in Cloud - check whether the clause is still meaningful.'
 $ReviewFieldNotes['epic name']             = 'Deprecated: "Epic Name" is not maintained in Cloud - check whether the clause is still meaningful.'
 $ReviewFieldNotes['parent link']           = 'Deprecated: "Parent Link" is replaced by "parent" in Cloud. Rewrite the clause.'
-$ReviewFieldNotes['gruppen']               = 'Locked JSM field on DC with no Cloud counterpart - verify actual usage, then either drop the clause or recreate as a Group picker and rewrite against the new cf id.'
-$ReviewFieldNotes['groups']                = 'Locked JSM field on DC with no Cloud counterpart - verify actual usage, then either drop the clause or recreate as a Group picker and rewrite against the new cf id.'
+
+# ============================================================================
+#  Fields with no Cloud counterpart at all. No remap is proposed for these and
+#  no "missing Cloud id/name" warning is raised - the filter has to be rewritten.
+#  Keys are lower-case DC names.
+# ============================================================================
+$UnsupportedInCloudFields = @{}
+$UnsupportedInCloudFields['issuefunction']         = 'ScriptRunner JQL functions are not supported in native Cloud JQL - they run only on the ScriptRunner Enhanced Search page. JCMA deletes filters whose functions have no Enhanced Search equivalent.'
+$UnsupportedInCloudFields['original story points'] = 'No Cloud equivalent: company-managed projects use "Story Points", team-managed projects use "Story point estimate".'
+$UnsupportedInCloudFields['gruppen']               = 'Locked JSM field with no Cloud counterpart - verify actual usage, then drop the clause or recreate it as a Group picker.'
+$UnsupportedInCloudFields['groups']                = 'Locked JSM field with no Cloud counterpart - verify actual usage, then drop the clause or recreate it as a Group picker.'
+
 
 # ============================================================================
 #  Clause names that are deprecated in Cloud, matched against the raw JQL so
@@ -408,9 +417,10 @@ foreach ($row in $filterRows) {
     $jql = Get-Val $row 'Filter JQL'
     if ([string]::IsNullOrWhiteSpace($jql)) { continue }
 
-    $hitNums = [ordered]@{}
-    foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true } }
-    foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true } }
+    $hitNums     = [ordered]@{}
+    $matchedById = @{}
+    foreach ($m in $idRegex.Matches($jql))      { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
+    foreach ($m in $bracketRegex.Matches($jql)) { $n = $m.Groups[1].Value; if ($cfByNum.ContainsKey($n)) { $hitNums[$n] = $true; $matchedById[$n] = $true } }
     if ($nameRegex) {
         foreach ($m in $nameRegex.Matches($jql)) {
             $key = $m.Groups[1].Value.ToLowerInvariant()
@@ -462,12 +472,26 @@ foreach ($row in $filterRows) {
         $ids.Add("customfield_$($f.DcNum)")
         if ($f.DcName -and -not $names.Contains($f.DcName)) { $names.Add($f.DcName) }
 
-        if ($f.DcName) {
-            $rk = $f.DcName.ToLowerInvariant()
-            if ($ReviewFieldNotes.ContainsKey($rk)) {
-                $rn = $ReviewFieldNotes[$rk]
-                if (-not $notes.Contains($rn)) { $notes.Add($rn) }
+        $lk = ''
+        if ($f.DcName) { $lk = $f.DcName.ToLowerInvariant() }
+
+        # --- no Cloud counterpart: report it, propose nothing ----------------
+        if ($lk -and $UnsupportedInCloudFields.ContainsKey($lk)) {
+            if ($matchedById.ContainsKey($n)) {
+                $un = "Custom field cf[$($f.DcNum)] ($($f.DcName)) is not supported in Cloud, filter rewrite is needed."
             }
+            else {
+                $un = "Custom field ""$($f.DcName)"" is not supported in Cloud, filter rewrite is needed."
+            }
+            if (-not $notes.Contains($un)) { $notes.Add($un) }
+            $ux = $UnsupportedInCloudFields[$lk]
+            if (-not $notes.Contains($ux)) { $notes.Add($ux) }
+            continue
+        }
+
+        if ($lk -and $ReviewFieldNotes.ContainsKey($lk)) {
+            $rn = $ReviewFieldNotes[$lk]
+            if (-not $notes.Contains($rn)) { $notes.Add($rn) }
         }
 
         # Field is reported non-existent by the filter itself - no remap to propose.
@@ -477,18 +501,21 @@ foreach ($row in $filterRows) {
         }
         if ($isMissing) { continue }
 
+        $dcLabel    = if ($f.DcName)    { " ($($f.DcName))" }    else { '' }
+        $cloudLabel = if ($f.CloudName) { " ($($f.CloudName))" } else { '' }
+
         # --- id remap: always a change ---------------------------------------
         if ($f.CloudNum) {
-            $changes.Add("cf[$($f.DcNum)] $ARROW cf[$($f.CloudNum)]")
+            $changes.Add("cf[$($f.DcNum)]$dcLabel $ARROW cf[$($f.CloudNum)]$cloudLabel")
         }
         else {
-            $changes.Add("cf[$($f.DcNum)] $ARROW ???")
+            $changes.Add("cf[$($f.DcNum)]$dcLabel $ARROW ???")
             if ($f.HasMapping) {
-                $notes.Add("Built-in field ""$($f.DcName)"" maps to ""$($f.CloudName)"" in Cloud, but no Cloud id was found in the custom field CSV - look the id up in Cloud.")
+                $notes.Add("Built-in field cf[$($f.DcNum)] ($($f.DcName)) maps to ""$($f.CloudName)"" in Cloud, but no Cloud id was found in the custom field CSV - look the id up in Cloud.")
             }
             else {
-                $notes.Add("No matching Cloud Id for DC CustomField ""$($f.DcName)""")
-                $label = "$($f.DcName) (customfield_$($f.DcNum))"
+                $notes.Add("No matching Cloud Id for DC CustomField cf[$($f.DcNum)] ($($f.DcName))")
+                $label = "cf[$($f.DcNum)] ($($f.DcName))"
                 if (-not $missingCloudId.Contains($label)) { $missingCloudId.Add($label) }
             }
         }
@@ -496,12 +523,12 @@ foreach ($row in $filterRows) {
         # --- name remap ------------------------------------------------------
         if ($f.DcName) {
             if (-not $f.CloudName) {
-                $changes.Add("$($f.DcName) $ARROW ???")
-                $notes.Add("No matching Cloud Name for DC CustomField ""$($f.DcName)""")
+                $changes.Add("""$($f.DcName)"" $ARROW ???")
+                $notes.Add("No matching Cloud Name for DC CustomField cf[$($f.DcNum)] ($($f.DcName))")
                 if (-not $f.HasMapping -and -not $missingCloudNm.Contains($f.DcName)) { $missingCloudNm.Add($f.DcName) }
             }
             elseif ($f.DcName -cne $f.CloudName) {
-                $changes.Add("$($f.DcName) $ARROW $($f.CloudName)")
+                $changes.Add("""$($f.DcName)"" $ARROW ""$($f.CloudName)""")
                 if ($f.HasMapping) {
                     $notes.Add("Built-in field: Cloud name resolved from the pre-defined mapping table.")
                 }
@@ -510,9 +537,9 @@ foreach ($row in $filterRows) {
                 $notes.Add("DC custom field ""$($f.DcName)"" is also ""$($f.CloudName)"" in Cloud")
             }
 
-            $key = $f.DcName.ToLowerInvariant()
-            if ($nameToNum.ContainsKey($key) -and $nameToNum[$key].Count -gt 1) {
-                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to customfield_$($nameToNum[$key] -join ' / customfield_')"
+            if ($nameToNum.ContainsKey($lk) -and $nameToNum[$lk].Count -gt 1) {
+                $dupeIds = @($nameToNum[$lk] | ForEach-Object { "cf[$_] ($($f.DcName))" }) -join ' / '
+                $dupe = "Ambiguous DC name ""$($f.DcName)"" maps to $dupeIds"
                 if (-not $notes.Contains($dupe)) { $notes.Add($dupe) }
             }
         }
@@ -522,7 +549,7 @@ foreach ($row in $filterRows) {
     foreach ($c in $passThroughColumns) { $out[$c] = Get-Val $row $c }
     $out['CustomField Ids']     = ($ids     -join ', ')
     $out['CustomField Names']   = ($names   -join ', ')
-    $out['CustomField Changes'] = ($changes -join ', ')
+    $out['CustomField Changes'] = ($changes -join (',' + $NL))
     $out['Comments']            = ($notes   -join $NL)
 
     $report.Add([pscustomobject]$out)
