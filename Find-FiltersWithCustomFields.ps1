@@ -50,6 +50,8 @@ param(
     [Parameter(Mandatory = $true)][string]$OutputCsv,
     [string]$StatusOutputCsv,
     [string]$CloudFiltersCacheJson,
+    [ValidateSet('GlobalAndPrivate', 'All')]
+    [string]$FilterScope = 'GlobalAndPrivate',
     [string]$Delimiter = ',',
     [int]$MinNameLength = 3,
     [switch]$SkipNameMatching,
@@ -193,7 +195,7 @@ function Assert-Column {
 function Get-StatusesFromJql {
     param([string]$Jql)
     $found = New-Object System.Collections.Generic.List[string]
-    if ([string]::IsNullOrWhiteSpace($Jql)) { return ,$found }
+    if ([string]::IsNullOrWhiteSpace($Jql)) { return $found.ToArray() }
 
     $add = {
         param([string]$v)
@@ -218,13 +220,13 @@ function Get-StatusesFromJql {
                else { $m.Groups[3].Value }
         & $add $val
     }
-    return ,$found
+    return $found.ToArray()
 }
 
 function ConvertFrom-FilterErrors {
     param([string]$Text)
     $notes = New-Object System.Collections.Generic.List[string]
-    if ([string]::IsNullOrWhiteSpace($Text)) { return ,$notes }
+    if ([string]::IsNullOrWhiteSpace($Text)) { return $notes.ToArray() }
     foreach ($line in ($Text -split "`r?`n")) {
         $m = $errLineRegex.Match($line)
         if (-not $m.Success) { continue }
@@ -238,7 +240,7 @@ function ConvertFrom-FilterErrors {
         $notes.Add("Error: $bodyTxt")
     }
     if ($notes.Count -gt 0) { $notes.Insert(0, 'Filter was not working in DC due to errors.') }
-    return ,$notes
+    return $notes.ToArray()
 }
 
 # ------------------------------------------------------------ Jira Cloud -----
@@ -263,9 +265,13 @@ function Invoke-JiraGet {
 }
 
 function Get-CloudFilters {
-    $all = New-Object System.Collections.Generic.List[object]
-    $startAt = 0
+    $all  = New-Object System.Collections.Generic.List[object]
+    $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+    $script:ShareTypeCounts = @{}
+    $script:OutOfScope = 0
+    $startAt  = 0
     $pageSize = 50
+    $dupes    = 0
     do {
         $uri = "$script:JiraBase/rest/api/3/filter/search" +
                "?startAt=$startAt&maxResults=$pageSize" +
@@ -273,16 +279,62 @@ function Get-CloudFilters {
                "&expand=jql,owner,sharePermissions"
         Write-Verbose "GET $uri"
         $page = Invoke-JiraGet -Uri $uri
-        if ($page.PSObject.Properties['values'] -and $page.values) {
-            foreach ($v in $page.values) { $all.Add($v) }
+
+        $batch = @()
+        if ($page.PSObject.Properties['values'] -and $page.values) { $batch = @($page.values) }
+        foreach ($v in $batch) {
+            if (-not $seen.Add([string]$v.id)) { $dupes++; continue }
+
+            $tKey = (@(Get-FilterShareTypes -Filter $v) -join ', ')
+            if (-not $tKey) { $tKey = '(private)' }
+            if ($script:ShareTypeCounts.ContainsKey($tKey)) { $script:ShareTypeCounts[$tKey]++ }
+            else { $script:ShareTypeCounts[$tKey] = 1 }
+
+            if (Test-FilterInScope -Filter $v) { $all.Add($v) } else { $script:OutOfScope++ }
         }
+
         $isLast = $true
         if ($page.PSObject.Properties['isLast']) { $isLast = [bool]$page.isLast }
-        $startAt += $pageSize
+
+        # advance by what the server actually returned, not by what we asked for
+        if ($batch.Count -eq 0) { break }
+        $startAt += $batch.Count
+
         Write-Progress -Activity 'Reading filters from Jira Cloud' -Status "$($all.Count) fetched"
     } while (-not $isLast)
     Write-Progress -Activity 'Reading filters from Jira Cloud' -Completed
-    return ,$all
+    if ($dupes) { Write-Warning "$dupes duplicate filter(s) returned by paging and ignored." }
+
+    Write-Host "Filters by share scope:"
+    foreach ($k in ($script:ShareTypeCounts.Keys | Sort-Object)) {
+        Write-Host ("  {0,-40} {1}" -f $k, $script:ShareTypeCounts[$k])
+    }
+    if ($script:OutOfScope) {
+        Write-Host "Skipped $($script:OutOfScope) filter(s) outside -FilterScope $FilterScope. Use -FilterScope All to keep them."
+    }
+    return $all.ToArray()
+}
+
+function Get-FilterShareTypes {
+    param($Filter)
+    $types = @()
+    if ($Filter.PSObject.Properties['sharePermissions'] -and $null -ne $Filter.sharePermissions) {
+        foreach ($p in $Filter.sharePermissions) {
+            if ($p.PSObject.Properties['type'] -and $p.type) { $types += [string]$p.type }
+        }
+    }
+    return ,@($types | Sort-Object -Unique)
+}
+
+function Test-FilterInScope {
+    param($Filter)
+    if ($FilterScope -eq 'All') { return $true }
+    $types = @(Get-FilterShareTypes -Filter $Filter)
+    if ($types.Count -eq 0) { return $true }                       # private
+    foreach ($t in $types) {
+        if ($t -in @('global', 'loggedin', 'authenticated')) { return $true }
+    }
+    return $false
 }
 
 function Get-CloudFilterType {
@@ -449,7 +501,7 @@ else {
         [System.IO.File]::WriteAllText($CloudFiltersCacheJson, $json, (New-Object System.Text.UTF8Encoding $true))
     }
 }
-Write-Host "Cloud filters read: $($cloudFilters.Count)"
+Write-Host ("DC inventory rows: {0}; distinct DC filter names: {1}; Cloud filters read: {2}" -f $dcRows.Count, $dcByName.Count, $cloudFilters.Count)
 
 # --------------------------------------------------------------- reporting ---
 
@@ -640,7 +692,17 @@ foreach ($cflt in $cloudFilters) {
     $report.Add([pscustomobject]$out)
 }
 
-foreach ($nm in $noDcMatch)      { Write-Warning "No matching DC inventory entry for Cloud filter ""$nm""." }
+if ($noDcMatch.Count) {
+    Write-Warning "$($noDcMatch.Count) Cloud filter(s) have no DC inventory entry matching by name."
+    $shownCap = 50
+    foreach ($nm in ($noDcMatch | Select-Object -First $shownCap)) {
+        Write-Warning "  no DC match: ""$nm"""
+    }
+    if ($noDcMatch.Count -gt $shownCap) {
+        Write-Warning "  ... and $($noDcMatch.Count - $shownCap) more (re-run with -Verbose for the full list)."
+        foreach ($nm in ($noDcMatch | Select-Object -Skip $shownCap)) { Write-Verbose "  no DC match: $nm" }
+    }
+}
 foreach ($nm in $dupDcMatch)     { Write-Warning "DC inventory has more than one entry named ""$nm""; the first was used." }
 foreach ($nm in $missingCloudNm) { Write-Warning "No Cloud name on file for DC custom field ""$nm""." }
 foreach ($nm in $missingCloudId) { Write-Warning "No Cloud id on file for DC custom field $nm." }
