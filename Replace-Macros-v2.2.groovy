@@ -2133,10 +2133,21 @@ String applyToBody(String body, VersionFinding vf, Map<String, MigrationDef> byI
                 replacement = replaceMacro(mig, fresh, notes)
             } catch (IllegalStateException ise) {
                 if (ON_MISSING == 'FAIL') throw ise
-                mm.status = ReplacementStatus.Skipped
-                mm.message = ise.getMessage()
-                mig.occSkipped++
-                notes.add('  SKIPPED macro-id=' + sp.macroId + ': ' + ise.getMessage())
+                // strictParams: an unknown/unresolvable parameter is a config
+                // gap that needs action (add the alias) - report it as FAILED,
+                // not as a routine Skipped; the run continues either way and
+                // the re-run after fixing config no-ops what already replaced
+                if (mig.strictParams) {
+                    mm.status = ReplacementStatus.Failed
+                    mm.message = ise.getMessage()
+                    mig.occFailed++
+                    notes.add('  FAILED macro-id=' + sp.macroId + ': ' + ise.getMessage())
+                } else {
+                    mm.status = ReplacementStatus.Skipped
+                    mm.message = ise.getMessage()
+                    mig.occSkipped++
+                    notes.add('  SKIPPED macro-id=' + sp.macroId + ': ' + ise.getMessage())
+                }
                 continue                                     // leave untouched
             }
 
