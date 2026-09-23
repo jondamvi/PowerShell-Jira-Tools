@@ -34,7 +34,7 @@ import java.util.regex.Pattern
 
 @Field Pattern P_PARAM = Pattern.compile(
         '(?s)<ac:parameter\\s+[^>]*?ac:name=(?:"([^"]*)"|\'([^\']*)\')\\s*' +
-
+        '(?:/>|>(.*?)</ac:parameter>)')
 
 class MacroSpan {
     int start, openEnd, end, depth
