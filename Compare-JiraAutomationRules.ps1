@@ -204,10 +204,12 @@ function Get-PropNames {
 
 function ConvertTo-SafeFileName {
     param([string]$Name, [int]$MaxLen = 100)
-    $invalid = [System.IO.Path]::GetInvalidFileNameChars() + @('<', '>', '|', ':', '"', '/', '\', '?', '*')
+    $invalid = New-Object 'System.Collections.Generic.HashSet[char]'
+    foreach ($c in [System.IO.Path]::GetInvalidFileNameChars()) { [void]$invalid.Add($c) }
+    foreach ($c in '<>|:"/\?*'.ToCharArray())                  { [void]$invalid.Add($c) }
     $sb = New-Object System.Text.StringBuilder
     foreach ($ch in $Name.ToCharArray()) {
-        if ($invalid -contains $ch -or [int]$ch -lt 32) { [void]$sb.Append('_') } else { [void]$sb.Append($ch) }
+        if ($invalid.Contains($ch) -or [int]$ch -lt 32) { [void]$sb.Append('_') } else { [void]$sb.Append($ch) }
     }
     $s = $sb.ToString().Trim().TrimEnd('.').Trim()
     $s = $s -replace '\s+', ' '
@@ -376,22 +378,33 @@ $nameReplacements = @($nameReplacements | Sort-Object { $_.Dc.Length } -Descendi
 $cfIdRegex      = [regex]::new('customfield_(\d+)', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 $cfBracketRegex = [regex]::new('cf\[(\d+)\]', [System.Text.RegularExpressions.RegexOptions]::IgnoreCase)
 
+function Replace-CfNumbers {
+    param([string]$Text, [regex]$Regex, [string]$Prefix, [string]$Suffix)
+    $matches2 = $Regex.Matches($Text)
+    if ($matches2.Count -eq 0) { return $Text }
+    $sb = New-Object System.Text.StringBuilder
+    $pos = 0
+    foreach ($m in $matches2) {
+        [void]$sb.Append($Text.Substring($pos, $m.Index - $pos))
+        $n = $m.Groups[1].Value
+        if ($cfByNum.ContainsKey($n) -and $cfByNum[$n].CloudNum) {
+            [void]$sb.Append($Prefix + $cfByNum[$n].CloudNum + $Suffix)
+        } else {
+            [void]$sb.Append($m.Value)
+        }
+        $pos = $m.Index + $m.Length
+    }
+    [void]$sb.Append($Text.Substring($pos))
+    return $sb.ToString()
+}
+
 function ConvertTo-CloudString {
     # Rewrites a DC string so that it should equal the Cloud string if migration was correct.
     param([string]$s)
     if ([string]::IsNullOrEmpty($s)) { return $s }
-    $out = $cfIdRegex.Replace($s, {
-        param($m)
-        $n = $m.Groups[1].Value
-        if ($cfByNum.ContainsKey($n) -and $cfByNum[$n].CloudNum) { return "customfield_$($cfByNum[$n].CloudNum)" }
-        return $m.Value
-    })
-    $out = $cfBracketRegex.Replace($out, {
-        param($m)
-        $n = $m.Groups[1].Value
-        if ($cfByNum.ContainsKey($n) -and $cfByNum[$n].CloudNum) { return "cf[$($cfByNum[$n].CloudNum)]" }
-        return $m.Value
-    })
+    # manual replace loop instead of a MatchEvaluator scriptblock (not reliable on PS 5.1)
+    $out = Replace-CfNumbers -Text $s    -Regex $cfIdRegex      -Prefix 'customfield_' -Suffix ''
+    $out = Replace-CfNumbers -Text $out  -Regex $cfBracketRegex -Prefix 'cf['          -Suffix ']'
     foreach ($r in $nameReplacements) { $out = $r.Regex.Replace($out, $r.Cloud) }
     return $out
 }
@@ -539,8 +552,8 @@ function Get-RuleActor {
     if ($a -is [string]) { return $a }
     $t = Get-Prop $a 'type'; $v = Get-Prop $a 'value'
     $dn = Get-Prop $a 'displayName'
-    if ($dn) { return "$t:$dn" }
-    return "$t:$v"
+    if ($dn) { return "${t}:${dn}" }
+    return "${t}:${v}"
 }
 
 function Get-RuleLabels {
