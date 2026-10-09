@@ -641,8 +641,13 @@ function Get-NextPageUrl {
             }
         }
         if (-not $next) { return '' }
-        if ($next -match '^https?://') { return $next }
-        return ($BaseUrl + '?cursor=' + [uri]::EscapeDataString($next))
+        if ($next -match '^https?://') { return $next }                       # absolute URL
+        if ($next.StartsWith('?')) { return ($BaseUrl + $next) }               # relative query string, e.g. "?cursor=QVAx..."
+        if ($next.StartsWith('/')) {                                           # absolute path on the same host
+            $u = New-Object System.Uri ($BaseUrl)
+            return ($u.Scheme + '://' + $u.Authority + $next)
+        }
+        return ($BaseUrl + '?cursor=' + [uri]::EscapeDataString($next))        # bare cursor value
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
