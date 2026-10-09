@@ -169,6 +169,7 @@ function Format-FunctionError {
         $lines.Add("(could not build parameter report: $($_.Exception.Message))")
     }
     $Parameters = $lines -join "`n"
+    if (-not $Parameters) { $Parameters = '(none)' }
     return "$($ErrorRecord.Exception.Message)`n$($ErrorRecord | Format-List | Out-String)`nError Trace:`n$($ErrorRecord.ScriptStackTrace)`nFunction Parameters:`n$Parameters"
 }
 
@@ -201,7 +202,9 @@ function Invoke-FunctionCatch {
     [CmdletBinding()]
     param([Parameter(Mandatory = $true)]$ErrorRecord, [Parameter(Mandatory = $true)]$Cmdlet, [Parameter(Mandatory = $true)]$Invocation, [Parameter(Mandatory = $true)]$BoundParameters, [string]$Report)
     if ($ErrorRecord.FullyQualifiedErrorId -like 'FunctionError*') { $Cmdlet.ThrowTerminatingError($ErrorRecord) }
-    Write-Error -Message $Report -ErrorId 'FunctionError' -ErrorAction Stop
+    $exception = New-Object System.Exception ($Report, $ErrorRecord.Exception)
+    $record    = New-Object System.Management.Automation.ErrorRecord ($exception, 'FunctionError', [System.Management.Automation.ErrorCategory]::NotSpecified, $null)
+    $Cmdlet.ThrowTerminatingError($record)
 }
 
 # ----------------------------------------------------------------- helpers ----
@@ -245,7 +248,7 @@ function Invoke-JsonGet {
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
         if ([string]::IsNullOrWhiteSpace($text)) { return $null }
         $obj = ConvertFrom-Json -InputObject $text
-        return ,$obj
+        return $obj
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -256,13 +259,13 @@ function Get-ListPayload {
     [CmdletBinding()]
     param($Obj)
     try {
-        if ($null -eq $Obj) { return ,@() }
-        if ($Obj -is [System.Array]) { return ,$Obj }
+        if ($null -eq $Obj) { return @() }
+        if ($Obj -is [System.Array]) { return $Obj }
         foreach ($k in 'data', 'items', 'values', 'rules', 'results') {
             $p = $Obj.PSObject.Properties[$k]
-            if ($null -ne $p -and $p.Value -is [System.Array]) { return ,$p.Value }
+            if ($null -ne $p -and $p.Value -is [System.Array]) { return $p.Value }
         }
-        return ,@($Obj)
+        return @($Obj)
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -288,8 +291,8 @@ function Get-ArrayProp {
     param($Obj, [string]$Name)
     try {
         $v = Get-Prop -Obj $Obj -Name $Name
-        if ($null -eq $v) { return ,@() }
-        return ,@($v)
+        if ($null -eq $v) { return @() }
+        return @($v)
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -331,8 +334,8 @@ function Get-PropNames {
     [CmdletBinding()]
     param($Obj)
     try {
-        if ($Obj -is [System.Collections.IDictionary]) { return ,@($Obj.Keys) }
-        return ,@($Obj.PSObject.Properties.Name)
+        if ($Obj -is [System.Collections.IDictionary]) { return @($Obj.Keys) }
+        return @($Obj.PSObject.Properties.Name)
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -376,7 +379,7 @@ function Read-Utf8Json {
     try {
         $text = [System.IO.File]::ReadAllText($Path, [System.Text.Encoding]::UTF8)
         $obj = ConvertFrom-Json -InputObject $text
-        return ,$obj
+        return $obj
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -591,7 +594,7 @@ function Get-DcRules {
         $listPath = Get-CachePath -Side 'dc' -Id '_list'
         if ($listPath -and -not $RefreshCache -and (Test-Path -LiteralPath $listPath)) {
             Write-Host 'DC: using cached rule list'
-            return ,@(Get-ListPayload -Obj (Read-Utf8Json -Path $listPath))
+            return @(Get-ListPayload -Obj (Read-Utf8Json -Path $listPath))
         }
         Write-Host 'DC: loading automation rules ...'
         $raw  = Invoke-JsonGet -Uri "$DcBaseUrl/rest/cb-automation/latest/project/GLOBAL/rule" -Headers $Script:DcHeaders
@@ -613,8 +616,9 @@ function Get-DcRules {
             $full.Add($r)
         }
         Write-Progress -Activity 'DC rules' -Completed
-        if ($listPath) { Write-Utf8Json -Path $listPath -Obj @($full) }
-        return ,@($full)
+        $result = $full.ToArray()
+        if ($listPath) { Write-Utf8Json -Path $listPath -Obj $result }
+        return $result
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -627,7 +631,7 @@ function Get-CloudRules {
         $listPath = Get-CachePath -Side 'cloud' -Id '_list'
         if ($listPath -and -not $RefreshCache -and (Test-Path -LiteralPath $listPath)) {
             Write-Host 'Cloud: using cached rule list'
-            return ,@(Get-ListPayload -Obj (Read-Utf8Json -Path $listPath))
+            return @(Get-ListPayload -Obj (Read-Utf8Json -Path $listPath))
         }
         Write-Host 'Cloud: resolving cloudId ...'
         $tenant  = Invoke-JsonGet -Uri "$CloudBaseUrl/_edge/tenant_info" -Headers $Script:CloudHeaders
@@ -666,8 +670,9 @@ function Get-CloudRules {
             $full.Add($r)
         }
         Write-Progress -Activity 'Cloud rules' -Completed
-        if ($listPath) { Write-Utf8Json -Path $listPath -Obj @($full) }
-        return ,@($full)
+        $result = $full.ToArray()
+        if ($listPath) { Write-Utf8Json -Path $listPath -Obj $result }
+        return $result
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -796,7 +801,7 @@ function Get-FlatSteps {
         if ($null -ne $trigger) { Add-FlatStep -Node $trigger -Path 'T' -Steps $steps }
         $comps = @(Get-ArrayProp -Obj $Rule -Name 'components')
         for ($i = 0; $i -lt $comps.Count; $i++) { Add-FlatStep -Node $comps[$i] -Path ([string]($i + 1)) -Steps $steps }
-        return ,$steps
+        return $steps.ToArray()
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -998,8 +1003,8 @@ function Compare-Rule {
         }
 
         # ---- 2. step count
-        $dcSteps = Get-FlatSteps -Rule $Dc
-        $clSteps = Get-FlatSteps -Rule $Cloud
+        $dcSteps = @(Get-FlatSteps -Rule $Dc)
+        $clSteps = @(Get-FlatSteps -Rule $Cloud)
         $Row['DC Steps'] = $dcSteps.Count; $Row['Cloud Steps'] = $clSteps.Count
         if (-not $stop -and $dcSteps.Count -ne $clSteps.Count) {
             $dcList = @($dcSteps | ForEach-Object { "$($_.Path) $($_.Kind) $($_.Type)" }) -join $NL
@@ -1159,7 +1164,7 @@ try {
 
         if ($null -eq $cloud) {
             $row['Verdict']  = 'NotFoundInCloud'
-            $row['DC Steps'] = (Get-FlatSteps -Rule $dc).Count
+            $row['DC Steps'] = @(Get-FlatSteps -Rule $dc).Count
         } else {
             Compare-Rule -Row $row -Dc $dc -Cloud $cloud
         }
@@ -1173,7 +1178,7 @@ try {
             foreach ($cr in $cloudByName[$k]) {
                 $row = New-SummaryRow -Name ([string](Get-Prop -Obj $cr -Name 'name')) -Dc $null -Cloud $cr -MatchStatus 'NotFoundInDC'
                 $row['Verdict']     = 'NotFoundInDC'
-                $row['Cloud Steps'] = (Get-FlatSteps -Rule $cr).Count
+                $row['Cloud Steps'] = @(Get-FlatSteps -Rule $cr).Count
                 Write-RuleJsonFiles -Row $row -Dc $null -Cloud $cr
                 $Script:Summary.Add([pscustomobject]$row)
             }
@@ -1192,7 +1197,12 @@ try {
     Write-Host "JSON    : $Script:JsonDir"
 }
 catch {
-    $ErrorMessage = "$($_.Exception.Message)`n$($_ | Format-List | Out-String)`nError Trace:`n$($_.ScriptStackTrace)"
+    if ($_.FullyQualifiedErrorId -like 'FunctionError*') {
+        # a function already produced the full report (message, Format-List, trace, parameters)
+        $ErrorMessage = $_.Exception.Message
+    } else {
+        $ErrorMessage = "$($_.Exception.Message)`n$($_ | Format-List | Out-String)`nError Trace:`n$($_.ScriptStackTrace)"
+    }
     Write-Error "$ErrorMessage" -ErrorAction Continue
     Exit 1
 }
