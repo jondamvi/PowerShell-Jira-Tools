@@ -17,10 +17,19 @@
                {CloudBaseUrl}/gateway/api/automation/public/jira/{cloudId}/rest/v1 is tried as fallback)
               GET /rest/api/3/project/search                               (projectId -> key)
 
-    Matching: DC rule <-> Cloud rule by rule name (trimmed, case-insensitive). Duplicate
-    names on either side are warned about and reported as MatchStatus = DuplicateName.
+    Matching: by rule name (trimmed, case-insensitive); when several rules share a name the
+    one with the same project scope is taken ("Matched (by scope)"); still ambiguous ->
+    "DuplicateName" (first candidate used).
 
-    Comparison, in order (default: stop at the first difference per rule, -FullDiff for all):
+    STAGE 1 - rule presence: every DC rule and every Cloud-only rule with DC id, Cloud id,
+    project(s), state and an assessment ("Expected: disabled on DC, not migrated" /
+    "CHECK: enabled on DC but missing in Cloud" / "Cloud only ..."). Printed to the console
+    (-NoPresenceConsole to suppress) and written to AutomationCompare_Presence_<ts>.csv
+    (-NoPresenceCsv to suppress).
+
+    STAGE 2 - configuration comparison, driven by the CLOUD rule list (rules disabled on DC
+    at migration time were not migrated, so Cloud is the authoritative set); -Skip/-MaxRules
+    apply to that list. Order per rule (default: stop at the first difference, -FullDiff for all):
       1. rule settings  : state, scope (project keys), allow-other-rules-trigger,
                           notify-on-error, edit access, labels, description
       2. step count     : trigger + flattened component tree (children/conditions)
@@ -40,7 +49,8 @@
     retried with Retry-After / backoff regardless.
 
 .OUTPUTS
-    <OutputDir>\AutomationCompare_Summary_<ts>.csv   one row per rule
+    <OutputDir>\AutomationCompare_Presence_<ts>.csv  stage 1, one row per DC rule / Cloud-only rule
+    <OutputDir>\AutomationCompare_Summary_<ts>.csv   stage 2, one row per compared Cloud rule
     <OutputDir>\AutomationCompare_Details_<ts>.csv   one row per difference
     <OutputDir>\json\<SafeRuleName>_<id>_DC.json / _Cloud.json   raw rule JSON
     <CacheDir>\dc\*.json, <CacheDir>\cloud\*.json   when -CacheDir is given
@@ -69,9 +79,10 @@ param(
     [int]$MaxRules = 0,
     [switch]$FullDiff,
     [switch]$CaseSensitive,
-    [switch]$IncludeCloudOnlyRules,
     [int]$MinNameLength = 3,
-    [int]$CloudDelayMs = 300
+    [int]$CloudDelayMs = 300,
+    [switch]$NoPresenceConsole,
+    [switch]$NoPresenceCsv
 )
 
 # ============================================================================
@@ -139,6 +150,7 @@ $Script:Summary          = New-Object System.Collections.Generic.List[object]
 $Script:Details          = New-Object System.Collections.Generic.List[object]
 $Script:StopAtFirst      = $true
 $Script:CompareCaseSensitive = $false
+$Script:PresenceColumns  = @('Rule Name', 'Presence', 'Assessment', 'DC Rule ID', 'Cloud Rule ID', 'DC Project(s)', 'Cloud Project(s)', 'DC State', 'Cloud State', 'Match Status')
 $Script:DetailColumns    = @('Rule Name', 'DC Rule ID', 'Cloud Rule ID', 'Area', 'Step Path', 'Step Kind', 'Step Type', 'Property', 'DC Value', 'Cloud Value')
 
 # ============================================================================
@@ -815,9 +827,9 @@ function Get-RuleScope {
     try {
         $ids = New-Object System.Collections.Generic.List[string]
         foreach ($p in @(Get-ArrayProp -Obj $Rule -Name 'projects')) {
-            $pid = Get-Prop -Obj $p -Name 'projectId'
-            if ($null -eq $pid) { $pid = Get-Prop -Obj $p -Name 'id' }
-            if ($null -ne $pid) { $ids.Add([string]$pid) }
+            $projId = Get-Prop -Obj $p -Name 'projectId'
+            if ($null -eq $projId) { $projId = Get-Prop -Obj $p -Name 'id' }
+            if ($null -ne $projId) { $ids.Add([string]$projId) }
         }
         $scope = Get-Prop -Obj $Rule -Name 'ruleScope'
         if ($null -ne $scope) {
@@ -981,6 +993,160 @@ function Compare-Deep {
 }
 
 # ---------------------------------------------------------- report rows ----
+
+function Get-CloudRuleId {
+    [CmdletBinding()]
+    param($Rule)
+    try {
+        $id = [string](Get-Prop -Obj $Rule -Name 'uuid')
+        if (-not $id) { $id = [string](Get-Prop -Obj $Rule -Name 'id') }
+        return $id
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Find-RuleMatch {
+    # Finds the counterpart of one rule among candidates with the same name key.
+    # Single candidate -> Matched; several -> the one with the same project scope -> Matched (by scope);
+    # still ambiguous -> first candidate, DuplicateName; none -> $null rule.
+    [CmdletBinding()]
+    param([string]$Scope, $Candidates, [hashtable]$CandidateProjectKeys, [string]$NotFoundStatus)
+    try {
+        $list = @()
+        if ($null -ne $Candidates) { $list = @($Candidates) }
+        if ($list.Count -eq 0) { return [pscustomobject]@{ Rule = $null; Status = $NotFoundStatus } }
+        if ($list.Count -eq 1) { return [pscustomobject]@{ Rule = $list[0]; Status = 'Matched' } }
+        $byScope = @($list | Where-Object { (Get-RuleScope -Rule $_ -ProjectKeys $CandidateProjectKeys) -eq $Scope })
+        if ($byScope.Count -eq 1) { return [pscustomobject]@{ Rule = $byScope[0]; Status = 'Matched (by scope)' } }
+        $pick = $list[0]
+        if ($byScope.Count -gt 1) { $pick = $byScope[0] }
+        return [pscustomobject]@{ Rule = $pick; Status = 'DuplicateName' }
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Get-PresenceRows {
+    # Stage 1: one row per DC rule and per Cloud-only rule, with ids, projects, state and an assessment.
+    [CmdletBinding()]
+    param($DcRules, $CloudRules, [hashtable]$DcByName, [hashtable]$CloudByName)
+    try {
+        $rows = New-Object System.Collections.Generic.List[object]
+        $matchedCloudIds = New-Object 'System.Collections.Generic.HashSet[string]'
+        foreach ($dc in @($DcRules)) {
+            $name    = [string](Get-Prop -Obj $dc -Name 'name')
+            $key     = Get-RuleNameKey -Name $name
+            $dcScope = Get-RuleScope -Rule $dc -ProjectKeys $Script:DcProjectKeys
+            $dcState = [string](Get-Prop -Obj $dc -Name 'state')
+            $cands   = $null
+            if ($CloudByName.ContainsKey($key)) { $cands = $CloudByName[$key] }
+            $m = Find-RuleMatch -Scope $dcScope -Candidates $cands -CandidateProjectKeys $Script:CloudProjectKeys -NotFoundStatus 'NotFoundInCloud'
+            $cloudId = ''; $cloudScope = ''; $cloudState = ''; $presence = 'DC only'; $assessment = ''
+            if ($null -ne $m.Rule) {
+                $cloudId    = Get-CloudRuleId -Rule $m.Rule
+                $cloudScope = Get-RuleScope -Rule $m.Rule -ProjectKeys $Script:CloudProjectKeys
+                $cloudState = [string](Get-Prop -Obj $m.Rule -Name 'state')
+                [void]$matchedCloudIds.Add($cloudId)
+                $presence = 'Both'
+                if ($m.Status -eq 'DuplicateName') { $assessment = 'Ambiguous: several rules with this name, scope did not disambiguate' }
+                elseif ($dcState -ine $cloudState) { $assessment = "State differs: DC $dcState, Cloud $cloudState" }
+            } elseif ($dcState -ieq 'DISABLED') {
+                $assessment = 'Expected: disabled on DC, not migrated'
+            } else {
+                $assessment = 'CHECK: enabled on DC but missing in Cloud'
+            }
+            $rows.Add([pscustomobject]@{
+                'Rule Name'        = $name
+                'Presence'         = $presence
+                'Assessment'       = $assessment
+                'DC Rule ID'       = [string](Get-Prop -Obj $dc -Name 'id')
+                'Cloud Rule ID'    = $cloudId
+                'DC Project(s)'    = $dcScope
+                'Cloud Project(s)' = $cloudScope
+                'DC State'         = $dcState
+                'Cloud State'      = $cloudState
+                'Match Status'     = $m.Status
+            })
+        }
+        foreach ($cr in @($CloudRules)) {
+            $cloudId = Get-CloudRuleId -Rule $cr
+            if ($cloudId -and $matchedCloudIds.Contains($cloudId)) { continue }
+            $name = [string](Get-Prop -Obj $cr -Name 'name')
+            $key  = Get-RuleNameKey -Name $name
+            $assessment = 'Cloud only: created in Cloud, JSM/project default rule, or renamed'
+            if ($DcByName.ContainsKey($key)) { $assessment = 'Cloud only: same name exists on DC but was matched to another rule (duplicate name)' }
+            $rows.Add([pscustomobject]@{
+                'Rule Name'        = $name
+                'Presence'         = 'Cloud only'
+                'Assessment'       = $assessment
+                'DC Rule ID'       = ''
+                'Cloud Rule ID'    = $cloudId
+                'DC Project(s)'    = ''
+                'Cloud Project(s)' = Get-RuleScope -Rule $cr -ProjectKeys $Script:CloudProjectKeys
+                'DC State'         = ''
+                'Cloud State'      = [string](Get-Prop -Obj $cr -Name 'state')
+                'Match Status'     = 'NotFoundInDC'
+            })
+        }
+        return $rows.ToArray()
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Write-PresenceConsole {
+    [CmdletBinding()]
+    param($Rows)
+    try {
+        $all      = @($Rows)
+        $both     = @($all | Where-Object { $_.Presence -eq 'Both' })
+        $dcOnly   = @($all | Where-Object { $_.Presence -eq 'DC only' })
+        $cloudOnly= @($all | Where-Object { $_.Presence -eq 'Cloud only' })
+        $check    = @($dcOnly | Where-Object { $_.Assessment -like 'CHECK*' })
+        $expected = @($dcOnly | Where-Object { $_.Assessment -like 'Expected*' })
+        $ambig    = @($both   | Where-Object { $_.'Match Status' -eq 'DuplicateName' })
+        $stateDif = @($both   | Where-Object { $_.Assessment -like 'State differs*' })
+        Write-Host ''
+        Write-Host '=== Stage 1: rule presence DC vs Cloud ==='
+        Write-Host ("  Present on both sides      : {0}" -f $both.Count)
+        Write-Host ("    of which state differs   : {0}" -f $stateDif.Count)
+        Write-Host ("    of which ambiguous name  : {0}" -f $ambig.Count)
+        Write-Host ("  DC only, disabled on DC    : {0}  (expected, not migrated)" -f $expected.Count)
+        Write-Host ("  DC only, ENABLED on DC     : {0}  (possible migration gap)" -f $check.Count)
+        Write-Host ("  Cloud only                 : {0}" -f $cloudOnly.Count)
+        if ($check.Count) {
+            Write-Host ''
+            Write-Host '  Enabled on DC but missing in Cloud:'
+            foreach ($r in ($check | Sort-Object -Property 'Rule Name')) {
+                Write-Host ("    [{0}] {1}   projects: {2}" -f $r.'DC Rule ID', $r.'Rule Name', $r.'DC Project(s)')
+            }
+        }
+        if ($stateDif.Count) {
+            Write-Host ''
+            Write-Host '  Present on both sides but state differs:'
+            foreach ($r in ($stateDif | Sort-Object -Property 'Rule Name')) {
+                Write-Host ("    [{0} / {1}] {2}   {3}" -f $r.'DC Rule ID', $r.'Cloud Rule ID', $r.'Rule Name', $r.Assessment)
+            }
+        }
+        Write-Host ''
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Export-PresenceCsv {
+    [CmdletBinding()]
+    param($Rows, [string]$Path, [string]$CsvDelimiter)
+    try {
+        $enc = 'UTF8'
+        if ($PSVersionTable.PSVersion.Major -ge 6) { $enc = 'utf8BOM' }
+        @($Rows) | Select-Object -Property $Script:PresenceColumns | Sort-Object -Property 'Presence', 'Rule Name' |
+            Export-Csv -LiteralPath $Path -Delimiter $CsvDelimiter -Encoding $enc -NoTypeInformation
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
 
 function New-SummaryRow {
     [CmdletBinding()]
@@ -1226,6 +1392,19 @@ try {
     $Script:DcProjectKeys    = Get-DcProjectKeys
     $Script:CloudProjectKeys = Get-CloudProjectKeys
 
+    # ---- Cloud summaries deduplicated by uuid/id (guards against pagination overlap)
+    $cloudDistinct = New-Object System.Collections.Generic.List[object]
+    $seenCloudIds  = New-Object 'System.Collections.Generic.HashSet[string]'
+    foreach ($r in $cloudRules) {
+        $cid = Get-CloudRuleId -Rule $r
+        if ($cid -and -not $seenCloudIds.Add($cid)) { continue }
+        $cloudDistinct.Add($r)
+    }
+    if ($cloudDistinct.Count -ne $cloudRules.Count) {
+        Write-Warning ("Cloud: {0} duplicate summary entries removed (same uuid/id); {1} distinct rules" -f ($cloudRules.Count - $cloudDistinct.Count), $cloudDistinct.Count)
+    }
+    $cloudRules = $cloudDistinct.ToArray()
+
     # ---- index by name
     $dcByName = @{}; $cloudByName = @{}
     foreach ($r in $dcRules) {
@@ -1238,71 +1417,65 @@ try {
         if (-not $cloudByName.ContainsKey($k)) { $cloudByName[$k] = New-Object System.Collections.Generic.List[object] }
         $cloudByName[$k].Add($r)
     }
-    foreach ($k in $dcByName.Keys)    { if ($dcByName[$k].Count -gt 1)    { Write-Warning "DC has $($dcByName[$k].Count) rules named ""$(Get-Prop -Obj $dcByName[$k][0] -Name 'name')""." } }
-    foreach ($k in $cloudByName.Keys) { if ($cloudByName[$k].Count -gt 1) { Write-Warning "Cloud has $($cloudByName[$k].Count) rules named ""$(Get-Prop -Obj $cloudByName[$k][0] -Name 'name')""." } }
+    $dcDupNames    = @($dcByName.Keys    | Where-Object { $dcByName[$_].Count -gt 1 }).Count
+    $cloudDupNames = @($cloudByName.Keys | Where-Object { $cloudByName[$_].Count -gt 1 }).Count
+    Write-Host ("Names used by more than one rule: DC {0}, Cloud {1} (resolved by project scope where possible; see presence CSV)" -f $dcDupNames, $cloudDupNames)
 
-    # ---- work list: DC rules sorted by name, filtered, offset/limit
-    $work = @($dcRules | Sort-Object -Property @{ Expression = { [string](Get-Prop -Obj $_ -Name 'name') } })
+    # ---- STAGE 1: rule presence
+    $presenceRows = @(Get-PresenceRows -DcRules $dcRules -CloudRules $cloudRules -DcByName $dcByName -CloudByName $cloudByName)
+    if (-not $NoPresenceConsole) { Write-PresenceConsole -Rows $presenceRows }
+    $presencePath = ''
+    if (-not $NoPresenceCsv) {
+        $presencePath = Join-Path $OutputDir "AutomationCompare_Presence_$ts.csv"
+        Export-PresenceCsv -Rows $presenceRows -Path $presencePath -CsvDelimiter $Delimiter
+    }
+
+    # ---- STAGE 2: configuration comparison, driven by the Cloud rule list
+    #      (rules disabled on DC at migration time were not migrated, so Cloud is the set that matters)
+    $work = @($cloudRules | Sort-Object -Property @{ Expression = { [string](Get-Prop -Obj $_ -Name 'name') } })
     $work = @($work | Where-Object {
         $k = Get-RuleNameKey -Name ([string](Get-Prop -Obj $_ -Name 'name'))
         (-not $allSkip.Contains($k)) -and ($onlyNames.Count -eq 0 -or $onlyNames.Contains($k))
     })
     if ($Skip -gt 0)     { $work = @($work | Select-Object -Skip $Skip) }
     if ($MaxRules -gt 0) { $work = @($work | Select-Object -First $MaxRules) }
-    Write-Host ("Processing {0} DC rule(s) (skip {1}, max {2}, {3} name(s) on skip list)" -f $work.Count, $Skip, $MaxRules, $allSkip.Count)
+    Write-Host ("=== Stage 2: comparing {0} Cloud rule(s) against DC (skip {1}, max {2}, {3} name(s) on skip list) ===" -f $work.Count, $Skip, $MaxRules, $allSkip.Count)
 
-    # ---- compare
     $n = 0
-    foreach ($dcEntry in $work) {
+    foreach ($cloudEntry in $work) {
         $n++
-        $name = [string](Get-Prop -Obj $dcEntry -Name 'name')
+        $name = [string](Get-Prop -Obj $cloudEntry -Name 'name')
         $key  = Get-RuleNameKey -Name $name
         Write-Host ("[{0}/{1}] {2}" -f $n, $work.Count, $name)
 
-        $dc = Get-DcRuleFull -Rule $dcEntry
-        $matchStatus = 'Matched'
-        $cloud = $null
-        if ($cloudByName.ContainsKey($key)) {
-            if ($cloudByName[$key].Count -gt 1 -or $dcByName[$key].Count -gt 1) { $matchStatus = 'DuplicateName' }
-            $cloud = Get-CloudRuleFull -Summary $cloudByName[$key][0]
-        } else {
-            $matchStatus = 'NotFoundInCloud'
-        }
+        $cloudScope = Get-RuleScope -Rule $cloudEntry -ProjectKeys $Script:CloudProjectKeys
+        $cands = $null
+        if ($dcByName.ContainsKey($key)) { $cands = $dcByName[$key] }
+        $m = Find-RuleMatch -Scope $cloudScope -Candidates $cands -CandidateProjectKeys $Script:DcProjectKeys -NotFoundStatus 'NotFoundInDC'
 
-        $row = New-SummaryRow -Name $name -Dc $dc -Cloud $cloud -MatchStatus $matchStatus
+        $cloud = Get-CloudRuleFull -Summary $cloudEntry
+        $dc = $null
+        if ($null -ne $m.Rule) { $dc = Get-DcRuleFull -Rule $m.Rule }
+
+        $row = New-SummaryRow -Name $name -Dc $dc -Cloud $cloud -MatchStatus $m.Status
         Write-RuleJsonFiles -Row $row -Dc $dc -Cloud $cloud
 
-        if ($null -eq $cloud) {
-            $row['Verdict']  = 'NotFoundInCloud'
-            $row['DC Steps'] = @(Get-FlatSteps -Rule $dc).Count
+        if ($null -eq $dc) {
+            $row['Verdict']     = 'NotFoundInDC'
+            $row['Cloud Steps'] = @(Get-FlatSteps -Rule $cloud).Count
         } else {
             Compare-Rule -Row $row -Dc $dc -Cloud $cloud
         }
         $Script:Summary.Add([pscustomobject]$row)
     }
 
-    # ---- Cloud-only rules (no DC counterpart): only on a full run, or when asked
-    if ($IncludeCloudOnlyRules -or ($MaxRules -eq 0 -and $Skip -eq 0 -and $onlyNames.Count -eq 0)) {
-        foreach ($k in $cloudByName.Keys) {
-            if ($dcByName.ContainsKey($k) -or $allSkip.Contains($k)) { continue }
-            foreach ($crEntry in $cloudByName[$k]) {
-                $cr  = Get-CloudRuleFull -Summary $crEntry
-                $row = New-SummaryRow -Name ([string](Get-Prop -Obj $cr -Name 'name')) -Dc $null -Cloud $cr -MatchStatus 'NotFoundInDC'
-                $row['Verdict']     = 'NotFoundInDC'
-                $row['Cloud Steps'] = @(Get-FlatSteps -Rule $cr).Count
-                Write-RuleJsonFiles -Row $row -Dc $null -Cloud $cr
-                $Script:Summary.Add([pscustomobject]$row)
-            }
-        }
-    }
-
     # ---- output
     $paths = Export-Results -Dir $OutputDir -Stamp $ts -CsvDelimiter $Delimiter
     $ident = @($Script:Summary | Where-Object { $_.Verdict -eq 'Identical' }).Count
     $diff  = @($Script:Summary | Where-Object { $_.Verdict -like 'Different*' }).Count
-    $noCl  = @($Script:Summary | Where-Object { $_.Verdict -eq 'NotFoundInCloud' }).Count
     $noDc  = @($Script:Summary | Where-Object { $_.Verdict -eq 'NotFoundInDC' }).Count
-    Write-Host ("Done. Identical: {0}, Different: {1}, NotFoundInCloud: {2}, NotFoundInDC: {3}" -f $ident, $diff, $noCl, $noDc)
+    Write-Host ("Done. Identical: {0}, Different: {1}, NotFoundInDC: {2}" -f $ident, $diff, $noDc)
+    if ($presencePath) { Write-Host "Presence: $presencePath" }
     Write-Host "Summary : $($paths.Summary)"
     Write-Host "Details : $($paths.Details)"
     Write-Host "JSON    : $Script:JsonDir"
