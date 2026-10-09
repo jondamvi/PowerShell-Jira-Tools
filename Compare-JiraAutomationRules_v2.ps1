@@ -34,6 +34,11 @@
     string comparison is case-insensitive unless -CaseSensitive. Missing key == null == ""
     (false is NOT treated as missing, so an unticked checkbox is reported).
 
+    Full rule configurations are fetched lazily - only for the rules actually processed (after
+    -SkipRuleNames / -RuleName / -Skip / -MaxRules), so -MaxRules 2 costs 2 Cloud fetches.
+    -CloudDelayMs (default 300) pauses before every Jira Cloud request; HTTP 429/502/503/504 are
+    retried with Retry-After / backoff regardless.
+
 .OUTPUTS
     <OutputDir>\AutomationCompare_Summary_<ts>.csv   one row per rule
     <OutputDir>\AutomationCompare_Details_<ts>.csv   one row per difference
@@ -65,7 +70,8 @@ param(
     [switch]$FullDiff,
     [switch]$CaseSensitive,
     [switch]$IncludeCloudOnlyRules,
-    [int]$MinNameLength = 3
+    [int]$MinNameLength = 3,
+    [int]$CloudDelayMs = 300
 )
 
 # ============================================================================
@@ -127,6 +133,8 @@ $Script:NameReplacements = @()      # { Dc, Cloud, Regex } sorted longest DC nam
 $Script:DcProjectKeys    = @{}
 $Script:CloudProjectKeys = @{}
 $Script:JsonDir          = ''
+$Script:CloudApi         = ''       # public Automation API base, set by Get-CloudRuleIndex
+$Script:CloudDelayMs     = 300      # pause before every Cloud call (rate limiting); set from -CloudDelayMs
 $Script:Summary          = New-Object System.Collections.Generic.List[object]
 $Script:Details          = New-Object System.Collections.Generic.List[object]
 $Script:StopAtFirst      = $true
@@ -239,11 +247,32 @@ function Assert-Column {
 
 function Invoke-JsonGet {
     # GET + explicit UTF-8 decode (PS 5.1 otherwise falls back to the ANSI code page).
-    # A top-level JSON array is returned as ONE array object (comma operator).
+    # Retries on HTTP 429/502/503/504 honouring Retry-After; optional pause before each call.
     [CmdletBinding()]
-    param([Parameter(Mandatory = $true)][string]$Uri, [Parameter(Mandatory = $true)][hashtable]$Headers)
+    param([Parameter(Mandatory = $true)][string]$Uri, [Parameter(Mandatory = $true)][hashtable]$Headers, [int]$DelayMs = 0, [int]$MaxAttempts = 6)
     try {
-        $resp  = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+        $resp = $null
+        $attempt = 0
+        while ($null -eq $resp) {
+            $attempt++
+            try {
+                if ($DelayMs -gt 0) { Start-Sleep -Milliseconds $DelayMs }
+                $resp = Invoke-WebRequest -Uri $Uri -Headers $Headers -Method Get -UseBasicParsing
+            } catch {
+                $ex = $_.Exception
+                if ($ex -isnot [System.Net.WebException] -or $null -eq $ex.Response) { throw }
+                $status     = [int]$ex.Response.StatusCode
+                $retryAfter = [string]$ex.Response.Headers['Retry-After']
+                $retryable  = ($status -eq 429 -or $status -eq 502 -or $status -eq 503 -or $status -eq 504)
+                if (-not $retryable -or $attempt -ge $MaxAttempts) { throw }
+                $waitSec = 0
+                if ($retryAfter -match '^\d+$') { $waitSec = [int]$retryAfter }
+                if ($waitSec -le 0) { $waitSec = 3 * $attempt }
+                if ($waitSec -gt 90) { $waitSec = 90 }
+                Write-Warning ("HTTP {0} on {1} - retry {2}/{3} in {4}s" -f $status, $Uri, $attempt, $MaxAttempts, $waitSec)
+                Start-Sleep -Seconds $waitSec
+            }
+        }
         $bytes = $resp.RawContentStream.ToArray()
         $text  = [System.Text.Encoding]::UTF8.GetString($bytes)
         if ($text.Length -gt 0 -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
@@ -588,7 +617,8 @@ function Get-CachePath {
     }
 }
 
-function Get-DcRules {
+function Get-DcRuleList {
+    # All DC rules as returned by the list endpoint (usually full config; may be summaries).
     [CmdletBinding()]
     param()
     try {
@@ -600,26 +630,25 @@ function Get-DcRules {
         Write-Host 'DC: loading automation rules ...'
         $raw  = Invoke-JsonGet -Uri "$DcBaseUrl/rest/cb-automation/latest/project/GLOBAL/rule" -Headers $Script:DcHeaders
         $list = @(Get-ListPayload -Obj $raw)
-        Write-Host ("DC: {0} rule(s) in list" -f $list.Count)
-        $full  = New-Object System.Collections.Generic.List[object]
-        $total = [int]$list.Count
-        if ($total -lt 1) { $total = 1 }
-        $i = 0
-        foreach ($r in $list) {
-            $i++
-            # list may be summaries only - fetch full config where components are missing
-            if (-not (Test-HasProp -Obj $r -Name 'components') -and -not (Test-HasProp -Obj $r -Name 'trigger')) {
-                $pct = [int](100 * $i / $total)
-                Write-Progress -Activity 'DC rules' -Status "$i / $total" -PercentComplete $pct
-                $rid = [string](Get-Prop -Obj $r -Name 'id')
-                $r = Invoke-JsonGet -Uri "$DcBaseUrl/rest/cb-automation/latest/project/GLOBAL/rule/$rid" -Headers $Script:DcHeaders
-            }
-            $full.Add($r)
-        }
-        Write-Progress -Activity 'DC rules' -Completed
-        $result = $full.ToArray()
-        if ($listPath) { Write-Utf8Json -Path $listPath -Obj $result }
-        return $result
+        if ($listPath) { Write-Utf8Json -Path $listPath -Obj $list }
+        return $list
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Get-DcRuleFull {
+    # Full configuration of one DC rule; fetches /rule/{id} only if the list entry is a summary.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Rule)
+    try {
+        if ((Test-HasProp -Obj $Rule -Name 'components') -or (Test-HasProp -Obj $Rule -Name 'trigger')) { return $Rule }
+        $rid = [string](Get-Prop -Obj $Rule -Name 'id')
+        $cp  = Get-CachePath -Side 'dc' -Id $rid
+        if ($cp -and -not $RefreshCache -and (Test-Path -LiteralPath $cp)) { return (Read-Utf8Json -Path $cp) }
+        $full = Invoke-JsonGet -Uri "$DcBaseUrl/rest/cb-automation/latest/project/GLOBAL/rule/$rid" -Headers $Script:DcHeaders
+        if ($cp) { Write-Utf8Json -Path $cp -Obj $full }
+        return $full
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -666,7 +695,7 @@ function Get-CloudRuleSummaries {
         $base = ''; $page = $null
         foreach ($c in $candidates) {
             try {
-                $page = Invoke-JsonGet -Uri "$c/rule/summary" -Headers $Script:CloudHeaders
+                $page = Invoke-JsonGet -Uri "$c/rule/summary" -Headers $Script:CloudHeaders -DelayMs $Script:CloudDelayMs
                 $base = $c
                 break
             } catch {
@@ -685,7 +714,7 @@ function Get-CloudRuleSummaries {
             foreach ($r in @(Get-ListPayload -Obj $page)) { $all.Add($r) }
             $nextUrl = Get-NextPageUrl -Page $page -BaseUrl $listUrl
             if (-not $nextUrl -or -not $seen.Add($nextUrl)) { break }
-            $page = Invoke-JsonGet -Uri $nextUrl -Headers $Script:CloudHeaders
+            $page = Invoke-JsonGet -Uri $nextUrl -Headers $Script:CloudHeaders -DelayMs $Script:CloudDelayMs
         }
         return [pscustomobject]@{ Base = $base; Rules = $all.ToArray() }
     } catch {
@@ -693,52 +722,54 @@ function Get-CloudRuleSummaries {
     }
 }
 
-function Get-CloudRules {
+function Get-CloudRuleIndex {
+    # Resolves cloudId, lists rule summaries (cached as cloud\_list.json) and sets $Script:CloudApi.
     [CmdletBinding()]
     param()
     try {
         $listPath = Get-CachePath -Side 'cloud' -Id '_list'
         if ($listPath -and -not $RefreshCache -and (Test-Path -LiteralPath $listPath)) {
-            Write-Host 'Cloud: using cached rule list'
-            return @(Get-ListPayload -Obj (Read-Utf8Json -Path $listPath))
+            $cached = Read-Utf8Json -Path $listPath
+            $base   = [string](Get-Prop -Obj $cached -Name 'Base')
+            if ($base) {
+                Write-Host 'Cloud: using cached rule summaries'
+                $Script:CloudApi = $base
+                return @(Get-ArrayProp -Obj $cached -Name 'Rules')
+            }
         }
         Write-Host 'Cloud: resolving cloudId ...'
-        $tenant  = Invoke-JsonGet -Uri "$CloudBaseUrl/_edge/tenant_info" -Headers $Script:CloudHeaders
+        $tenant  = Invoke-JsonGet -Uri "$CloudBaseUrl/_edge/tenant_info" -Headers $Script:CloudHeaders -DelayMs $Script:CloudDelayMs
         $cloudId = [string](Get-Prop -Obj $tenant -Name 'cloudId')
         if (-not $cloudId) { throw 'Could not read cloudId from /_edge/tenant_info' }
 
         Write-Host 'Cloud: loading rule summaries (public Automation API) ...'
         $sum = Get-CloudRuleSummaries -CloudId $cloudId
-        $api = [string]$sum.Base
-        $all = @($sum.Rules)
-        Write-Host ("Cloud: {0} rule(s) in list via {1}" -f $all.Count, $api)
+        $Script:CloudApi = [string]$sum.Base
+        $rules = @($sum.Rules)
+        Write-Host ("Cloud: {0} rule(s) in list via {1}" -f $rules.Count, $Script:CloudApi)
+        if ($listPath) { Write-Utf8Json -Path $listPath -Obj ([pscustomobject]@{ Base = $Script:CloudApi; Rules = $rules }) }
+        return $rules
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
 
-        $full  = New-Object System.Collections.Generic.List[object]
-        $total = [int]$all.Count
-        if ($total -lt 1) { $total = 1 }
-        $i = 0
-        foreach ($r in $all) {
-            $i++
-            # the full-rule endpoint is addressed by the rule UUID
-            $rid = [string](Get-Prop -Obj $r -Name 'uuid')
-            if (-not $rid) { $rid = [string](Get-Prop -Obj $r -Name 'id') }
-            if (-not $rid) { Write-Warning "Cloud: summary entry without id/uuid skipped: $(Format-Value -v $r)"; continue }
-            $cp = Get-CachePath -Side 'cloud' -Id $rid
-            if ($cp -and -not $RefreshCache -and (Test-Path -LiteralPath $cp)) {
-                $full.Add((Read-Utf8Json -Path $cp)); continue
-            }
-            $pct = [int](100 * $i / $total)
-            Write-Progress -Activity 'Cloud rules' -Status "$i / $total" -PercentComplete $pct
-            $resp = Invoke-JsonGet -Uri "$api/rule/$rid" -Headers $Script:CloudHeaders
-            $rule = Get-Prop -Obj $resp -Name 'rule'      # GET /rule/{uuid} may wrap the rule in { rule: {...} }
-            if ($null -eq $rule) { $rule = $resp }
-            if ($cp) { Write-Utf8Json -Path $cp -Obj $rule }
-            $full.Add($rule)
-        }
-        Write-Progress -Activity 'Cloud rules' -Completed
-        $result = $full.ToArray()
-        if ($listPath) { Write-Utf8Json -Path $listPath -Obj $result }
-        return $result
+function Get-CloudRuleFull {
+    # Full configuration of one Cloud rule (GET /rule/{uuid}), cached per rule under cloud\<uuid>.json.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)]$Summary)
+    try {
+        if ((Test-HasProp -Obj $Summary -Name 'components') -or (Test-HasProp -Obj $Summary -Name 'trigger')) { return $Summary }
+        $rid = [string](Get-Prop -Obj $Summary -Name 'uuid')
+        if (-not $rid) { $rid = [string](Get-Prop -Obj $Summary -Name 'id') }
+        if (-not $rid) { throw "Cloud summary entry without id/uuid: $(Format-Value -v $Summary)" }
+        $cp = Get-CachePath -Side 'cloud' -Id $rid
+        if ($cp -and -not $RefreshCache -and (Test-Path -LiteralPath $cp)) { return (Read-Utf8Json -Path $cp) }
+        $resp = Invoke-JsonGet -Uri "$Script:CloudApi/rule/$rid" -Headers $Script:CloudHeaders -DelayMs $Script:CloudDelayMs
+        $rule = Get-Prop -Obj $resp -Name 'rule'      # GET /rule/{uuid} may wrap the rule in { rule: {...} }
+        if ($null -eq $rule) { $rule = $resp }
+        if ($cp) { Write-Utf8Json -Path $cp -Obj $rule }
+        return $rule
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -764,7 +795,7 @@ function Get-CloudProjectKeys {
     try {
         $startAt = 0
         do {
-            $page = Invoke-JsonGet -Uri "$CloudBaseUrl/rest/api/3/project/search?startAt=$startAt&maxResults=50" -Headers $Script:CloudHeaders
+            $page = Invoke-JsonGet -Uri "$CloudBaseUrl/rest/api/3/project/search?startAt=$startAt&maxResults=50" -Headers $Script:CloudHeaders -DelayMs $Script:CloudDelayMs
             $vals = @(Get-ArrayProp -Obj $page -Name 'values')
             foreach ($p in $vals) { $map[[string](Get-Prop -Obj $p -Name 'id')] = [string](Get-Prop -Obj $p -Name 'key') }
             $startAt += 50
@@ -1156,6 +1187,7 @@ try {
     if ($CloudBaseUrl -notmatch '^https?://') { $CloudBaseUrl = "https://$CloudBaseUrl" }
 
     $Script:StopAtFirst          = -not $FullDiff
+    $Script:CloudDelayMs         = $CloudDelayMs
     $Script:CompareCaseSensitive = [bool]$CaseSensitive
 
     $Script:DcHeaders    = @{ 'Accept' = 'application/json'; 'Authorization' = "Bearer $DcToken" }
@@ -1187,9 +1219,9 @@ try {
 
     Initialize-CustomFieldMapping -CsvPath $CustomFieldsCsv -CsvDelimiter $Delimiter -MinLen $MinNameLength
 
-    # ---- fetch
-    $dcRules    = @(Get-DcRules)
-    $cloudRules = @(Get-CloudRules)
+    # ---- fetch rule lists (summaries); full configurations are fetched per processed rule below
+    $dcRules    = @(Get-DcRuleList)
+    $cloudRules = @(Get-CloudRuleIndex)
     Write-Host ("DC rules: {0}, Cloud rules: {1}" -f $dcRules.Count, $cloudRules.Count)
     $Script:DcProjectKeys    = Get-DcProjectKeys
     $Script:CloudProjectKeys = Get-CloudProjectKeys
@@ -1221,17 +1253,18 @@ try {
 
     # ---- compare
     $n = 0
-    foreach ($dc in $work) {
+    foreach ($dcEntry in $work) {
         $n++
-        $name = [string](Get-Prop -Obj $dc -Name 'name')
+        $name = [string](Get-Prop -Obj $dcEntry -Name 'name')
         $key  = Get-RuleNameKey -Name $name
         Write-Host ("[{0}/{1}] {2}" -f $n, $work.Count, $name)
 
+        $dc = Get-DcRuleFull -Rule $dcEntry
         $matchStatus = 'Matched'
         $cloud = $null
         if ($cloudByName.ContainsKey($key)) {
             if ($cloudByName[$key].Count -gt 1 -or $dcByName[$key].Count -gt 1) { $matchStatus = 'DuplicateName' }
-            $cloud = $cloudByName[$key][0]
+            $cloud = Get-CloudRuleFull -Summary $cloudByName[$key][0]
         } else {
             $matchStatus = 'NotFoundInCloud'
         }
@@ -1252,7 +1285,8 @@ try {
     if ($IncludeCloudOnlyRules -or ($MaxRules -eq 0 -and $Skip -eq 0 -and $onlyNames.Count -eq 0)) {
         foreach ($k in $cloudByName.Keys) {
             if ($dcByName.ContainsKey($k) -or $allSkip.Contains($k)) { continue }
-            foreach ($cr in $cloudByName[$k]) {
+            foreach ($crEntry in $cloudByName[$k]) {
+                $cr  = Get-CloudRuleFull -Summary $crEntry
                 $row = New-SummaryRow -Name ([string](Get-Prop -Obj $cr -Name 'name')) -Dc $null -Cloud $cr -MatchStatus 'NotFoundInDC'
                 $row['Verdict']     = 'NotFoundInDC'
                 $row['Cloud Steps'] = @(Get-FlatSteps -Rule $cr).Count
