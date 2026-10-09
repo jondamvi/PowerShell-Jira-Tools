@@ -145,6 +145,7 @@ $Script:DcProjectKeys    = @{}
 $Script:CloudProjectKeys = @{}
 $Script:JsonDir          = ''
 $Script:CloudApi         = ''       # public Automation API base, set by Get-CloudRuleIndex
+$Script:CloudScopeById   = @{}      # uuid -> union of project keys when the summary lists a rule once per project
 $Script:CloudDelayMs     = 300      # pause before every Cloud call (rate limiting); set from -CloudDelayMs
 $Script:Summary          = New-Object System.Collections.Generic.List[object]
 $Script:Details          = New-Object System.Collections.Generic.List[object]
@@ -208,7 +209,9 @@ function Format-ParameterValue {
         elseif ($Value -is [System.Collections.IDictionary]) { $s = "hashtable(" + (@($Value.Keys) -join ', ') + ")" }
         elseif ($Value -is [System.Array] -or $Value -is [System.Collections.IList]) {
             $parts = foreach ($x in $Value) { if ($null -eq $x) { 'Null' } elseif ($x -is [string] -or $x.GetType().IsPrimitive) { [string]$x } else { $x.GetType().Name } }
-            $s = "[" + ($parts -join ', ') + "] (" + @($Value).Count + " items)"
+            $itemCount = 0
+            foreach ($x in $Value) { $itemCount++ }
+            $s = "[" + ($parts -join ', ') + "] (" + $itemCount + " items)"
         }
         elseif ($Value -is [System.Management.Automation.PSCustomObject]) { $s = ($Value | ConvertTo-Json -Depth 3 -Compress) }
         else { $s = [string]$Value }
@@ -844,7 +847,11 @@ function Get-RuleScope {
         $keys = foreach ($id in @($ids | Select-Object -Unique)) {
             if ($ProjectKeys.ContainsKey($id)) { $ProjectKeys[$id] } else { $id }
         }
-        return ((@($keys) | Sort-Object) -join ', ')
+        $scope = ((@($keys) | Sort-Object) -join ', ')
+        # a Cloud rule listed once per project in the summary: use the union collected at dedupe time
+        $uuid = [string](Get-Prop -Obj $Rule -Name 'uuid')
+        if ($uuid -and $Script:CloudScopeById.ContainsKey($uuid)) { return $Script:CloudScopeById[$uuid] }
+        return $scope
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
     }
@@ -1013,8 +1020,14 @@ function Find-RuleMatch {
     [CmdletBinding()]
     param([string]$Scope, $Candidates, [hashtable]$CandidateProjectKeys, [string]$NotFoundStatus)
     try {
+        # NOTE: @() applied directly to a generic List[object] triggers the PS 5.1 engine bug
+        # "Argument types do not match" - callers pass arrays (List.ToArray()), and this guards the rest.
         $list = @()
-        if ($null -ne $Candidates) { $list = @($Candidates) }
+        if ($null -ne $Candidates) {
+            if ($Candidates -is [System.Array]) { $list = $Candidates }
+            elseif ($null -ne $Candidates.PSObject.Methods['ToArray']) { $list = $Candidates.ToArray() }
+            else { $list = @($Candidates) }
+        }
         if ($list.Count -eq 0) { return [pscustomobject]@{ Rule = $null; Status = $NotFoundStatus } }
         if ($list.Count -eq 1) { return [pscustomobject]@{ Rule = $list[0]; Status = 'Matched' } }
         $byScope = @($list | Where-Object { (Get-RuleScope -Rule $_ -ProjectKeys $CandidateProjectKeys) -eq $Scope })
@@ -1040,7 +1053,7 @@ function Get-PresenceRows {
             $dcScope = Get-RuleScope -Rule $dc -ProjectKeys $Script:DcProjectKeys
             $dcState = [string](Get-Prop -Obj $dc -Name 'state')
             $cands   = $null
-            if ($CloudByName.ContainsKey($key)) { $cands = $CloudByName[$key] }
+            if ($CloudByName.ContainsKey($key)) { $cands = $CloudByName[$key].ToArray() }
             $m = Find-RuleMatch -Scope $dcScope -Candidates $cands -CandidateProjectKeys $Script:CloudProjectKeys -NotFoundStatus 'NotFoundInCloud'
             $cloudId = ''; $cloudScope = ''; $cloudState = ''; $presence = 'DC only'; $assessment = ''
             if ($null -ne $m.Rule) {
@@ -1388,22 +1401,39 @@ try {
     # ---- fetch rule lists (summaries); full configurations are fetched per processed rule below
     $dcRules    = @(Get-DcRuleList)
     $cloudRules = @(Get-CloudRuleIndex)
-    Write-Host ("DC rules: {0}, Cloud rules: {1}" -f $dcRules.Count, $cloudRules.Count)
     $Script:DcProjectKeys    = Get-DcProjectKeys
     $Script:CloudProjectKeys = Get-CloudProjectKeys
 
-    # ---- Cloud summaries deduplicated by uuid/id (guards against pagination overlap)
-    $cloudDistinct = New-Object System.Collections.Generic.List[object]
-    $seenCloudIds  = New-Object 'System.Collections.Generic.HashSet[string]'
+    # ---- Cloud summaries deduplicated by uuid/id.
+    #      The summary endpoint lists a rule once per project in its scope, so a multi-project rule
+    #      appears several times with different ruleScope entries; identical repeats would be
+    #      pagination overlap. Scopes of repeats are merged into $Script:CloudScopeById.
+    $cloudTotal     = $cloudRules.Count
+    $cloudDistinct  = New-Object System.Collections.Generic.List[object]
+    $firstById      = @{}
+    $scopesById     = @{}
+    $repeatScoped   = 0
+    $repeatIdentical= 0
     foreach ($r in $cloudRules) {
-        $cid = Get-CloudRuleId -Rule $r
-        if ($cid -and -not $seenCloudIds.Add($cid)) { continue }
-        $cloudDistinct.Add($r)
+        $cid   = Get-CloudRuleId -Rule $r
+        $scope = Get-RuleScope -Rule $r -ProjectKeys $Script:CloudProjectKeys
+        if (-not $cid) { $cloudDistinct.Add($r); continue }
+        if (-not $firstById.ContainsKey($cid)) {
+            $firstById[$cid] = $r
+            $scopesById[$cid] = New-Object 'System.Collections.Generic.HashSet[string]'
+            [void]$scopesById[$cid].Add($scope)
+            $cloudDistinct.Add($r)
+            continue
+        }
+        if ($scopesById[$cid].Add($scope)) { $repeatScoped++ } else { $repeatIdentical++ }
     }
-    if ($cloudDistinct.Count -ne $cloudRules.Count) {
-        Write-Warning ("Cloud: {0} duplicate summary entries removed (same uuid/id); {1} distinct rules" -f ($cloudRules.Count - $cloudDistinct.Count), $cloudDistinct.Count)
+    foreach ($cid in $scopesById.Keys) {
+        if ($scopesById[$cid].Count -gt 1) {
+            $Script:CloudScopeById[$cid] = ((@($scopesById[$cid]) | Where-Object { $_ -ne 'GLOBAL' } | Sort-Object) -join ', ')
+        }
     }
     $cloudRules = $cloudDistinct.ToArray()
+    Write-Host ("DC rules: {0}, Cloud rules: {1} distinct ({2} summary entries; {3} repeats with another project scope = multi-project rules listed once per project; {4} identical repeats = pagination overlap)" -f $dcRules.Count, $cloudRules.Count, $cloudTotal, $repeatScoped, $repeatIdentical)
 
     # ---- index by name
     $dcByName = @{}; $cloudByName = @{}
@@ -1450,7 +1480,7 @@ try {
 
         $cloudScope = Get-RuleScope -Rule $cloudEntry -ProjectKeys $Script:CloudProjectKeys
         $cands = $null
-        if ($dcByName.ContainsKey($key)) { $cands = $dcByName[$key] }
+        if ($dcByName.ContainsKey($key)) { $cands = $dcByName[$key].ToArray() }
         $m = Find-RuleMatch -Scope $cloudScope -Candidates $cands -CandidateProjectKeys $Script:DcProjectKeys -NotFoundStatus 'NotFoundInDC'
 
         $cloud = Get-CloudRuleFull -Summary $cloudEntry
