@@ -11,10 +11,11 @@
               GET /rest/cb-automation/latest/project/GLOBAL/rule/{id}     (fallback per rule)
               GET /rest/api/2/project                                      (projectId -> key)
       Cloud : GET /_edge/tenant_info                                       (cloudId)
-              GET /gateway/api/automation/internal-api/jira/{cloudId}/pro/rest/GLOBAL/rule
-              GET /gateway/api/automation/internal-api/jira/{cloudId}/pro/rest/GLOBAL/rule/{id}
+              GET https://api.atlassian.com/automation/public/jira/{cloudId}/rest/v1/rule/summary
+              GET https://api.atlassian.com/automation/public/jira/{cloudId}/rest/v1/rule/{ruleUuid}
+              (public Automation Rule Management API; the site alias
+               {CloudBaseUrl}/gateway/api/automation/public/jira/{cloudId}/rest/v1 is tried as fallback)
               GET /rest/api/3/project/search                               (projectId -> key)
-      The Cloud automation endpoints are the undocumented ones the admin UI uses.
 
     Matching: DC rule <-> Cloud rule by rule name (trimmed, case-insensitive). Duplicate
     names on either side are warned about and reported as MatchStatus = DuplicateName.
@@ -624,6 +625,69 @@ function Get-DcRules {
     }
 }
 
+function Get-NextPageUrl {
+    # Cursor pagination of the public Automation API: links.next (URL or cursor) or a next cursor field.
+    [CmdletBinding()]
+    param($Page, [string]$BaseUrl)
+    try {
+        if ($null -eq $Page -or $Page -is [System.Array]) { return '' }
+        $next = ''
+        $links = Get-Prop -Obj $Page -Name 'links'
+        if ($null -ne $links) { $next = [string](Get-Prop -Obj $links -Name 'next') }
+        if (-not $next) {
+            foreach ($k in 'nextCursor', 'nextPageToken', 'next') {
+                $v = [string](Get-Prop -Obj $Page -Name $k)
+                if ($v) { $next = $v; break }
+            }
+        }
+        if (-not $next) { return '' }
+        if ($next -match '^https?://') { return $next }
+        return ($BaseUrl + '?cursor=' + [uri]::EscapeDataString($next))
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
+function Get-CloudRuleSummaries {
+    # Lists rules via the public Automation Rule Management API (GET /rest/v1/rule/summary).
+    # Tries api.atlassian.com first, then the site gateway alias. Returns { Base, Rules }.
+    [CmdletBinding()]
+    param([Parameter(Mandatory = $true)][string]$CloudId)
+    try {
+        $candidates = @(
+            "https://api.atlassian.com/automation/public/jira/$CloudId/rest/v1",
+            "$CloudBaseUrl/gateway/api/automation/public/jira/$CloudId/rest/v1"
+        )
+        $base = ''; $page = $null
+        foreach ($c in $candidates) {
+            try {
+                $page = Invoke-JsonGet -Uri "$c/rule/summary" -Headers $Script:CloudHeaders
+                $base = $c
+                break
+            } catch {
+                Write-Warning ("Cloud: {0}/rule/summary failed: {1}" -f $c, (([string]$_.Exception.Message) -split "`n")[0])
+            }
+        }
+        if (-not $base) { throw 'Automation public API not reachable via api.atlassian.com nor the site gateway (see warnings above).' }
+
+        $all  = New-Object System.Collections.Generic.List[object]
+        $seen = New-Object 'System.Collections.Generic.HashSet[string]'
+        $listUrl = "$base/rule/summary"
+        [void]$seen.Add($listUrl)
+        $guard = 0
+        while ($null -ne $page -and $guard -lt 1000) {
+            $guard++
+            foreach ($r in @(Get-ListPayload -Obj $page)) { $all.Add($r) }
+            $nextUrl = Get-NextPageUrl -Page $page -BaseUrl $listUrl
+            if (-not $nextUrl -or -not $seen.Add($nextUrl)) { break }
+            $page = Invoke-JsonGet -Uri $nextUrl -Headers $Script:CloudHeaders
+        }
+        return [pscustomobject]@{ Base = $base; Rules = $all.ToArray() }
+    } catch {
+        Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
+    }
+}
+
 function Get-CloudRules {
     [CmdletBinding()]
     param()
@@ -637,18 +701,12 @@ function Get-CloudRules {
         $tenant  = Invoke-JsonGet -Uri "$CloudBaseUrl/_edge/tenant_info" -Headers $Script:CloudHeaders
         $cloudId = [string](Get-Prop -Obj $tenant -Name 'cloudId')
         if (-not $cloudId) { throw 'Could not read cloudId from /_edge/tenant_info' }
-        $api = "$CloudBaseUrl/gateway/api/automation/internal-api/jira/$cloudId/pro/rest/GLOBAL"
 
-        Write-Host 'Cloud: loading automation rules ...'
-        $all = New-Object System.Collections.Generic.List[object]
-        $offset = 0; $limit = 100
-        do {
-            $page  = Invoke-JsonGet -Uri "$api/rule?limit=$limit&offset=$offset" -Headers $Script:CloudHeaders
-            $batch = @(Get-ListPayload -Obj $page)
-            foreach ($r in $batch) { $all.Add($r) }
-            $offset += $limit
-        } while ($batch.Count -ge $limit)
-        Write-Host ("Cloud: {0} rule(s) in list" -f $all.Count)
+        Write-Host 'Cloud: loading rule summaries (public Automation API) ...'
+        $sum = Get-CloudRuleSummaries -CloudId $cloudId
+        $api = [string]$sum.Base
+        $all = @($sum.Rules)
+        Write-Host ("Cloud: {0} rule(s) in list via {1}" -f $all.Count, $api)
 
         $full  = New-Object System.Collections.Generic.List[object]
         $total = [int]$all.Count
@@ -656,18 +714,21 @@ function Get-CloudRules {
         $i = 0
         foreach ($r in $all) {
             $i++
-            $rid = [string](Get-Prop -Obj $r -Name 'id')
-            $cp  = Get-CachePath -Side 'cloud' -Id $rid
+            # the full-rule endpoint is addressed by the rule UUID
+            $rid = [string](Get-Prop -Obj $r -Name 'uuid')
+            if (-not $rid) { $rid = [string](Get-Prop -Obj $r -Name 'id') }
+            if (-not $rid) { Write-Warning "Cloud: summary entry without id/uuid skipped: $(Format-Value -v $r)"; continue }
+            $cp = Get-CachePath -Side 'cloud' -Id $rid
             if ($cp -and -not $RefreshCache -and (Test-Path -LiteralPath $cp)) {
                 $full.Add((Read-Utf8Json -Path $cp)); continue
             }
-            if (-not (Test-HasProp -Obj $r -Name 'components') -and -not (Test-HasProp -Obj $r -Name 'trigger')) {
-                $pct = [int](100 * $i / $total)
-                Write-Progress -Activity 'Cloud rules' -Status "$i / $total" -PercentComplete $pct
-                $r = Invoke-JsonGet -Uri "$api/rule/$rid" -Headers $Script:CloudHeaders
-            }
-            if ($cp) { Write-Utf8Json -Path $cp -Obj $r }
-            $full.Add($r)
+            $pct = [int](100 * $i / $total)
+            Write-Progress -Activity 'Cloud rules' -Status "$i / $total" -PercentComplete $pct
+            $resp = Invoke-JsonGet -Uri "$api/rule/$rid" -Headers $Script:CloudHeaders
+            $rule = Get-Prop -Obj $resp -Name 'rule'      # GET /rule/{uuid} may wrap the rule in { rule: {...} }
+            if ($null -eq $rule) { $rule = $resp }
+            if ($cp) { Write-Utf8Json -Path $cp -Obj $rule }
+            $full.Add($rule)
         }
         Write-Progress -Activity 'Cloud rules' -Completed
         $result = $full.ToArray()
@@ -793,6 +854,8 @@ function Add-FlatStep {
 
 function Get-FlatSteps {
     # Depth-first flatten of trigger + components, descending into children and conditions.
+    # DC export keeps the trigger in a separate "trigger" key; the Cloud public API puts it
+    # into components[] as component = TRIGGER. Both end up at path "T"; the rest is numbered.
     [CmdletBinding()]
     param($Rule)
     try {
@@ -800,7 +863,16 @@ function Get-FlatSteps {
         $trigger = Get-Prop -Obj $Rule -Name 'trigger'
         if ($null -ne $trigger) { Add-FlatStep -Node $trigger -Path 'T' -Steps $steps }
         $comps = @(Get-ArrayProp -Obj $Rule -Name 'components')
-        for ($i = 0; $i -lt $comps.Count; $i++) { Add-FlatStep -Node $comps[$i] -Path ([string]($i + 1)) -Steps $steps }
+        $n = 0
+        foreach ($c in $comps) {
+            $kind = [string](Get-Prop -Obj $c -Name 'component')
+            if ($kind -eq 'TRIGGER') {
+                if ($null -eq $trigger) { Add-FlatStep -Node $c -Path 'T' -Steps $steps; $trigger = $c }
+                continue
+            }
+            $n++
+            Add-FlatStep -Node $c -Path ([string]$n) -Steps $steps
+        }
         return $steps.ToArray()
     } catch {
         Invoke-FunctionCatch -ErrorRecord $_ -Cmdlet $PSCmdlet -Invocation $MyInvocation -BoundParameters $PSBoundParameters -Report (Format-FunctionError -ErrorRecord $_ -Invocation $MyInvocation -BoundParameters $PSBoundParameters)
